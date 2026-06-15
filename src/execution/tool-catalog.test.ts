@@ -20,6 +20,7 @@ import { describe, expect, test } from "bun:test";
 import {
   applyDeferralFilter,
   buildToolCatalog,
+  chatBlockArgsPreviewFor,
   deferredToolIndex,
   firstSentence,
   handleLoadTools,
@@ -448,6 +449,20 @@ describe("buildToolCatalog", () => {
     });
   });
 
+  test("web_search description steers factual/lookup questions away from memory", () => {
+    // The search-vs-memory policy is the behavioral fix for models that
+    // answer source-dependent questions from parametric or recalled memory
+    // instead of searching. Pin the clause so a description rewrite can't
+    // silently drop it. The same policy lives in the default INSTRUCTIONS.md
+    // (see system-prompt.test.ts); both surfaces must carry it.
+    const state = stateWithToolsets([ts("web_search")]);
+    const catalog = buildToolCatalog(state);
+    const desc = catalog.find((t) => t.function.name === "web_search")?.function.description ?? "";
+    expect(desc).toContain("BEFORE answering");
+    expect(desc).toContain("recalled memory");
+    expect(desc).toContain("stable general knowledge");
+  });
+
   describe("cross-toolset routing hints", () => {
     // browser_navigate's description steers content discovery to
     // web_search, and the search/fetch descriptions steer page
@@ -672,5 +687,52 @@ describe("deferred tools", () => {
     expect(firstSentence("Open a page. Then do more.")).toBe("Open a page.");
     const long = "a".repeat(200);
     expect(firstSentence(long, 50).length).toBeLessThanOrEqual(50);
+  });
+});
+
+describe("chatBlockArgsPreviewFor browser ref labels", () => {
+  test("browser_click renders role + name when the resolver names the ref", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      (ref) => (ref === "@e38" ? { role: "button", name: "Buy a License" } : undefined)
+    );
+    expect(preview).toBe('button "Buy a License"');
+  });
+
+  test("browser_click falls back to the bare ref with no resolver", () => {
+    expect(chatBlockArgsPreviewFor("browser_click", { ref: "@e38" })).toBe("@e38");
+  });
+
+  test('browser_click drops the synthetic "clickable" role and shows the name alone', () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      () => ({ role: "clickable", name: "Buy a License" })
+    );
+    expect(preview).toBe('"Buy a License"');
+  });
+
+  test("browser_click falls back to the bare ref when the named element has no name", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      () => ({ role: "button", name: "" })
+    );
+    expect(preview).toBe("@e38");
+  });
+
+  test("browser_fill_form joins each field's resolved label", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_fill_form",
+      { fields: [{ ref: "@e1" }, { ref: "@e2" }] },
+      (ref) =>
+        ref === "@e1"
+          ? { role: "textbox", name: "Email" }
+          : ref === "@e2"
+            ? { role: "textbox", name: "Password" }
+            : undefined
+    );
+    expect(preview).toBe('textbox "Email", textbox "Password"');
   });
 });

@@ -966,7 +966,7 @@ async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record
     // keeps the generic line (nothing is connected at all).
     const requestedLabel = requested ? (getProvider(requested)?.label ?? requested) : undefined;
     throw new ToolDisplayError(
-      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`,
+      `Web search via a connector is unavailable: no healthy ${wanted} connector. You still have live-web tools, so do NOT answer from memory — search another way and answer from what you find: use browser_navigate to query a search engine (e.g. https://duckduckgo.com/?q=<query> or https://www.google.com/search?q=<query>) and read the results, or web_fetch a search-results URL. Querying a real search engine like this IS searching; only guessing random content URLs is not. You can also call request_connector with provider '${requested ?? "brave-search"}' to add a search API key for faster, cleaner results going forward, then retry this tool.`,
       {
         displayMessage: requestedLabel ? `${requestedLabel} is not connected.` : "No search provider connected.",
         severity: "info"
