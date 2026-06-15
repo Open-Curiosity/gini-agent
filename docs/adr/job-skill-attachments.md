@@ -53,6 +53,43 @@ The contract:
   skill usage. Fan-out workers get the trace only (they are spawned through
   `spawnSubagent`, whose contract stays untouched).
 
+### Surfacing skips
+
+A skipped attachment must be visible in the **delivered output**, not only in
+the trace file — otherwise the model can flail or hallucinate a result the
+missing recipe would have produced, and the user reading the briefing sees no
+degradation signal. Skips surface on four layers:
+
+- **Run record.** `JobRunRecord.skillSkips` (`src/types.ts`) is the durable,
+  structured record of what was skipped this fire. Both dispatch paths
+  (`dispatchPromptRun`, `dispatchFanOut` in `src/jobs/index.ts`) stamp it from
+  `resolveJobSkillAttachments`' `skipped[]` when non-empty, so `/api/job-runs`
+  and the jobs UI carry it without parsing the trace.
+- **In-prompt directive.** When some attachments were skipped,
+  `resolveJobSkillAttachments` prepends an informational line to the prompt
+  block naming the unavailable recipe(s) + reason and instructing the model to
+  proceed without them and not fabricate results that would need them. This is
+  model-awareness only — it does NOT ask the model to emit a user-facing
+  notice (the deterministic surfaces below own that, avoiding double-noting).
+  The all-skipped case still yields a block of just this directive.
+- **Chat system_note.** `finalizeJobRunFromTask` (`src/jobs/finalize.ts`)
+  captures the run's `skillSkips` inside its `mutateState` and, after the
+  answer syncs, inserts **one** `system_note` ChatBlock into the job session
+  (keyed `{sessionId, taskId, runId, threadId, parentBlockId}` so it lands
+  in-thread after the answer) naming the skipped recipe(s) + the remedy
+  ("re-enable the skill or re-attach via `update_job`"). This is the
+  guaranteed (not model-reliant) web surface. Idempotent: finalize
+  early-returns once the run is terminal, so the note is written once.
+- **Bridge note.** `dispatchJobReplyToBridge` appends the same one-line note to
+  the telegram/discord text when the run had skips and the reply is non-empty
+  and not `[SILENT]`, so bridge/CLI users see it too.
+
+**Fan-out limitation.** Fan-out workers deliver individually (each via the
+chat path, not through `finalizeJobRunFromTask`), so the deterministic chat
+`system_note` and bridge note are scoped to the standard `dispatchPromptRun`
+path. On the fan-out path the run record still records `skillSkips` and the
+in-prompt directive still reaches every worker.
+
 ## Context
 
 Dogfooding the dominant personal-agent use case — a scheduled morning

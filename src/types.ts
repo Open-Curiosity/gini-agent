@@ -1849,6 +1849,14 @@ export interface JobRunRecord {
   summary?: string;
   error?: string;
   cost?: CostRecord;
+  // Skill attachments that were SKIPPED at fire time (a name that resolved at
+  // create time but had gone missing/disabled/inactive by the time the run
+  // dispatched). Durable + structured so /api/job-runs surfaces the
+  // degradation, the model is told (in-prompt directive) not to fabricate
+  // results that need the missing recipe, and the delivery surfaces (chat
+  // system_note + bridge note) name it. Absent when nothing was skipped. See
+  // ADR job-skill-attachments.md ("Surfacing skips").
+  skillSkips?: Array<{ name: string; reason: string }>;
 }
 
 export interface CostRecord {

@@ -9,6 +9,10 @@
 //     create is SKIPPED with a trace event while the fire proceeds.
 //   - size cap: inlined bodies share a 32k-char budget; the overflowing
 //     skill is truncated with an in-prompt read_skill pointer and a trace.
+//   - surfacing skips: a skip persists on the JobRunRecord, the dispatched
+//     prompt carries an informational skip directive (all-skipped =>
+//     directive-only block), finalize emits one system_note naming the
+//     skipped skill into the job session, and a clean run emits none.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -20,7 +24,7 @@ import {
   setEchoToolCallingResponse
 } from "../provider";
 import { createScheduledJob, runJobNow, updateJob } from "./index";
-import { closeAllMemoryDbs, mutateState, readState, readTrace } from "../state";
+import { closeAllMemoryDbs, listChatBlocks, mutateState, readState, readTrace } from "../state";
 import { __registerHookForTest, __resetHooksForTest } from "../hooks";
 import "../hooks/builtins";
 import type { RuntimeConfig, RuntimeState, SkillRecord } from "../types";
@@ -79,6 +83,18 @@ async function createSession(config: RuntimeConfig, id: string): Promise<void> {
       runIds: []
     });
   });
+}
+
+// runJobNow dispatches the chat task detached, so the run is finalized (and
+// the skip system_note emitted) on a later tick. Poll the run to terminal
+// before asserting on those finalize-side effects.
+async function waitForJobRunTerminal(config: RuntimeConfig, jobId: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    const run = readState(config.instance).jobRuns.find((r) => r.jobId === jobId);
+    if (run && run.status !== "running") return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Job ${jobId} run did not reach a terminal status in time`);
 }
 
 describe("job skill attachments", () => {
@@ -448,6 +464,130 @@ describe("job skill attachments", () => {
       // The inline trace landed on the worker task.
       const trace = readTrace(config.instance, worker!.id);
       expect(trace.some((entry) => entry.message === "Job skill attachments inlined")).toBe(true);
+    });
+  });
+
+  describe("surfacing skips", () => {
+    test("a fire-time skip persists on the JobRunRecord", async () => {
+      const config = buildConfig(workspaceRoot, "attach-skip-run");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+      const session = "session_skip_run";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "fleeting", body: "ephemeral recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "resilient",
+        prompt: "carry on",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["fleeting"]
+      });
+      // The skill is disabled between create and fire, so it skips at dispatch.
+      await mutateState(config.instance, (state) => {
+        const skill = state.skills.find((s) => s.name === "fleeting");
+        if (skill) skill.status = "disabled";
+      });
+
+      await runJobNow(config, job.id, "manual");
+
+      const run = readState(config.instance).jobRuns.find((r) => r.jobId === job.id);
+      expect(run).toBeDefined();
+      expect(run!.skillSkips).toEqual([{ name: "fleeting", reason: "missing or disabled" }]);
+    });
+
+    test("finalize emits exactly one system_note naming the skipped skill into the session", async () => {
+      const config = buildConfig(workspaceRoot, "attach-skip-note");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "the briefing", toolCalls: [], finishReason: "stop" });
+      const session = "session_skip_note";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "fleeting", body: "ephemeral recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "resilient",
+        prompt: "carry on",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["fleeting"]
+      });
+      await mutateState(config.instance, (state) => {
+        const skill = state.skills.find((s) => s.name === "fleeting");
+        if (skill) skill.status = "disabled";
+      });
+
+      await runJobNow(config, job.id, "manual");
+      await waitForJobRunTerminal(config, job.id);
+
+      const notes = listChatBlocks(config.instance, session).filter(
+        (b) => b.kind === "system_note" && b.text.includes("fleeting")
+      );
+      expect(notes.length).toBe(1);
+      expect(notes[0]!.kind === "system_note" && notes[0]!.text).toContain("update_job");
+    });
+
+    test("a clean run (no skips) emits no skip system_note", async () => {
+      const config = buildConfig(workspaceRoot, "attach-skip-none");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "the briefing", toolCalls: [], finishReason: "stop" });
+      const session = "session_skip_clean";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "google-calendar", body: "calendar recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "briefing",
+        prompt: "morning briefing",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["google-calendar"]
+      });
+
+      await runJobNow(config, job.id, "manual");
+      await waitForJobRunTerminal(config, job.id);
+
+      const run = readState(config.instance).jobRuns.find((r) => r.jobId === job.id);
+      expect(run!.skillSkips).toBeUndefined();
+      const notes = listChatBlocks(config.instance, session).filter(
+        (b) => b.kind === "system_note" && b.text.includes("could not use")
+      );
+      expect(notes.length).toBe(0);
+    });
+
+    test("the dispatched prompt carries the skip directive; all-skipped yields a directive-only block", async () => {
+      const config = buildConfig(workspaceRoot, "attach-skip-directive");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+      const session = "session_skip_directive";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "fleeting", body: "ephemeral recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "resilient",
+        prompt: "carry on",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["fleeting"]
+      });
+      await mutateState(config.instance, (state) => {
+        const skill = state.skills.find((s) => s.name === "fleeting");
+        if (skill) skill.status = "disabled";
+      });
+
+      await runJobNow(config, job.id, "manual");
+
+      const task = readState(config.instance).tasks.find((t) => t.jobId === job.id);
+      expect(task).toBeDefined();
+      // The informational directive names the unavailable recipe + reason.
+      expect(task!.input).toContain("requested skill recipe(s) are unavailable this run");
+      expect(task!.input).toContain("fleeting: missing or disabled");
+      // All skills skipped, so the block is JUST the directive — no inlined
+      // attachment header, but the prompt still carries the original task.
+      expect(task!.input).not.toContain("Attached skill instructions");
+      expect(task!.input).toContain("carry on");
     });
   });
 });

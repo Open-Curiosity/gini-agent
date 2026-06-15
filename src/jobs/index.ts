@@ -906,7 +906,10 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 //     reported in `truncated`.
 // See ADR job-skill-attachments.md.
 interface JobSkillAttachments {
-  // The prompt block to inline, or undefined when every skill was skipped.
+  // The prompt block to inline, or undefined only when the job has NO
+  // attachments at all. When every skill was skipped the block is just the
+  // informational skip directive (sections empty) so the model is still told
+  // the recipes are unavailable — see the directive below.
   block: string | undefined;
   attached: Array<{ id: string; name: string; version: number; chars: number }>;
   skipped: Array<{ name: string; reason: string }>;
@@ -939,9 +942,23 @@ function resolveJobSkillAttachments(state: RuntimeState, job: JobRecord): JobSki
     sections.push(`<skill name="${skill.name}" version="${skill.version}">\n${body}\n</skill>`);
     attached.push({ id: skill.id, name: skill.name, version: skill.version, chars: body.length });
   }
-  const block = sections.length > 0
+  // When some attachments were skipped, prepend an INFORMATIONAL directive so
+  // the model knows the requested recipe is unavailable this fire and must
+  // not invent results that depend on it. This is model-awareness only — the
+  // user-facing degradation notice is owned by the deterministic surfaces in
+  // finalizeJobRunFromTask (chat system_note + bridge note), so we do NOT ask
+  // the model to emit its own notice (avoids double-noting). All-skipped (no
+  // sections) still yields a block of just this directive so the model is
+  // informed even when nothing inlined.
+  const skipDirective = skipped.length > 0
+    ? `Note: ${skipped.length} requested skill recipe(s) are unavailable this run (${skipped
+        .map((s) => `${s.name}: ${s.reason}`)
+        .join("; ")}). Proceed without them and do not fabricate results that would require those skills.`
+    : undefined;
+  const inlinedBlock = sections.length > 0
     ? `Attached skill instructions (operator-registered; follow these recipes instead of rediscovering CLI usage):\n${sections.join("\n")}`
     : undefined;
+  const block = [skipDirective, inlinedBlock].filter((part) => part !== undefined).join("\n\n") || undefined;
   return { block, attached, skipped, truncated };
 }
 
@@ -1053,6 +1070,17 @@ async function dispatchPromptRun(
   // time so a stale name skips (traced below) instead of failing the fire.
   const attachments = resolveJobSkillAttachments(readState(config.instance), job);
   const prompt = withCronHint(job.prompt, [...job.context, ...hookContext], attachments?.block);
+  // Persist any fire-time skill skips on the run BEFORE submitTask so the
+  // degradation is durable on /api/job-runs and finalizeJobRunFromTask sees it
+  // — submitTask dispatches the chat task detached, and that task's own
+  // finalize reads run.skillSkips, so stamping it after submitTask returns
+  // would race the finalize. Only stamp when non-empty (absent = no skips).
+  if (attachments && attachments.skipped.length > 0) {
+    await mutateState(config.instance, (state) => {
+      const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+      if (runItem) runItem.skillSkips = attachments.skipped;
+    });
+  }
   // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
@@ -1268,6 +1296,17 @@ async function dispatchFanOut(
   // the job's attachment list, mirroring dispatchPromptRun's fire-time
   // skip/truncate semantics.
   const attachments = resolveJobSkillAttachments(readState(config.instance), job);
+  // Persist fire-time skips onto the per-tick run so /api/job-runs surfaces
+  // the degradation. Fan-out workers deliver independently (not via
+  // finalizeJobRunFromTask), so the deterministic chat/bridge skip notes
+  // don't apply on this path — the in-prompt directive reaches the workers
+  // and the run record records the skip. See ADR job-skill-attachments.md.
+  if (attachments && attachments.skipped.length > 0) {
+    await mutateState(config.instance, (state) => {
+      const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+      if (runItem) runItem.skillSkips = attachments.skipped;
+    });
+  }
   for (const [routeKey, bucketContext] of Object.entries(buckets)) {
     // Empty bucket → no worker (zero-idle-turn discipline).
     if (bucketContext.length === 0) continue;
