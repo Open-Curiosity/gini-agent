@@ -9,7 +9,7 @@ import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { hasUsableCodexCredentials, normalizeProvider } from "../../provider";
+import { hasUsableAwsCredentials, hasUsableCodexCredentials, normalizeProvider } from "../../provider";
 import {
   ensureSecretsEnvPerms,
   secretsEnvPath,
@@ -79,13 +79,21 @@ export interface OpenAIKeyStatus {
   value?: string;
 }
 
-export function checkOpenAIKeyStatus(): OpenAIKeyStatus {
-  if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 0) {
-    return { source: "env", value: process.env.OPENAI_API_KEY };
+// Resolve an API key from the process env (set by the user's shell) or the
+// gini secrets.env file (written by a prior setup run). Generic over the env
+// var name so every API-key provider shares one lookup.
+export function checkApiKeyStatus(envVar: string): OpenAIKeyStatus {
+  const fromEnv = process.env[envVar];
+  if (fromEnv && fromEnv.length > 0) {
+    return { source: "env", value: fromEnv };
   }
-  const fromFile = readKeyFromSecretsFile("OPENAI_API_KEY");
+  const fromFile = readKeyFromSecretsFile(envVar);
   if (fromFile) return { source: "file", value: fromFile };
   return { source: "missing" };
+}
+
+export function checkOpenAIKeyStatus(): OpenAIKeyStatus {
+  return checkApiKeyStatus("OPENAI_API_KEY");
 }
 
 export interface CredentialStatus {
@@ -94,14 +102,39 @@ export interface CredentialStatus {
   display: string;
 }
 
+// How a provider authenticates, which drives the credential prompt in setup:
+//   api-key     — a key the user pastes; saved to secrets.env under `apiKeyEnv`
+//   codex-oauth — codex CLI owns the token (~/.codex/auth.json); no key to save
+//   aws         — bedrock signs with ~/.aws / AWS_* creds; no gini-held key
+//   local       — OpenAI-compatible local server; key optional (most are no-auth)
+export type ProviderKind = "api-key" | "codex-oauth" | "aws" | "local";
+
+// Extra transport fields a provider needs persisted beyond name + model. Azure
+// is the only one with required routing (a per-resource endpoint); bedrock takes
+// an optional region; local takes a base URL. Captured during ensureCredentials
+// and applied by the caller via normalizeProvider.
+export interface ProviderExtraConfig {
+  baseUrl?: string;
+  awsRegion?: string;
+  apiVersion?: string;
+  deployment?: string;
+  authScheme?: "api-key" | "bearer";
+}
+
 export interface ProviderModule {
-  id: "openai" | "codex";
+  id: "openai" | "codex" | "anthropic" | "bedrock" | "azure" | "openrouter" | "deepseek" | "local";
+  kind: ProviderKind;
   label: string;
   description: string;
   defaultModel: string;
   suggestedModels: string[];
+  // The env var holding the key for api-key/local providers; undefined for
+  // codex (CLI-owned) and bedrock (AWS chain).
+  apiKeyEnv?: string;
   checkCredentials(): CredentialStatus;
-  ensureCredentials(io: SetupIO): Promise<boolean>;
+  // Resolve/capture credentials. Returns false when the user aborts. Mutates
+  // `extra` in place with any transport config the provider needs persisted.
+  ensureCredentials(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean>;
 }
 
 // Single source of truth for "are codex credentials usable?" — the runtime
@@ -120,35 +153,135 @@ function checkCodexCredentialsStatus(): CredentialStatus {
   return { available: true, source: "file", display: "✓ ~/.codex/auth.json" };
 }
 
-const openaiProvider: ProviderModule = {
+// Build an API-key provider module (openai, anthropic, openrouter, deepseek,
+// azure). They differ only in label/models/env var and, for azure, the extra
+// transport prompts — the credential resolution (env → secrets.env → prompt) is
+// shared. `keyHint` describes the expected key shape; `extraPrompts` collects
+// any per-provider transport config into the shared `extra` object.
+function apiKeyProvider(spec: {
+  id: ProviderModule["id"];
+  label: string;
+  description: string;
+  apiKeyEnv: string;
+  defaultModel: string;
+  suggestedModels: string[];
+  keyHint: string;
+  extraPrompts?: (io: SetupIO, extra: ProviderExtraConfig) => Promise<boolean>;
+}): ProviderModule {
+  return {
+    id: spec.id,
+    kind: "api-key",
+    label: spec.label,
+    description: spec.description,
+    apiKeyEnv: spec.apiKeyEnv,
+    defaultModel: spec.defaultModel,
+    suggestedModels: spec.suggestedModels,
+    checkCredentials(): CredentialStatus {
+      const status = checkApiKeyStatus(spec.apiKeyEnv);
+      if (status.source === "env") return { available: true, source: "env", display: "✓ in env" };
+      if (status.source === "file") return { available: true, source: "file", display: "✓ saved" };
+      return { available: false, source: "missing", display: "✗ missing" };
+    },
+    async ensureCredentials(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean> {
+      const status = checkApiKeyStatus(spec.apiKeyEnv);
+      if (status.source === "env") {
+        io.info(`Using ${spec.apiKeyEnv} from your environment.`);
+        if (status.value) writeKeyToSecretsFile(spec.apiKeyEnv, status.value);
+      } else if (status.source === "file") {
+        io.info(`Found existing ${spec.label} key in ~/.gini/secrets.env.`);
+      } else {
+        const ok = await promptAndSaveApiKey(io, spec.apiKeyEnv, spec.label, spec.keyHint);
+        if (!ok) return false;
+      }
+      // Capture any extra transport config (azure endpoint/deployment, etc.).
+      if (spec.extraPrompts) return spec.extraPrompts(io, extra);
+      return true;
+    }
+  };
+}
+
+const openaiProvider: ProviderModule = apiKeyProvider({
   id: "openai",
   label: "OpenAI",
   description: "API key — sk-...",
+  apiKeyEnv: "OPENAI_API_KEY",
   defaultModel: "gpt-5.4-mini",
   suggestedModels: ["gpt-5.4-mini", "gpt-5.4", "gpt-4o"],
-  checkCredentials(): CredentialStatus {
-    const status = checkOpenAIKeyStatus();
-    if (status.source === "env") return { available: true, source: "env", display: "✓ in env" };
-    if (status.source === "file") return { available: true, source: "file", display: "✓ saved" };
-    return { available: false, source: "missing", display: "✗ missing" };
-  },
-  async ensureCredentials(io: SetupIO): Promise<boolean> {
-    const status = checkOpenAIKeyStatus();
-    if (status.source === "missing") {
-      return promptAndSaveApiKey(io);
+  keyHint: "sk-"
+});
+
+const anthropicProvider: ProviderModule = apiKeyProvider({
+  id: "anthropic",
+  label: "Anthropic",
+  description: "First-party Claude API key — sk-ant-...",
+  apiKeyEnv: "ANTHROPIC_API_KEY",
+  defaultModel: "claude-opus-4-8",
+  suggestedModels: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+  keyHint: "sk-ant-"
+});
+
+const openrouterProvider: ProviderModule = apiKeyProvider({
+  id: "openrouter",
+  label: "OpenRouter",
+  description: "Multi-model router — sk-or-...",
+  apiKeyEnv: "OPENROUTER_API_KEY",
+  defaultModel: "openrouter/auto",
+  suggestedModels: ["openrouter/auto"],
+  keyHint: "sk-or-"
+});
+
+const deepseekProvider: ProviderModule = apiKeyProvider({
+  id: "deepseek",
+  label: "DeepSeek",
+  description: "API key — sk-...",
+  apiKeyEnv: "DEEPSEEK_API_KEY",
+  defaultModel: "deepseek-v4-flash",
+  suggestedModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
+  keyHint: "sk-"
+});
+
+const azureProvider: ProviderModule = apiKeyProvider({
+  id: "azure",
+  label: "Azure OpenAI",
+  description: "Deployment on your Azure resource",
+  apiKeyEnv: "AZURE_OPENAI_API_KEY",
+  defaultModel: "gpt-5.5",
+  suggestedModels: ["gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o3-mini"],
+  keyHint: "",
+  // Azure has no default endpoint: it routes per deployment on the user's
+  // resource, so a base URL is required and the deployment/api-version/auth
+  // scheme refine the path. Mirrors the `gini provider set azure` flags.
+  async extraPrompts(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean> {
+    const baseUrl = (await io.prompt("Azure resource endpoint (https://<resource>.openai.azure.com):")).trim();
+    if (!baseUrl) {
+      io.error("Azure requires a resource endpoint. Aborting.");
+      return false;
     }
-    if (status.source === "env") {
-      io.info("Using OPENAI_API_KEY from your environment.");
-      if (status.value) writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
-      return true;
+    if (!baseUrl.startsWith("https://")) {
+      io.error("The Azure endpoint must be an https:// URL (the key is sent on every request). Aborting.");
+      return false;
     }
-    io.info("Found existing OpenAI key in ~/.gini/secrets.env.");
+    extra.baseUrl = baseUrl;
+    const deployment = (await io.prompt("Deployment name [defaults to the model id]:", "")).trim();
+    if (deployment) extra.deployment = deployment;
+    const apiVersion = (await io.prompt("API version [GA default]:", "")).trim();
+    if (apiVersion) extra.apiVersion = apiVersion;
+    const scheme = await io.select(
+      "Auth scheme:",
+      [
+        { label: "api-key (resource key)", value: "api-key" as const },
+        { label: "bearer (Entra token)", value: "bearer" as const }
+      ],
+      0
+    );
+    extra.authScheme = scheme;
     return true;
   }
-};
+});
 
 const codexProvider: ProviderModule = {
   id: "codex",
+  kind: "codex-oauth",
   label: "OpenAI Codex",
   description: "Use existing codex login auth (~/.codex/auth.json)",
   defaultModel: "gpt-5.5",
@@ -226,7 +359,82 @@ function runCodexLogin(io: SetupIO, spawn: typeof spawnSync = spawnSync): boolea
   return true;
 }
 
-const PROVIDERS: ProviderModule[] = [openaiProvider, codexProvider];
+// Bedrock signs every Converse request with AWS SigV4 from the standard AWS
+// credential chain (AWS_* env or ~/.aws). There's no gini-held key, so
+// "configured" means the chain resolves — mirroring codex. An optional region
+// refines the endpoint (defaults resolve at request time).
+const bedrockProvider: ProviderModule = {
+  id: "bedrock",
+  kind: "aws",
+  label: "Amazon Bedrock",
+  description: "AWS SigV4 — Claude, Nova, Llama… (no API key)",
+  defaultModel: "us.anthropic.claude-opus-4-8",
+  suggestedModels: [
+    "us.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-sonnet-4-6",
+    "us.amazon.nova-pro-v1:0",
+    "us.meta.llama4-scout-17b-instruct-v1:0"
+  ],
+  checkCredentials(): CredentialStatus {
+    if (hasUsableAwsCredentials()) {
+      return { available: true, source: "env", display: "✓ AWS credentials resolved" };
+    }
+    return { available: false, source: "missing", display: "✗ no AWS credentials (set AWS_* or ~/.aws/credentials)" };
+  },
+  async ensureCredentials(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean> {
+    if (!hasUsableAwsCredentials()) {
+      io.error(
+        "No AWS credentials found. Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN " +
+        "for temporary sessions), or run `aws configure` to write ~/.aws/credentials, then re-run setup."
+      );
+      return false;
+    }
+    io.info("Using AWS credentials from your environment / ~/.aws.");
+    const region = (await io.prompt("AWS region [blank → AWS_REGION / us-east-1]:", "")).trim();
+    if (region) extra.awsRegion = region;
+    return true;
+  }
+};
+
+// Local OpenAI-compatible server (Ollama, LM Studio, vLLM, …). No-auth is the
+// common case, so the key is optional; the base URL is what setup needs.
+const localProvider: ProviderModule = {
+  id: "local",
+  kind: "local",
+  label: "Local",
+  description: "OpenAI-compatible server (Ollama, LM Studio, vLLM)",
+  apiKeyEnv: "GINI_LOCAL_API_KEY",
+  defaultModel: "local/default",
+  suggestedModels: ["local/default"],
+  checkCredentials(): CredentialStatus {
+    const status = checkApiKeyStatus("GINI_LOCAL_API_KEY");
+    if (status.source === "env") return { available: true, source: "env", display: "✓ key in env" };
+    if (status.source === "file") return { available: true, source: "file", display: "✓ key saved" };
+    // No-auth local gateways are valid — local is "available" without a key.
+    return { available: true, source: "missing", display: "no key (no-auth gateway)" };
+  },
+  async ensureCredentials(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean> {
+    const baseUrl = (await io.prompt("Local server base URL:", "http://127.0.0.1:11434/v1")).trim();
+    if (baseUrl) extra.baseUrl = baseUrl;
+    const key = (await io.secret("API key if your server requires one (blank for no-auth):")).trim();
+    if (key) {
+      writeKeyToSecretsFile("GINI_LOCAL_API_KEY", key);
+      io.success("Saved local API key to ~/.gini/secrets.env (mode 0600).");
+    }
+    return true;
+  }
+};
+
+const PROVIDERS: ProviderModule[] = [
+  openaiProvider,
+  codexProvider,
+  anthropicProvider,
+  bedrockProvider,
+  azureProvider,
+  openrouterProvider,
+  deepseekProvider,
+  localProvider
+];
 
 function providerById(id: string | undefined): ProviderModule | undefined {
   if (!id) return undefined;
@@ -281,39 +489,55 @@ export const providerStep: SetupStep = {
   }
 };
 
+// Providers auto-configurable in a --yes run, in precedence order. Codex first
+// (existing OAuth/key files, no prompt), then the API-key providers whose key is
+// already in env/secrets.env, then bedrock (AWS chain). azure and local are
+// excluded: both need interactive transport input (azure's resource endpoint,
+// local's base URL) that a non-interactive run can't gather, so they only set
+// up through the interactive picker.
+const AUTO_CONFIGURABLE: ProviderModule[] = [
+  codexProvider,
+  openaiProvider,
+  anthropicProvider,
+  openrouterProvider,
+  deepseekProvider,
+  bedrockProvider
+];
+
 async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<void> {
-  // Precedence: codex > openai. Codex uses existing OAuth/API key files and
-  // needs no prompt, so we prefer it when both are available in a --yes run.
-  const codexStatus = codexProvider.checkCredentials();
-  const openaiStatus = openaiProvider.checkCredentials();
+  for (const provider of AUTO_CONFIGURABLE) {
+    const status = provider.checkCredentials();
+    if (!status.available) continue;
 
-  if (codexStatus.available) {
-    const model = config.provider?.name === "codex" && config.provider.model
+    const model = config.provider?.name === provider.id && config.provider.model
       ? config.provider.model
-      : codexProvider.defaultModel;
-    config.provider = normalizeProvider({ name: "codex", model });
-    writeRuntimeConfig(config);
-    io.success(`Auto-configured: codex (${model}), credentials from ${codexStatus.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`);
-    return;
-  }
+      : provider.defaultModel;
 
-  if (openaiStatus.available) {
-    const status = checkOpenAIKeyStatus();
-    if (status.source === "env" && status.value) {
-      writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
+    // For API-key providers, persist a key found only in the live env into
+    // secrets.env so future shells (loading via the wrapper) pick it up.
+    if (provider.kind === "api-key" && provider.apiKeyEnv) {
+      const key = checkApiKeyStatus(provider.apiKeyEnv);
+      if (key.source === "env" && key.value) writeKeyToSecretsFile(provider.apiKeyEnv, key.value);
     }
-    const model = config.provider?.name === "openai" && config.provider.model
-      ? config.provider.model
-      : openaiProvider.defaultModel;
-    config.provider = normalizeProvider({ name: "openai", model });
+
+    config.provider = normalizeProvider({ name: provider.id, model });
     writeRuntimeConfig(config);
-    io.success(`Auto-configured: openai (${model}), key from ${status.source === "env" ? "env" : "secrets.env"}`);
+    io.success(`Auto-configured: ${provider.id} (${model}), ${describeCredentialSource(provider, status)}`);
     return;
   }
 
   throw new Error(
     "No provider credentials found. Set OPENAI_API_KEY in your environment, write it to ~/.gini/secrets.env, set CODEX_AUTH_JSON, or run codex login (~/.codex/auth.json), then re-run `gini setup --yes`."
   );
+}
+
+// Human-readable credential source for the auto-config success line.
+function describeCredentialSource(provider: ProviderModule, status: CredentialStatus): string {
+  if (provider.kind === "codex-oauth") {
+    return `credentials from ${status.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`;
+  }
+  if (provider.kind === "aws") return "AWS credentials from env / ~/.aws";
+  return `key from ${status.source === "env" ? "env" : "secrets.env"}`;
 }
 
 async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: ProviderModule): Promise<void> {
@@ -338,10 +562,19 @@ async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: Pr
     return;
   }
   if (action === "credentials") {
-    const ok = await current.ensureCredentials(io);
+    const extra: ProviderExtraConfig = {};
+    const ok = await current.ensureCredentials(io, extra);
     if (!ok) {
       io.info("Aborted.");
+      return;
     }
+    // Re-saving credentials can also re-capture transport config (azure
+    // endpoint, bedrock region, local base URL); persist it with the existing
+    // model so a credential refresh doesn't drop the routing.
+    const model = config.provider?.model ?? current.defaultModel;
+    config.provider = normalizeProvider({ name: current.id, model, ...extra });
+    writeRuntimeConfig(config);
+    io.success(`Updated ${current.label} credentials.`);
     return;
   }
   if (action === "switch") {
@@ -373,7 +606,8 @@ async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
   }
   io.info(`\n→ ${provider.label} selected.\n`);
 
-  const ok = await provider.ensureCredentials(io);
+  const extra: ProviderExtraConfig = {};
+  const ok = await provider.ensureCredentials(io, extra);
   if (!ok) {
     io.info("Aborted.");
     return;
@@ -381,22 +615,23 @@ async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
 
   const model = await selectModelForProvider(io, provider, null, false);
   const chosenModel = model ?? provider.defaultModel;
-  config.provider = normalizeProvider({ name: provider.id, model: chosenModel });
+  config.provider = normalizeProvider({ name: provider.id, model: chosenModel, ...extra });
   writeRuntimeConfig(config);
   io.success(`Provider set to ${provider.id} (${chosenModel}).`);
 }
 
-async function promptAndSaveApiKey(io: SetupIO): Promise<boolean> {
-  const apiKey = await io.secret("Enter your OpenAI API key (sk-...):");
+async function promptAndSaveApiKey(io: SetupIO, envVar: string, label: string, keyHint: string): Promise<boolean> {
+  const hint = keyHint ? ` (${keyHint}...)` : "";
+  const apiKey = await io.secret(`Enter your ${label} API key${hint}:`);
   if (!apiKey) {
     io.error("No API key entered. Skipping.");
     return false;
   }
-  if (!apiKey.startsWith("sk-")) {
-    io.error("API key doesn't look like an OpenAI key (expected to start with sk-). Continuing anyway.");
+  if (keyHint && !apiKey.startsWith(keyHint)) {
+    io.error(`API key doesn't look like a ${label} key (expected to start with ${keyHint}). Continuing anyway.`);
   }
-  writeKeyToSecretsFile("OPENAI_API_KEY", apiKey);
-  io.success("Saved API key to ~/.gini/secrets.env (mode 0600).");
+  writeKeyToSecretsFile(envVar, apiKey);
+  io.success(`Saved ${envVar} to ~/.gini/secrets.env (mode 0600).`);
   return true;
 }
 
@@ -442,7 +677,19 @@ async function selectModelForProvider(
 }
 
 // Exported for tests.
-export const __testing = { openaiProvider, codexProvider, PROVIDERS, runCodexLogin };
+export const __testing = {
+  openaiProvider,
+  codexProvider,
+  anthropicProvider,
+  bedrockProvider,
+  azureProvider,
+  openrouterProvider,
+  deepseekProvider,
+  localProvider,
+  PROVIDERS,
+  AUTO_CONFIGURABLE,
+  runCodexLogin
+};
 
 const STEPS: SetupStep[] = [providerStep];
 

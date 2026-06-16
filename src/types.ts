@@ -1312,6 +1312,10 @@ export interface ProviderCatalogItem {
   models: string[];
   capabilities: string[];
   costHint: "free" | "external" | "unknown";
+  // Hosted setup guide for this provider, rendered inline by the web client's
+  // DocReference/DocSheet. Derived by convention from the docs base
+  // (<base>/providers/<id>); absent for providers with no guide (echo).
+  setupDocUrl?: string;
 }
 
 // One way to reach a model: the (provider, providerModelId) pair dispatch

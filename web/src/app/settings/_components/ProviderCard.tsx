@@ -233,6 +233,16 @@ export function ProviderCard({
                     </Button>
                   )
                 ) : null}
+                {row.setupDocUrl ? (
+                  <DocReference url={row.setupDocUrl}>
+                    <button
+                      type="button"
+                      className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                    >
+                      Setup guide
+                    </button>
+                  </DocReference>
+                ) : null}
               </div>
               {/*
                 Codex authenticates via codex login → ~/.codex/auth.json,

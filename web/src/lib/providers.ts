@@ -29,7 +29,7 @@ import type {
 // CTA routing the chat re-auth note uses.
 export type ProviderCatalogItem = Pick<
   RuntimeProviderCatalogItem,
-  "id" | "name" | "displayName" | "baseUrl" | "auth" | "models"
+  "id" | "name" | "displayName" | "baseUrl" | "auth" | "models" | "setupDocUrl"
 > & { configured?: boolean; authStatus?: ProviderAuthStatus; reauth?: ProviderReauthInfo };
 
 // The `/providers/models` payload: canonical models with the routes

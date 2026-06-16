@@ -18,6 +18,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { BedrockModelSelect } from "../_components/BedrockModelSelect";
 import { BedrockRegionSelect } from "../_components/BedrockRegionSelect";
+import { DocReference } from "@/components/DocReference";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 
@@ -246,6 +247,16 @@ export default function AddProviderPage() {
                     ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
                     : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
             </p>
+            {entry?.setupDocUrl ? (
+              <p className="text-xs text-muted-foreground">
+                Need help?{" "}
+                <DocReference url={entry.setupDocUrl}>
+                  <button type="button" className="underline underline-offset-2 hover:text-foreground">
+                    Read the {displayProviderName(entry)} setup guide
+                  </button>
+                </DocReference>
+              </p>
+            ) : null}
           </div>
 
           <form

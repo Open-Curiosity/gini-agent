@@ -237,7 +237,7 @@ export function withProviderAuthStatus<T extends { name: ProviderCatalogItem["na
 }
 
 export function providerCatalog(): ProviderCatalogItem[] {
-  return [
+  const items: ProviderCatalogItem[] = [
     {
       id: "echo",
       name: "echo",
@@ -362,6 +362,12 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "unknown"
     }
   ];
+  // Attach the hosted setup guide by convention (<base>/providers/<id>), the
+  // same path scheme the re-auth CTA uses. echo is a dev/test provider with no
+  // guide, so it stays without one.
+  return items.map((item) =>
+    item.id === "echo" ? item : { ...item, setupDocUrl: `${DOCS_BASE_URL}/providers/${item.id}` }
+  );
 }
 
 // Short brand label for a provider, used in user-facing copy (e.g. the

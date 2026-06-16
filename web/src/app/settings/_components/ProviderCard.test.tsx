@@ -247,6 +247,23 @@ describe("ProviderCard rows", () => {
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 
+  test("a row with setupDocUrl renders a Setup guide DocReference even when connected", () => {
+    const docUrl = "https://gini.lilaclabs.ai/docs/providers/openai";
+    renderCard([row("openai", { setupDocUrl: docUrl })]);
+
+    const guide = screen.getByText("Setup guide");
+    expect(guide).not.toBeNull();
+    // The link is wrapped by the DocReference slide-over trigger, carrying the
+    // hosted doc URL the DocSheet fetches inline.
+    expect(guide.closest("[data-testid='doc-reference']")?.getAttribute("data-url")).toBe(docUrl);
+  });
+
+  test("a row without setupDocUrl renders no Setup guide link", () => {
+    renderCard([row("openai")]);
+    expect(screen.queryByText("Setup guide")).toBeNull();
+    expect(screen.queryByTestId("doc-reference")).toBeNull();
+  });
+
   test("an unconfigured row with a needs_reauth record still renders the amber guidance", () => {
     // bedrock/anthropic flip configured to false the moment their credentials
     // VANISH (env scrubbed, ~/.aws/credentials deleted) — exactly a needs-
