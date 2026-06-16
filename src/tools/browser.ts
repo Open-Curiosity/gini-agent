@@ -33,7 +33,7 @@ import { lookup } from "node:dns/promises";
 import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
-import { resolveProviderModality } from "../provider-capabilities";
+import { resolveImageByteLimit, resolveProviderModality } from "../provider-capabilities";
 import { addAudit, assertInsideWorkspace, mutateState, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
@@ -4430,14 +4430,6 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
   }
 }
 
-// Cap on screenshot byte size we'll forward to the vision provider. A
-// 5MB PNG is already absurdly large for vision input — anything bigger
-// is almost certainly a huge full-page scroll capture that will either
-// blow the provider's request limit or produce a useless answer. Failing
-// fast here is cheaper (no provider round-trip) and gives the model a
-// clear retry instruction.
-const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
-
 // Cap on numbered ref badges injected for an annotated browser_vision
 // screenshot. Fifty is plenty for the model to anchor an answer to
 // specific elements; an unbounded overlay on a ref-dense page would bury
@@ -4609,9 +4601,17 @@ export async function browserVision(
           } catch { /* best-effort removal */ }
         }
       }
-      if (buf.length > MAX_SCREENSHOT_BYTES) {
+      // The vision provider measures the base64-encoded image against its cap,
+      // not the decoded bytes. resolveImageByteLimit returns a raw-byte budget
+      // whose base64 expansion (4/3) stays under that cap, so an accepted
+      // screenshot never 400s at the provider. A capture this large is also
+      // almost certainly a huge full-page scroll that produces a useless answer;
+      // failing fast avoids a wasted provider round-trip and gives the model a
+      // clear retry instruction.
+      const maxScreenshotBytes = resolveImageByteLimit(config.provider);
+      if (buf.length > maxScreenshotBytes) {
         return fail(
-          `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
+          `Screenshot too large (${buf.length} bytes > ${maxScreenshotBytes} byte cap). Try full:false or scroll to a specific section.`
         );
       }
       // Re-check after the capture: if the page navigated to a refused origin
