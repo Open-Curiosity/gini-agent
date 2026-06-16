@@ -12,10 +12,7 @@ import type { RuntimeConfig } from "../types";
 import { addAudit, appendTrace, mutateState } from "../state";
 import { readUpload } from "../state/uploads";
 import { generateVisionAnalysis } from "../provider";
-
-// Same conservative cap browser_vision uses. Larger images blow the
-// provider request budget and produce useless answers.
-const MAX_BYTES = 5 * 1024 * 1024;
+import { resolveImageByteLimit } from "../provider-capabilities";
 
 export interface VisionQueryParams {
   uploadId: string;
@@ -48,10 +45,16 @@ export async function invokeVisionQuery(
   if (!upload) {
     return { ok: false, error: `Upload not found: ${params.uploadId}` };
   }
-  if (upload.bytes.length > MAX_BYTES) {
+  // The provider measures the base64-encoded image payload against its cap, not
+  // the decoded bytes. resolveImageByteLimit returns a raw-byte budget whose
+  // base64 expansion (4/3) stays under that cap, so an accepted upload never
+  // 400s at the provider. Larger images also blow the request budget and
+  // produce useless answers.
+  const maxBytes = resolveImageByteLimit(config.provider);
+  if (upload.bytes.length > maxBytes) {
     return {
       ok: false,
-      error: `Upload exceeds ${MAX_BYTES} byte vision cap (got ${upload.bytes.length}).`
+      error: `Upload exceeds ${maxBytes} byte vision cap (got ${upload.bytes.length}).`
     };
   }
   // Vision providers accept png and jpeg reliably. Other image mimes

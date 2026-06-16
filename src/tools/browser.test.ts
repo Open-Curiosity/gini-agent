@@ -37,6 +37,7 @@ import {
 import { dispatchToolCall } from "../execution/tool-dispatch";
 import { resolveSetupRequest } from "../agent";
 import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
+import { resolveImageByteLimit } from "../provider-capabilities";
 import {
   clearEchoAuxTextResponses,
   clearEchoVisionResponses,
@@ -3349,10 +3350,13 @@ describe("browserVision", () => {
     expect(screenshotCalls).toBe(1);
   });
 
-  test("fails fast when the screenshot exceeds the 5MB byte cap", async () => {
-    // Hand the fake page a >5MB Buffer. We allocate exactly 5MB + 1
-    // byte to avoid wasting test memory while still tripping the cap.
-    const oversize = Buffer.alloc(5 * 1024 * 1024 + 1, 0xff);
+  test("fails fast when the screenshot exceeds the base64-aware byte cap", async () => {
+    // Hand the fake page an oversize Buffer past the raw-byte budget (whose
+    // base64 expansion stays under the provider's encoded cap). 4MB + 1 trips
+    // the 3,750,000-byte budget while avoiding wasted test memory.
+    const maxBytes = resolveImageByteLimit({ name: "echo", model: "gini-echo-v0" });
+    const oversize = Buffer.alloc(4 * 1024 * 1024 + 1, 0xff);
+    expect(oversize.length).toBeGreaterThan(maxBytes);
     const fakePage = {
       screenshot: async () => oversize,
       url: () => "https://example.com/big"
@@ -3373,7 +3377,7 @@ describe("browserVision", () => {
     const parsed = JSON.parse(raw) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/Screenshot too large/);
-    expect(parsed.error).toMatch(/5MB cap/);
+    expect(parsed.error).toMatch(new RegExp(`${maxBytes} byte cap`));
   });
 
   test("bails with 'Browser disconnecting' if the generation advances between baseline and provider return", async () => {
