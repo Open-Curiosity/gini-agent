@@ -147,6 +147,178 @@ describe("subagent runtime (Slice 4)", () => {
     expect(spawnAudits[0]?.taskId).toBe(parent.id);
   });
 
+  test("a contiguous batch of spawn_subagent calls runs concurrently, not serially", async () => {
+    const config = buildConfig(workspaceRoot, "subagent-parallel");
+    const provider = normalizeProvider(config.provider);
+
+    // Concurrency is proven by INTERVAL OVERLAP, not wall-clock magnitude.
+    // Each child's lifetime is [createdAt, completedAt] on its SubagentRecord.
+    // Each child turn sleeps DELAY_MS, so every child's interval has real
+    // width. Under concurrent dispatch all children are created (spawned)
+    // before any completes, so max(createdAt) < min(completedAt) — the
+    // intervals share a common instant. Under serial dispatch child B is
+    // created only after child A has completed, so that inequality is false.
+    // This ordering test is independent of machine load: a busy CI box
+    // stretches every timestamp uniformly and cannot turn a serial ordering
+    // into an overlapping one (or vice versa). Interval overlap is the chosen
+    // signal — rather than a wall-clock ceiling — precisely because magnitude
+    // tracks load while ordering does not.
+    const DELAY_MS = 200;
+    const CHILDREN = 3;
+
+    // Parent turn 1: emit THREE spawn_subagent calls in a single assistant turn
+    // — the contiguous batch the loop should run under Promise.all.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_a",
+          type: "function",
+          function: { name: "spawn_subagent", arguments: JSON.stringify({ name: "lane-a", prompt: "research lane A" }) }
+        },
+        {
+          id: "call_b",
+          type: "function",
+          function: { name: "spawn_subagent", arguments: JSON.stringify({ name: "lane-b", prompt: "research lane B" }) }
+        },
+        {
+          id: "call_c",
+          type: "function",
+          function: { name: "spawn_subagent", arguments: JSON.stringify({ name: "lane-c", prompt: "research lane C" }) }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Three identical delayed child turns. The children consume these
+    // concurrently; because the stubs are identical, the FIFO order they're
+    // claimed in doesn't affect the observed behavior.
+    for (let i = 0; i < CHILDREN; i += 1) {
+      setEchoToolCallingResponse(
+        { provider, text: "lane done", toolCalls: [], finishReason: "stop" },
+        undefined,
+        { delayMs: DELAY_MS }
+      );
+    }
+    // Parent turn 2: final answer (consumed only after ALL children terminal,
+    // so it can never be claimed by a child — FIFO stays well-ordered).
+    setEchoToolCallingResponse({
+      provider,
+      text: "All lanes reported in.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const parent = await submitTask(config, "fan out three lanes", { mode: "chat" });
+    const finished = await waitForTerminal(config, parent.id, 8000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("All lanes reported in.");
+
+    // All subagents really ran and completed.
+    const state = readState(config.instance);
+    const subs = state.subagents.filter((s) => s.parentTaskId === parent.id);
+    expect(subs.length).toBe(CHILDREN);
+    expect(subs.every((s) => s.status === "completed")).toBe(true);
+
+    // Every child must carry a real lifetime interval.
+    const intervals = subs.map((s) => {
+      expect(s.createdAt).toBeDefined();
+      expect(s.completedAt).toBeDefined();
+      return { start: Date.parse(s.createdAt), end: Date.parse(s.completedAt!) };
+    });
+    expect(intervals.every((iv) => Number.isFinite(iv.start) && Number.isFinite(iv.end))).toBe(true);
+
+    // Concurrency proof (load-independent): the last child to be spawned
+    // started before the first child finished, so all three lifetimes share a
+    // common instant. A serial dispatch would spawn each child only after the
+    // previous one finished, making latestStart >= earliestEnd.
+    const latestStart = Math.max(...intervals.map((iv) => iv.start));
+    const earliestEnd = Math.min(...intervals.map((iv) => iv.end));
+    expect(latestStart).toBeLessThan(earliestEnd);
+  });
+
+  test("a non-spawn call between two spawns breaks the batch (they run serially)", async () => {
+    const config = buildConfig(workspaceRoot, "subagent-interleaved");
+    const provider = normalizeProvider(config.provider);
+
+    // Only CONTIGUOUS runs of spawn calls batch. A non-spawn tool call
+    // between two spawns splits them into two length-1 runs, neither of
+    // which meets the >=2 threshold, so both fall to the serial await path.
+    // This is the inverse of the concurrency proof: serial dispatch spawns
+    // the second child only after the first reaches terminal, so the two
+    // lifetimes are disjoint (latestStart >= earliestEnd). Like the positive
+    // test, the assertion is on ordering, not wall-clock magnitude, so it is
+    // load-independent.
+    const DELAY_MS = 200;
+
+    // Parent turn 1: spawn, then an interleaved sync tool, then spawn.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_a",
+          type: "function",
+          function: { name: "spawn_subagent", arguments: JSON.stringify({ name: "lane-a", prompt: "research lane A" }) }
+        },
+        {
+          id: "call_time",
+          type: "function",
+          function: { name: "get_current_time", arguments: "{}" }
+        },
+        {
+          id: "call_b",
+          type: "function",
+          function: { name: "spawn_subagent", arguments: JSON.stringify({ name: "lane-b", prompt: "research lane B" }) }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    // One delayed child turn per spawn (claimed in dispatch order; the
+    // interleaved get_current_time is a sync tool and consumes no stub).
+    setEchoToolCallingResponse(
+      { provider, text: "lane done", toolCalls: [], finishReason: "stop" },
+      undefined,
+      { delayMs: DELAY_MS }
+    );
+    setEchoToolCallingResponse(
+      { provider, text: "lane done", toolCalls: [], finishReason: "stop" },
+      undefined,
+      { delayMs: DELAY_MS }
+    );
+    // Parent turn 2: final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Both lanes reported in.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const parent = await submitTask(config, "spawn, clock, spawn", { mode: "chat" });
+    const finished = await waitForTerminal(config, parent.id, 8000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Both lanes reported in.");
+
+    const state = readState(config.instance);
+    const subs = state.subagents.filter((s) => s.parentTaskId === parent.id);
+    expect(subs.length).toBe(2);
+    expect(subs.every((s) => s.status === "completed")).toBe(true);
+
+    const intervals = subs.map((s) => {
+      expect(s.createdAt).toBeDefined();
+      expect(s.completedAt).toBeDefined();
+      return { start: Date.parse(s.createdAt), end: Date.parse(s.completedAt!) };
+    });
+
+    // Serial proof: the second spawn's child was created only after the first
+    // child finished, so the lifetimes are disjoint.
+    const latestStart = Math.max(...intervals.map((iv) => iv.start));
+    const earliestEnd = Math.min(...intervals.map((iv) => iv.end));
+    expect(latestStart).toBeGreaterThanOrEqual(earliestEnd);
+  });
+
   test("nesting depth cap rejects spawning past depth 3", async () => {
     const config = buildConfig(workspaceRoot, "subagent-depth");
 

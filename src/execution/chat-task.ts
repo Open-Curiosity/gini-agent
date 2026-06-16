@@ -2727,7 +2727,33 @@ async function runLoop(
     // THIS turn's tool calls; a tool loaded by a load_tools call earlier in the
     // same batch is deliberately NOT yet callable.
     const loadedAtTurnStart = new Set(loadedToolNames);
+    // Detect contiguous runs of >=2 spawn_subagent calls so the loop can
+    // launch them concurrently instead of awaiting each child to completion
+    // before spawning the next (see the concurrent-batch handler below).
+    // Keyed by the run's leader call id; followers are consumed when the
+    // leader runs. Only contiguous runs are grouped, so a spawn batch never
+    // jumps ahead of (or trails) an interleaved non-spawn call — turn order
+    // is preserved exactly as the serial path would have produced it.
+    const spawnBatches = new Map<string, typeof result.toolCalls>();
+    {
+      let i = 0;
+      while (i < result.toolCalls.length) {
+        if (result.toolCalls[i]!.function.name === "spawn_subagent") {
+          let j = i + 1;
+          while (j < result.toolCalls.length && result.toolCalls[j]!.function.name === "spawn_subagent") j += 1;
+          if (j - i >= 2) spawnBatches.set(result.toolCalls[i]!.id, result.toolCalls.slice(i, j));
+          i = j;
+        } else {
+          i += 1;
+        }
+      }
+    }
+    const consumedByBatch = new Set<string>();
     for (const call of result.toolCalls) {
+      // A follower of a concurrent spawn batch already had its guard, emit,
+      // and tool_result handled when the batch leader ran; skip it silently
+      // so it doesn't get a duplicate (or stray skip) result row.
+      if (consumedByBatch.has(call.id)) continue;
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
         const skipContent = JSON.stringify({ ok: false, skipped: true, reason: skipMessage });
@@ -2788,6 +2814,126 @@ async function runLoop(
         });
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
+      // Concurrent spawn batch: a contiguous run of >=2 spawn_subagent calls
+      // in this turn. spawn_subagent never returns a pending approval and is
+      // not a deferred/inline tool, so the calls are independent — the only
+      // thing serializing them is dispatchToolCall awaiting each child to a
+      // terminal state (waitForSubagentTerminal polls). submitTask already
+      // launches every child in the background (runTask fire-and-forget), so
+      // dispatching the whole run under Promise.all overlaps those waits:
+      // wall time collapses from the SUM of child runtimes to the MAX. The
+      // leader's guard (terminal re-check + running emit) already ran above;
+      // we run the same guard for each follower, emit running for all, then
+      // launch them together and stitch results back in turn order.
+      const spawnBatch = spawnBatches.get(call.id);
+      if (spawnBatch) {
+        // followers = the batch minus the leader (already guarded above).
+        const followers = spawnBatch.slice(1);
+        let batchAborted: { status: string } | undefined;
+        for (const follower of followers) {
+          const fStartedAt = now();
+          const fGuard = await mutateState(config.instance, (state) => {
+            const item = findTask(state, taskId);
+            if (isTerminalTaskStatus(item.status)) return { proceed: false as const, status: item.status };
+            pushRecentToolCall(item, {
+              id: follower.id,
+              name: follower.function.name,
+              argsPreview: buildArgsPreview(follower.function.arguments),
+              status: "running",
+              startedAt: fStartedAt
+            });
+            item.updatedAt = fStartedAt;
+            return { proceed: true as const };
+          });
+          if (!fGuard.proceed) {
+            batchAborted = { status: fGuard.status };
+            break;
+          }
+        }
+        if (batchAborted) {
+          appendTrace(config.instance, taskId, {
+            type: "task",
+            message: `Chat task bail-out: terminal status (${batchAborted.status}) observed before concurrent spawn batch`,
+            data: { iterations, leaderToolCallId: call.id, batchSize: spawnBatch.length }
+          });
+          const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+          return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+        }
+        // Mark every member as consumed so the outer loop skips the
+        // followers, and emit phase + running for all of them up front.
+        // Phase block first, then the running tool_call blocks — same order
+        // the serial path emits (phase then running) so the completed
+        // exchange renders the "Working:" label above its tool group rather
+        // than detached below it.
+        emitPhase(emitCtx, `Working: ${spawnBatch.length}x spawn_subagent (parallel)`);
+        for (const member of spawnBatch) {
+          consumedByBatch.add(member.id);
+          emitToolCallRunning(emitCtx, {
+            toolName: member.function.name,
+            callId: member.id,
+            args: parseToolArgsLenient(member.function.arguments)
+          });
+        }
+        appendTrace(config.instance, taskId, {
+          type: "tool",
+          message: `Dispatching ${spawnBatch.length} subagents concurrently`,
+          data: { toolCallIds: spawnBatch.map((c) => c.id) }
+        });
+        // Launch all dispatches together. Each settles to a tagged result;
+        // dispatchToolCall is the same entry the serial path uses, so result
+        // capping, audit, and trace all behave identically per child.
+        const settled = await Promise.all(
+          spawnBatch.map(async (member) => {
+            try {
+              const dispatch = await dispatchToolCall(
+                config,
+                taskId,
+                member.function.name,
+                member.id,
+                member.function.arguments,
+                workingMessages
+              );
+              // spawn_subagent never returns a pending approval; treat an
+              // unexpected pending defensively as an error result so the
+              // tool_call still resolves (a dangling tool_call breaks the
+              // next provider turn).
+              if (dispatch.kind === "sync") return { member, ok: true as const, content: dispatch.result };
+              return { member, ok: false as const, content: `Error: spawn_subagent unexpectedly required approval (${dispatch.approvalId}).` };
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return { member, ok: false as const, content: `Error: ${message}`, errored: true as const };
+            }
+          })
+        );
+        // Stitch results back in turn order so the message history stays
+        // paired (assistant tool_call -> tool result) in the exact sequence
+        // the provider emitted the calls.
+        for (const entry of settled) {
+          toolResultMessages.push({ role: "tool", tool_call_id: entry.member.id, content: entry.content });
+          persistTranscriptRow(config, taskId, transcriptSessionId, {
+            role: "tool",
+            toolCallId: entry.member.id,
+            content: entry.content
+          });
+          if (entry.ok) {
+            emitToolCallStatus(emitCtx, { callId: entry.member.id, status: "ok" });
+          } else {
+            emitToolCallStatus(emitCtx, { callId: entry.member.id, status: "error", errorMessage: entry.content });
+            if ("errored" in entry && entry.errored) {
+              appendTrace(config.instance, taskId, {
+                type: "error",
+                message: `Tool call ${entry.member.function.name} failed: ${entry.content}`,
+                data: { toolCallId: entry.member.id }
+              });
+            }
+          }
+          emitToolResult(emitCtx, { callId: entry.member.id, result: entry.content });
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), entry.member.id, entry.ok ? "done" : "error");
+          });
+        }
+        continue;
       }
       // start_thread is the agent-decided threading CONTROL tool, handled
       // INLINE here (before any phase/tool_call/tool_result emission) so it

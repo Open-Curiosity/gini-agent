@@ -25,6 +25,19 @@ and awaits the child's terminal state before returning the summary
 back as the tool result. Depth caps at 3 (parent → child →
 grandchild → great-grandchild is rejected).
 
+When a single model turn emits a **contiguous run of two or more**
+`spawn_subagent` calls, the chat-task loop dispatches that run
+concurrently under `Promise.all` rather than awaiting each child
+before spawning the next. The child tasks already execute in the
+background (`submitTask` fires `runTask` fire-and-forget), so the only
+thing the serial path was serializing was the parent's per-call
+`waitForSubagentTerminal` poll; overlapping those polls collapses the
+batch's wall time from the SUM of child runtimes to the MAX. Isolated
+spawns, and spawns interleaved with any non-spawn tool call, keep the
+unchanged serial path. See `docs/adr/subagent-delegation.md` ("Concurrent
+batch dispatch" below) for the ordering, approval, and cancellation
+semantics.
+
 ## Context
 
 Hermes-style "delegation" lets a parent agent fan out a focused
@@ -65,7 +78,9 @@ calling, approvals, audit, and trace records for free.
   - calls `spawnSubagent`,
   - polls `waitForSubagentTerminal` until the child reaches
     completed/failed/cancelled, the timeout elapses, or the parent
-    task itself transitions to cancelled,
+    task itself transitions to cancelled or failed (a sibling
+    tool-call approval denial flips the parent through the failed
+    branch, so the wait must settle on it too),
   - returns a JSON-shaped string `{ subagentId, status, summary, error }`
     as the tool result the model sees on the next iteration.
 - Cancellation cascades. `cancelTask` walks descendants by
@@ -87,11 +102,49 @@ calling, approvals, audit, and trace records for free.
   - `POST /api/subagents/<id>/cancel` cancels the underlying child
     task.
 
+## Concurrent batch dispatch
+
+A contiguous run of two or more `spawn_subagent` calls within one
+assistant turn (the threshold is the literal `j - i >= 2` in the
+batch-grouping scan in `src/execution/chat-task.ts`) is detected in the
+chat-task loop and dispatched together under `Promise.all`. The
+semantics:
+
+- **Contiguous-only grouping.** Only an adjacent run of spawn calls is
+  grouped. A spawn batch never jumps ahead of, or trails, an interleaved
+  non-spawn call — turn order is preserved exactly as the serial path
+  would have produced it. A lone `spawn_subagent` falls through to the
+  serial path untouched.
+- **Turn-order result stitching.** Results are pushed back into the
+  message history in the original call order (assistant `tool_call` →
+  `tool` result paired in sequence), so concurrency is invisible to the
+  transcript and to the model's next turn.
+- **Per-child independence is unchanged.** Each member still gets its own
+  running emit, terminal-status guard (so a mid-batch cancel bails the
+  whole turn to the stale task), audit (`subagent.spawn`), and trace.
+  `spawn_subagent` never returns a pending approval, so the batch path
+  has no interaction with the approval-pause/skip flow; and because each
+  child is its own task, a child that pauses on an approval-gated tool
+  gates only itself — siblings continue independently.
+- **Failure isolation and cancellation.** A batch member that fails (or
+  errors during dispatch) settles independently under `Promise.all` and
+  returns a `status: "failed"` / `Error:` tool result to the parent; it
+  does not abort its siblings and does not flip the parent terminal —
+  child failures never cascade upward. The only terminal cascade is
+  downward: if the *parent* task is itself cancelled or failed (operator
+  cancel, or an intra-turn sibling tool-call approval denial that flips
+  the parent), `waitForSubagentTerminal` short-circuits on the terminal
+  parent and `cancelDescendantTasks` tears down the in-flight children —
+  the same way the serial path unwinds.
+
 ## Deferred
 
 - Governance for budget/depth caps (e.g. per-subagent token caps,
   per-conversation total caps). The PoC uses a single `MAX_SUBAGENT_DEPTH`
-  constant.
+  constant. **No per-turn fan-out cap exists yet**: a contiguous batch of
+  N spawn calls launches all N concurrently, bounded only transitively by
+  the depth cap. A per-turn/per-conversation concurrency cap belongs in
+  this same governance pass.
 - Approval gating on `spawn_subagent`. Today it's medium-risk but
   bypasses approval — the audit record is the only record. A future
   pass may require approval for high-fanout subagent strategies.
@@ -128,5 +181,11 @@ calling, approvals, audit, and trace records for free.
   error to the model and creates no new SubagentRecord.
 - Cancelling a parent task cascades to in-flight subagent child
   tasks; both reach status `cancelled` after the cascade settles.
+- A single assistant turn emitting a contiguous run of two or more
+  `spawn_subagent` calls dispatches them concurrently under
+  `Promise.all` (their lifetimes overlap) and stitches the results
+  back in the original call order. A non-spawn tool call interleaved
+  between spawns breaks the contiguous run, so the surrounding spawns
+  fall back to the serial await path.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
   green.
