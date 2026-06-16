@@ -4,6 +4,7 @@ import {
   bedrockSupportsToolUse,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
+  resolveImageByteLimit,
   resolveProviderContextWindowTokens,
   resolveProviderModality
 } from "./provider-capabilities";
@@ -221,6 +222,18 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("openrouter", "openrouter/auto"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens({ name: "mystery" as ProviderConfig["name"], model: "x" }))
       .toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+  });
+});
+
+describe("resolveImageByteLimit", () => {
+  test("raw budget stays under the provider base64 cap once encoded", () => {
+    // Anthropic/Bedrock cap the base64-encoded `image.source.base64` payload at
+    // 5,242,880, not the raw bytes. base64 length = 4 * ceil(n / 3), so a raw
+    // limit must satisfy that the encoded form is <= the cap.
+    const limit = resolveImageByteLimit(provider("bedrock", "us.anthropic.claude-opus-4-8"));
+    expect(limit).toBeGreaterThan(0);
+    const encodedLength = 4 * Math.ceil(limit / 3);
+    expect(encodedLength).toBeLessThanOrEqual(5_242_880);
   });
 });
 
