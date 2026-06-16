@@ -219,16 +219,23 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
   }
 }
 
-// Maximum decoded image bytes a single image content part may carry. The
-// choke point is Anthropic's Messages API, which rejects any image whose
-// decoded `image.source.bytes` exceeds 5,242,880 (5 MB) server-side. We target
-// 5,000,000 — a margin under that ceiling — for every provider: anthropic and
-// bedrock share the limit, openrouter can route to an Anthropic upstream, and
-// providers that allow more (e.g. openai's 20 MB) are still safely served by a
-// smaller, high-quality JPEG. Kept as a per-provider hook so a future provider
-// with a different ceiling can be tuned here without touching the build path.
+// Maximum raw image bytes a single image content part may carry. The choke
+// point is Anthropic's Messages API, which caps the base64-encoded
+// `image.source.base64` payload — NOT the decoded bytes — at 5,242,880 server-
+// side. base64 inflates raw bytes by 4/3, so the raw budget that keeps the
+// encoded payload under the cap (with margin) is target * 3 / 4. Callers compare
+// raw decoded bytes against this limit. It is universal across every provider:
+// anthropic and bedrock share the cap, openrouter can route to an Anthropic
+// upstream, and providers that allow more (e.g. openai's 20 MB) are still safely
+// served by a smaller, high-quality JPEG. Kept as a per-provider hook so a
+// future provider with a different ceiling can be tuned here without touching
+// the build path.
 export function resolveImageByteLimit(_provider: ProviderConfig): number {
-  return 5_000_000;
+  const PROVIDER_BASE64_CAP = 5_242_880;
+  // Stay a margin under the hard cap on the encoded payload, then convert the
+  // encoded budget back to a raw-byte budget (base64 is 4/3 the size of raw).
+  const encodedTargetWithMargin = Math.min(5_000_000, PROVIDER_BASE64_CAP);
+  return Math.floor((encodedTargetWithMargin * 3) / 4);
 }
 
 // Bedrock Converse tool use (function calling) is per-model. Every family in the

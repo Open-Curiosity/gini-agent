@@ -1,7 +1,8 @@
 // Image compression for the vision-attachment build boundary.
 //
-// Anthropic's Messages API rejects any image whose decoded `image.source.bytes`
-// exceeds 5,242,880 (5 MB) with a hard server-side 400, failing the whole turn.
+// Anthropic's Messages API rejects any image whose base64-encoded
+// `image.source.base64` payload exceeds 5,242,880 (5 MB) with a hard server-side
+// 400, failing the whole turn.
 // Gini stores uploads full-size, so an oversized phone photo (e.g. a 5.5 MB
 // HEIC/JPEG) would 400 every turn it replays on. We downscale + re-encode such
 // images to fit under the provider's limit, lazily at the build boundary, and
