@@ -581,6 +581,7 @@ export default function ChatDetailScreen() {
                       <BlockToolCallsCollapsed
                         key={item.id}
                         calls={item.calls}
+                        steps={item.steps}
                         resultsByCallId={toolResultsByCallId}
                       />
                     );
