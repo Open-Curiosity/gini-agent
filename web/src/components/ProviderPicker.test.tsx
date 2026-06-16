@@ -288,6 +288,15 @@ describe("ProviderPicker rendering", () => {
     expect(screen.getByText("Loading providers…")).not.toBeNull();
   });
 
+  test("surfaces a terminal error (not a stuck spinner) when the catalog fetch fails", async () => {
+    catalogResponse = async () => new Response(JSON.stringify({ error: "down" }), { status: 503 });
+    render(<ProviderPicker onSaved={mock(() => {})} />);
+    expect(await screen.findByText(/Couldn't load providers/)).not.toBeNull();
+    expect(screen.queryByText("Loading providers…")).toBeNull();
+    // No config form renders without a selectable provider.
+    expect(screen.queryByText(/^Configure /)).toBeNull();
+  });
+
   test("seeds the first tile (codex) by default and shows its instructions", async () => {
     render(<ProviderPicker onSaved={mock(() => {})} />);
     // "codex login" appears in both a <pre> and an inline <code>; assert the

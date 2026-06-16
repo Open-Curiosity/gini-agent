@@ -290,7 +290,14 @@ export function ProviderPicker({
           <h2 className="text-sm font-semibold">Provider type</h2>
           <p className="text-xs text-muted-foreground">Choose the model API surface to configure.</p>
         </div>
-        {tiles.length === 0 ? (
+        {catalog.isError ? (
+          // A catalog fetch failure (e.g. the local gateway restarting — the BFF
+          // answers 503 gateway_unreachable, which api() throws on) must surface
+          // as a terminal error, not a spinner that never resolves.
+          <p className="text-xs text-destructive">
+            Couldn&apos;t load providers. Check that the gateway is running, then retry.
+          </p>
+        ) : tiles.length === 0 ? (
           <p className="text-xs text-muted-foreground">Loading providers…</p>
         ) : (
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -330,9 +337,14 @@ export function ProviderPicker({
         )}
       </section>
 
+      {/* The config form only makes sense once a real provider is selected.
+          Before the catalog seeds (or if it errors), `entry` is undefined —
+          rendering the form then would show an empty "Configure provider"
+          shell with a disabled, optionless model select. */}
+      {entry ? (
       <section className="rounded-2xl border border-border bg-card p-7">
         <div className="mb-5 space-y-1">
-          <h2 className="text-sm font-semibold">Configure {entry ? displayProviderName(entry) : "provider"}</h2>
+          <h2 className="text-sm font-semibold">Configure {displayProviderName(entry)}</h2>
           <p className="text-xs text-muted-foreground">
             {isCodex
               ? "Codex authenticates through your existing ChatGPT account — no API key needed."
@@ -568,6 +580,7 @@ export function ProviderPicker({
           </div>
         </form>
       </section>
+      ) : null}
     </div>
   );
 }
