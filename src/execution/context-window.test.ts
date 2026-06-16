@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolCallingMessage } from "../provider";
-import { packPriorContext, PRIOR_HISTORY_ELISION_NOTE, type ContextReplayMessage } from "./context-window";
+import {
+  estimateToolCallingMessageTokens,
+  packPriorContext,
+  PRIOR_HISTORY_ELISION_NOTE,
+  type ContextReplayMessage
+} from "./context-window";
 
 function entry(message: ToolCallingMessage, threadId?: string): ContextReplayMessage {
   return {
@@ -38,6 +43,32 @@ describe("prior context packing", () => {
     const toolResult = packed.messages.find((m) => m.role === "tool" && m.tool_call_id === "call_1");
     expect(assistantTool).toBeDefined();
     expect(toolResult).toBeDefined();
+  });
+
+  // An inline image is a base64 data URL. The provider tiles it to a small,
+  // bounded token cost regardless of byte size; counting the data-URL string
+  // at chars/4 over-estimates a multi-megabyte image by orders of magnitude.
+  // That phantom count is what tripped a spurious in-turn compaction bail in
+  // production: a 3.9 MB JPEG inlined as a data URL pushed the turn estimate
+  // to 891276 tokens against a 200000 window while the provider reported an
+  // input of 32406 tokens. The 3000023-char data URL below would score
+  // 750006 tokens under chars/4; the bounded estimate must stay far under it.
+  test("estimates an inline image by a bounded tile cost, not its data-URL length", () => {
+    const bigDataUrl = `data:image/jpeg;base64,${"A".repeat(3_000_000)}`;
+    const message: ToolCallingMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "is it good quality?" },
+        { type: "image_url", image_url: { url: bigDataUrl } }
+      ]
+    };
+    const tokens = estimateToolCallingMessageTokens(message);
+    const textOnly = estimateToolCallingMessageTokens({ role: "user", content: "is it good quality?" });
+    expect(tokens).toBeLessThan(5_000);
+    // The image must carry a real, bounded cost — never collapse toward the
+    // text part's count. That under-count is the regression the cap guards
+    // against (the estimate must never fall below a real image's token cost).
+    expect(tokens).toBeGreaterThan(textOnly + 1_000);
   });
 
   test("prefers active-thread history over unrelated thread history", () => {
