@@ -566,4 +566,543 @@ describe("gini setup --yes codex precedence", () => {
     expect(result.stderr).toContain("CODEX_AUTH_JSON");
     expect(result.stderr).toContain("~/.codex/auth.json");
   }, 30_000);
+
+  test("only ANTHROPIC_API_KEY set → auto-configures anthropic (not just openai/codex)", async () => {
+    const stateRoot = scratch("anthropic-yes");
+    const home = scratch("anthropic-yes-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home,
+      ANTHROPIC_API_KEY: "sk-ant-test"
+    };
+    delete env.OPENAI_API_KEY;
+    delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("anthropic");
+    const cfg = JSON.parse(readFileSync(join(stateRoot, "instances", instance, "config.json"), "utf8")) as { provider?: { name?: string; model?: string } };
+    expect(cfg.provider?.name).toBe("anthropic");
+    expect(cfg.provider?.model).toBe("claude-opus-4-8");
+  }, 30_000);
+});
+
+// Drive the interactive picker through a scripted SetupIO (the same approach
+// the runCodexLogin tests use), since the real prompt requires a TTY the
+// subprocess path refuses. Verifies every provider kind configures correctly.
+describe("gini setup interactive picker (scripted IO)", () => {
+  const { providerStep } = require("./commands/setup") as typeof import("./commands/setup");
+
+  // Build a SetupIO that answers select() by matching a predicate over the
+  // prompt, prompt()/secret() by substring of the question, with recorded
+  // success/error lines for assertions.
+  function scriptedIo(opts: {
+    pickProviderId: string;
+    answers?: Record<string, string>;
+    secret?: string;
+    selectFor?: (prompt: string, choices: { label: string; value: unknown }[]) => unknown | undefined;
+  }): SetupIO & { successes: string[]; errors: string[] } {
+    const successes: string[] = [];
+    const errors: string[] = [];
+    return {
+      isNonInteractive: false,
+      successes,
+      errors,
+      async select<T>(prompt: string, choices: { label: string; value: T }[], def = 0): Promise<T> {
+        if (prompt.startsWith("Select provider")) {
+          return choices.find((c) => (c.value as unknown) === opts.pickProviderId)!.value;
+        }
+        const custom = opts.selectFor?.(prompt, choices as { label: string; value: unknown }[]);
+        if (custom !== undefined) return custom as T;
+        return choices[def]!.value;
+      },
+      async prompt(question: string, dflt?: string): Promise<string> {
+        for (const [key, val] of Object.entries(opts.answers ?? {})) {
+          if (question.includes(key)) return val;
+        }
+        return dflt ?? "";
+      },
+      async secret(): Promise<string> {
+        return opts.secret ?? "";
+      },
+      info() {},
+      success(m: string) { successes.push(m); },
+      error(m: string) { errors.push(m); }
+    };
+  }
+
+  function freshConfig(): RuntimeConfigShape {
+    // A minimal fresh config: no provider set yet.
+    return { instance: "dev" } as RuntimeConfigShape;
+  }
+  type RuntimeConfigShape = Parameters<typeof providerStep.run>[0];
+
+  // Isolate HOME (so secrets.env writes land in a scratch dir, not the real
+  // ~/.gini) AND GINI_STATE_ROOT (so writeRuntimeConfig's config path resolves
+  // under the scratch tree); pre-create the instance dir the atomic write needs.
+  async function withScratchHome<T>(fn: (home: string) => T | Promise<T>): Promise<T> {
+    const home = scratch("picker-home");
+    const stateRoot = scratch("picker-state");
+    mkdirSync(join(stateRoot, "instances", "dev"), { recursive: true });
+    const oldHome = process.env.HOME;
+    const oldStateRoot = process.env.GINI_STATE_ROOT;
+    process.env.HOME = home;
+    process.env.GINI_STATE_ROOT = stateRoot;
+    try {
+      return await fn(home);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+      if (oldStateRoot === undefined) delete process.env.GINI_STATE_ROOT; else process.env.GINI_STATE_ROOT = oldStateRoot;
+    }
+  }
+
+  test("picker offers all eight providers in display order", () => {
+    expect(__testing.PROVIDERS.map((p) => p.id)).toEqual([
+      "openai", "codex", "anthropic", "bedrock", "azure", "openrouter", "deepseek", "local"
+    ]);
+  });
+
+  test("api-key provider (deepseek): prompts for key, saves it, sets provider", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.DEEPSEEK_API_KEY;
+      delete process.env.DEEPSEEK_API_KEY;
+      try {
+        const io = scriptedIo({ pickProviderId: "deepseek", secret: "sk-deepseek-xyz" });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("deepseek");
+        expect(config.provider?.model).toBe("deepseek-v4-flash");
+        expect(config.provider?.apiKeyEnv).toBe("DEEPSEEK_API_KEY");
+        expect(readKeyFromSecretsFile("DEEPSEEK_API_KEY")).toBe("sk-deepseek-xyz");
+      } finally {
+        if (old === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = old;
+      }
+    });
+  });
+
+  test("azure: captures endpoint, deployment, api-version, and auth scheme", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.AZURE_OPENAI_API_KEY;
+      delete process.env.AZURE_OPENAI_API_KEY;
+      try {
+        const io = scriptedIo({
+          pickProviderId: "azure",
+          secret: "azkey-123",
+          answers: {
+            "Azure resource endpoint": "https://myres.openai.azure.com",
+            "Deployment name": "my-deploy",
+            "API version": "2024-10-21"
+          },
+          selectFor: (prompt, choices) => (prompt.startsWith("Auth scheme") ? choices[0]!.value : undefined)
+        });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("azure");
+        expect(config.provider?.baseUrl).toBe("https://myres.openai.azure.com");
+        expect(config.provider?.deployment).toBe("my-deploy");
+        expect(config.provider?.apiVersion).toBe("2024-10-21");
+        expect(config.provider?.authScheme).toBe("api-key");
+        expect(readKeyFromSecretsFile("AZURE_OPENAI_API_KEY")).toBe("azkey-123");
+      } finally {
+        if (old === undefined) delete process.env.AZURE_OPENAI_API_KEY; else process.env.AZURE_OPENAI_API_KEY = old;
+      }
+    });
+  });
+
+  test("azure: blank endpoint aborts without setting the provider", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.AZURE_OPENAI_API_KEY;
+      delete process.env.AZURE_OPENAI_API_KEY;
+      try {
+        const io = scriptedIo({ pickProviderId: "azure", secret: "azkey-123", answers: { "Azure resource endpoint": "" } });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).not.toBe("azure");
+        expect(io.errors.join("\n")).toContain("Azure requires a resource endpoint");
+      } finally {
+        if (old === undefined) delete process.env.AZURE_OPENAI_API_KEY; else process.env.AZURE_OPENAI_API_KEY = old;
+      }
+    });
+  });
+
+  test("azure: non-https endpoint aborts", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.AZURE_OPENAI_API_KEY;
+      delete process.env.AZURE_OPENAI_API_KEY;
+      try {
+        const io = scriptedIo({ pickProviderId: "azure", secret: "azkey-123", answers: { "Azure resource endpoint": "http://insecure.example.com" } });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).not.toBe("azure");
+        expect(io.errors.join("\n")).toContain("https://");
+      } finally {
+        if (old === undefined) delete process.env.AZURE_OPENAI_API_KEY; else process.env.AZURE_OPENAI_API_KEY = old;
+      }
+    });
+  });
+
+  test("local: captures base URL and saves an optional key", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.GINI_LOCAL_API_KEY;
+      delete process.env.GINI_LOCAL_API_KEY;
+      try {
+        const io = scriptedIo({
+          pickProviderId: "local",
+          secret: "local-secret",
+          answers: { "Local server base URL": "http://localhost:1234/v1" }
+        });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("local");
+        expect(config.provider?.baseUrl).toBe("http://localhost:1234/v1");
+        expect(readKeyFromSecretsFile("GINI_LOCAL_API_KEY")).toBe("local-secret");
+      } finally {
+        if (old === undefined) delete process.env.GINI_LOCAL_API_KEY; else process.env.GINI_LOCAL_API_KEY = old;
+      }
+    });
+  });
+
+  test("local: no key entered → no-auth gateway, base URL still set", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.GINI_LOCAL_API_KEY;
+      delete process.env.GINI_LOCAL_API_KEY;
+      try {
+        const io = scriptedIo({ pickProviderId: "local", secret: "", answers: { "Local server base URL": "http://127.0.0.1:11434/v1" } });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("local");
+        expect(config.provider?.baseUrl).toBe("http://127.0.0.1:11434/v1");
+        expect(hasKeyInSecretsFile("GINI_LOCAL_API_KEY")).toBe(false);
+      } finally {
+        if (old === undefined) delete process.env.GINI_LOCAL_API_KEY; else process.env.GINI_LOCAL_API_KEY = old;
+      }
+    });
+  });
+
+  test("api-key provider with key already in env: reuses it without prompting", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.OPENROUTER_API_KEY;
+      process.env.OPENROUTER_API_KEY = "sk-or-fromenv";
+      try {
+        // secret() returns "" — if it were called the flow would abort, so a
+        // successful set proves the env key was reused without a prompt.
+        const io = scriptedIo({ pickProviderId: "openrouter", secret: "" });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("openrouter");
+        expect(readKeyFromSecretsFile("OPENROUTER_API_KEY")).toBe("sk-or-fromenv");
+      } finally {
+        if (old === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = old;
+      }
+    });
+  });
+
+  test("api-key provider: empty key entry aborts without setting the provider", async () => {
+    await withScratchHome(async () => {
+      const old = process.env.DEEPSEEK_API_KEY;
+      delete process.env.DEEPSEEK_API_KEY;
+      try {
+        const io = scriptedIo({ pickProviderId: "deepseek", secret: "" });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).not.toBe("deepseek");
+        expect(io.errors.join("\n")).toContain("No API key entered");
+      } finally {
+        if (old === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = old;
+      }
+    });
+  });
+
+  test("bedrock: with AWS creds, captures region and sets provider", async () => {
+    await withScratchHome(async () => {
+      const saved = {
+        id: process.env.AWS_ACCESS_KEY_ID,
+        secret: process.env.AWS_SECRET_ACCESS_KEY,
+        profile: process.env.AWS_PROFILE,
+        file: process.env.AWS_SHARED_CREDENTIALS_FILE
+      };
+      try {
+        delete process.env.AWS_PROFILE;
+        process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+        process.env.AWS_ACCESS_KEY_ID = "AKIATESTTESTTEST";
+        process.env.AWS_SECRET_ACCESS_KEY = "secret/value";
+        const io = scriptedIo({ pickProviderId: "bedrock", answers: { "AWS region": "us-west-2" } });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("bedrock");
+        expect(config.provider?.awsRegion).toBe("us-west-2");
+      } finally {
+        for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+
+  test("bedrock: without AWS creds, aborts with a guidance message", async () => {
+    await withScratchHome(async () => {
+      const saved = {
+        id: process.env.AWS_ACCESS_KEY_ID,
+        secret: process.env.AWS_SECRET_ACCESS_KEY,
+        profile: process.env.AWS_PROFILE,
+        file: process.env.AWS_SHARED_CREDENTIALS_FILE
+      };
+      try {
+        delete process.env.AWS_ACCESS_KEY_ID;
+        delete process.env.AWS_SECRET_ACCESS_KEY;
+        delete process.env.AWS_PROFILE;
+        process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+        const io = scriptedIo({ pickProviderId: "bedrock" });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).not.toBe("bedrock");
+        expect(io.errors.join("\n")).toContain("No AWS credentials found");
+      } finally {
+        for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+});
+
+// Drive runConfiguredFlow: when the current provider is already configured the
+// step offers keep / update-credentials / change-model / switch / cancel.
+describe("gini setup configured-provider flow (scripted IO)", () => {
+  const { providerStep } = require("./commands/setup") as typeof import("./commands/setup");
+
+  function ioChoosing(action: string, over: Partial<SetupIO> = {}): SetupIO & { successes: string[] } {
+    const successes: string[] = [];
+    return {
+      isNonInteractive: false,
+      successes,
+      select: async <T,>(prompt: string, choices: { label: string; value: T }[], def = 0) => {
+        const hit = choices.find((c) => (c.value as unknown) === action);
+        if (prompt.startsWith("What would you like to do") && hit) return hit.value;
+        return choices[def]!.value;
+      },
+      prompt: async (_q: string, dflt?: string) => dflt ?? "",
+      secret: async () => "",
+      info() {},
+      success(m: string) { successes.push(m); },
+      error() {},
+      ...over
+    } as SetupIO & { successes: string[] };
+  }
+
+  async function withConfiguredOpenAI<T>(fn: () => T | Promise<T>): Promise<T> {
+    const home = scratch("configured-home");
+    const stateRoot = scratch("configured-state");
+    mkdirSync(join(stateRoot, "instances", "dev"), { recursive: true });
+    const oldHome = process.env.HOME;
+    const oldRoot = process.env.GINI_STATE_ROOT;
+    const oldKey = process.env.OPENAI_API_KEY;
+    process.env.HOME = home;
+    process.env.GINI_STATE_ROOT = stateRoot;
+    process.env.OPENAI_API_KEY = "sk-configured";
+    try {
+      // Must AWAIT so env stays overridden through the async config write —
+      // restoring in finally before the promise settles would strip
+      // GINI_STATE_ROOT mid-write and send the config to the real ~/.gini.
+      return await fn();
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+      if (oldRoot === undefined) delete process.env.GINI_STATE_ROOT; else process.env.GINI_STATE_ROOT = oldRoot;
+      if (oldKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = oldKey;
+    }
+  }
+
+  test("keep: leaves the configured provider unchanged", async () => {
+    await withConfiguredOpenAI(async () => {
+      const io = ioChoosing("keep");
+      const config = { instance: "dev", provider: { name: "openai", model: "gpt-5.4-mini" } } as Parameters<typeof providerStep.run>[0];
+      await providerStep.run(config, io);
+      expect(io.successes.join("\n")).toContain("Kept current configuration");
+      expect(config.provider?.name).toBe("openai");
+    });
+  });
+
+  test("change model: updates the model to an explicit pick", async () => {
+    await withConfiguredOpenAI(async () => {
+      // First select() answers the action menu ("Change model"); the second is
+      // the model picker — answer it by choosing a concrete model id so the
+      // flow persists rather than taking the default "Skip".
+      let selectCalls = 0;
+      const io = ioChoosing("model", {
+        select: async <T,>(prompt: string, choices: { label: string; value: T }[], def = 0) => {
+          selectCalls += 1;
+          if (prompt.startsWith("What would you like to do")) {
+            return choices.find((c) => (c.value as unknown) === "model")!.value;
+          }
+          // Model picker: pick gpt-5.4 explicitly (not the skip sentinel).
+          const pick = choices.find((c) => (c.value as unknown) === "gpt-5.4");
+          return (pick ?? choices[def]!).value;
+        }
+      });
+      const config = { instance: "dev", provider: { name: "openai", model: "gpt-5.4-mini" } } as Parameters<typeof providerStep.run>[0];
+      await providerStep.run(config, io);
+      expect(selectCalls).toBeGreaterThanOrEqual(2);
+      expect(config.provider?.name).toBe("openai");
+      expect(config.provider?.model).toBe("gpt-5.4");
+      expect(io.successes.join("\n")).toContain("Provider set to openai (gpt-5.4)");
+    });
+  });
+});
+
+// Drive runNonInteractive in-process (isNonInteractive: true) so the
+// generalized auto-config loop and describeCredentialSource are exercised
+// directly (the subprocess tests above cover the wiring; these cover the
+// branch matrix without spawning a CLI per case).
+describe("gini setup non-interactive (in-process)", () => {
+  const { providerStep } = require("./commands/setup") as typeof import("./commands/setup");
+
+  function nonInteractiveIo(): SetupIO & { successes: string[] } {
+    const successes: string[] = [];
+    return {
+      isNonInteractive: true,
+      successes,
+      select: async <T,>(_p: string, choices: { label: string; value: T }[], def = 0) => choices[def]!.value,
+      prompt: async (_q: string, dflt?: string) => dflt ?? "",
+      secret: async () => "",
+      info() {},
+      success(m: string) { successes.push(m); },
+      error() {}
+    };
+  }
+
+  async function withIsolatedEnv<T>(envOverrides: Record<string, string | undefined>, fn: () => T | Promise<T>): Promise<T> {
+    const home = scratch("noninteractive-home");
+    const stateRoot = scratch("noninteractive-state");
+    mkdirSync(join(stateRoot, "instances", "dev"), { recursive: true });
+    // Clear every credential signal first so the host environment can't leak in.
+    const keys = [
+      "HOME", "GINI_STATE_ROOT", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+      "DEEPSEEK_API_KEY", "AZURE_OPENAI_API_KEY", "GINI_LOCAL_API_KEY", "CODEX_AUTH_JSON",
+      "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE"
+    ];
+    const saved: Record<string, string | undefined> = {};
+    for (const k of keys) { saved[k] = process.env[k]; delete process.env[k]; }
+    process.env.HOME = home;
+    process.env.GINI_STATE_ROOT = stateRoot;
+    // Point AWS shared-credentials file at nothing so a real ~/.aws can't leak.
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+    // codex resolves ~/.codex/auth.json via os.homedir() (the OS user database,
+    // NOT the HOME env var), so a real ~/.codex/auth.json on the test machine
+    // would leak in and always win precedence. CODEX_AUTH_JSON is checked first
+    // and DOES honor the env var, so point it at a non-existent path to force
+    // codex "unconfigured" unless a test explicitly overrides it.
+    process.env.CODEX_AUTH_JSON = "/nonexistent/codex/auth.json";
+    for (const [k, v] of Object.entries(envOverrides)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    }
+  }
+
+  test("only ANTHROPIC_API_KEY in env → auto-configures anthropic and persists the key", async () => {
+    await withIsolatedEnv({ ANTHROPIC_API_KEY: "sk-ant-xyz" }, async () => {
+      const io = nonInteractiveIo();
+      const config = { instance: "dev" } as Parameters<typeof providerStep.run>[0];
+      await providerStep.run(config, io);
+      expect(config.provider?.name).toBe("anthropic");
+      expect(io.successes.join("\n")).toContain("anthropic");
+      expect(io.successes.join("\n")).toContain("key from env");
+      expect(readKeyFromSecretsFile("ANTHROPIC_API_KEY")).toBe("sk-ant-xyz");
+    });
+  });
+
+  test("only AWS credentials → auto-configures bedrock with AWS source line", async () => {
+    await withIsolatedEnv({ AWS_ACCESS_KEY_ID: "AKIATESTTESTTEST", AWS_SECRET_ACCESS_KEY: "secret/value" }, async () => {
+      const io = nonInteractiveIo();
+      const config = { instance: "dev" } as Parameters<typeof providerStep.run>[0];
+      await providerStep.run(config, io);
+      expect(config.provider?.name).toBe("bedrock");
+      expect(io.successes.join("\n")).toContain("AWS credentials from env / ~/.aws");
+    });
+  });
+
+  test("codex precedence: both codex auth and an API key present → codex wins", async () => {
+    const home = scratch("codex-prec-home");
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-codex" }));
+    await withIsolatedEnv({ CODEX_AUTH_JSON: authPath, ANTHROPIC_API_KEY: "sk-ant-xyz" }, async () => {
+      const io = nonInteractiveIo();
+      const config = { instance: "dev" } as Parameters<typeof providerStep.run>[0];
+      await providerStep.run(config, io);
+      expect(config.provider?.name).toBe("codex");
+      expect(io.successes.join("\n")).toContain("credentials from CODEX_AUTH_JSON env");
+    });
+  });
+
+  test("no credentials at all → throws naming the OPENAI/CODEX sources", async () => {
+    await withIsolatedEnv({}, async () => {
+      const io = nonInteractiveIo();
+      const config = { instance: "dev" } as Parameters<typeof providerStep.run>[0];
+      await expect(providerStep.run(config, io)).rejects.toThrow(/OPENAI_API_KEY[\s\S]*CODEX_AUTH_JSON/);
+    });
+  });
+});
+
+describe("provider modules (direct)", () => {
+  test("bedrock.checkCredentials reflects AWS credential presence", () => {
+    const oldId = process.env.AWS_ACCESS_KEY_ID;
+    const oldSecret = process.env.AWS_SECRET_ACCESS_KEY;
+    const oldProfile = process.env.AWS_PROFILE;
+    const oldFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+    try {
+      delete process.env.AWS_PROFILE;
+      // Point the shared-credentials file at a non-existent path so a real
+      // ~/.aws/credentials on the test machine can't make this flaky.
+      process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+      delete process.env.AWS_ACCESS_KEY_ID;
+      delete process.env.AWS_SECRET_ACCESS_KEY;
+      expect(__testing.bedrockProvider.checkCredentials().available).toBe(false);
+
+      process.env.AWS_ACCESS_KEY_ID = "AKIATESTTESTTEST";
+      process.env.AWS_SECRET_ACCESS_KEY = "secret/key/value";
+      expect(__testing.bedrockProvider.checkCredentials().available).toBe(true);
+    } finally {
+      if (oldId === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = oldId;
+      if (oldSecret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = oldSecret;
+      if (oldProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = oldProfile;
+      if (oldFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = oldFile;
+    }
+  });
+
+  test("local.checkCredentials is always available (no-auth gateways are valid)", () => {
+    const old = process.env.GINI_LOCAL_API_KEY;
+    const oldHome = process.env.HOME;
+    // Point HOME at an empty scratch dir so a real ~/.gini/secrets.env with a
+    // GINI_LOCAL_API_KEY can't make the source assertion flaky.
+    const home = scratch("local-cred-home");
+    delete process.env.GINI_LOCAL_API_KEY;
+    process.env.HOME = home;
+    try {
+      const status = __testing.localProvider.checkCredentials();
+      expect(status.available).toBe(true);
+      expect(status.source).toBe("missing");
+    } finally {
+      if (old !== undefined) process.env.GINI_LOCAL_API_KEY = old;
+      if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    }
+  });
+
+  test("AUTO_CONFIGURABLE excludes azure and local (need interactive transport input)", () => {
+    const ids = __testing.AUTO_CONFIGURABLE.map((p) => p.id);
+    expect(ids).not.toContain("azure");
+    expect(ids).not.toContain("local");
+    expect(ids).toContain("bedrock");
+    expect(ids).toContain("anthropic");
+  });
 });

@@ -127,7 +127,7 @@ For step-by-step setup of each provider — getting credentials, installing any 
 
 The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). The `azure` provider targets an Azure OpenAI resource: set `--base-url` to `https://<resource>.openai.azure.com` and pick a deployment; `--api-version` defaults to a GA value and `--auth-scheme` defaults to `api-key` (a resource key), with `bearer` available for an Entra token. API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract and [Azure OpenAI As A First-Class Provider](docs/adr/azure-provider.md) for the Azure routing contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
-> **Note:** `gini setup`'s interactive picker currently covers only OpenAI and Codex. For Bedrock, Azure, Anthropic, OpenRouter, DeepSeek, or Local, use `gini provider set …` (above) or the web **Settings → Add provider** form.
+`gini setup`'s interactive picker covers every provider — OpenAI, Codex, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, and Local — prompting for whatever each one needs (an API key, the AWS credential check for Bedrock, the resource endpoint and deployment for Azure, the base URL for Local). `gini provider set …` (above) and the web **Settings → Add provider** form remain available for scripted or non-interactive configuration.
 
 ## Parallel Instances
 

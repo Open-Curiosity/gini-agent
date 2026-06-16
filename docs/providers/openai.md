@@ -43,7 +43,7 @@ compatible proxy with `--base-url`.
 ### Web
 
 Open **Settings → Add provider → OpenAI**, paste the key, and pick a model.
-(OpenAI is also covered by the `gini setup` interactive picker.)
+(`gini setup`'s interactive picker also configures OpenAI, like every provider.)
 
 ## Re-authentication
 

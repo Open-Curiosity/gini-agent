@@ -15,9 +15,11 @@ provider in Gini (both the CLI and the web Add Provider form).
 | Codex (OpenAI OAuth) | OAuth / CLI | `~/.codex/auth.json` (no key) | [codex.md](codex.md) |
 | Local (OpenAI-compatible) | none / optional key | `GINI_LOCAL_API_KEY` (optional) | [local.md](local.md) |
 
-`gini setup`'s interactive picker covers **OpenAI** and **Codex**. For every
-other provider, use `gini provider set …` (each page has the exact command) or
-the web **Settings → Add provider** form.
+`gini setup`'s interactive picker covers **every** provider above, prompting for
+whatever each one needs (an API key, the AWS credential check for Bedrock, the
+resource endpoint and deployment for Azure, the base URL for Local). You can
+also use `gini provider set …` (each page has the exact command) or the web
+**Settings → Add provider** form for scripted or non-interactive setup.
 
 When a credential fails mid-chat, Gini surfaces a provider-named note: API-key
 providers link to the Settings key form, Bedrock points at AWS-credential
