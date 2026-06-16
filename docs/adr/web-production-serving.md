@@ -25,12 +25,16 @@ Only the update and install flows ever **create** prod dirs:
 - `updateRuntime` (`src/runtime/update.ts`) runs `bun run build` in `web/`
   with `GINI_DIST_DIR=.next-prod-<sha12-of-the-new-HEAD>` after the web
   `bun install`. The build is skipped when that dir already carries a
-  `BUILD_ID` (idempotent re-update onto the same head). On success, every
-  *other* `web/.next-prod-*` dir is deleted — a non-matching sha can never
-  be served again, and each bundle is a full Next build's worth of disk. On
-  build failure `updateRuntime` throws (same contract as a failed
-  `bun install`), so **no restart is scheduled** and the old server keeps
-  serving its old, still self-consistent bundle.
+  `BUILD_ID` (idempotent re-update onto the same head). On success, the new
+  HEAD's bundle **and the previous HEAD's bundle** are kept; every
+  strictly-older `web/.next-prod-*` dir is deleted — a non-matching sha can
+  never be served again, and each bundle is a full Next build's worth of
+  disk. The previous bundle is preserved because the still-running old web
+  server is serving from it until the restart lands; it is reclaimed by a
+  later update once it is two generations old, so disk stays bounded to ~2
+  bundles steady-state. On build failure `updateRuntime` throws (same
+  contract as a failed `bun install`), so **no restart is scheduled** and the
+  old server keeps serving its old, still self-consistent bundle.
 - `scripts/install.sh` runs the same build after installing web
   dependencies, so a fresh install serves production from first boot.
 
@@ -98,9 +102,11 @@ instead.
   UpdateGate's whole-gate stall deadline was raised to 240s to cover it
   (see [Runtime Update Surface](runtime-update-surface.md)); the updating
   tab sits behind the gate's blur for the duration either way.
-- Between the GC of old prod dirs and the restart, the still-running old
-  server can 500 on a route it hadn't loaded yet (~1s window). Accepted:
-  the updating tab is blurred, and the restart lands on the new bundle.
+- The previous HEAD's bundle survives the GC, so the still-running old
+  server keeps serving a valid bundle across the whole update window — it
+  cannot 500 on a not-yet-loaded route because the bundle it serves from is
+  never deleted out from under it. The restart then lands on the new
+  bundle.
 - `web/.next-prod-*` dirs are working artifacts like `.next-<instance>`;
   `web/.gitignore`'s existing `/.next-*/` entry covers them.
 - Production mode ignores dev-only conveniences (`allowedDevOrigins`, HMR);
@@ -111,14 +117,15 @@ instead.
   start` is read-only on the dist dir, unlike `next dev`'s exclusive
   `<distDir>/lock` (which is why the dev fallback keeps the per-instance
   dirs).
-- Known limitation for multi-instance installs sharing the installed
-  runtime: an update triggered from one instance GCs every prior
-  `.next-prod-*` bundle and restarts only the triggering instance. Other
-  instances keep their already-running servers (which hold the deleted
-  bundle's assets in memory / open file handles and may 500 on
-  not-yet-loaded routes) until they are restarted themselves, at which
-  point they pick up the new bundle. Single-instance installs — the
-  installer default — never hit this.
+- Multi-instance installs sharing the installed runtime: an update
+  triggered from one instance restarts only the triggering instance. Other
+  instances keep their already-running servers until they are restarted
+  themselves, at which point they pick up the new bundle. Preserving the
+  previous HEAD's bundle mitigates this — an instance still on that bundle
+  keeps serving it, so it works until it restarts. Only an instance running
+  a bundle two generations old (reclaimed by a later update) can lose its
+  dist dir before restarting. Single-instance installs — the installer
+  default — never hit this.
 - CI gates merges on the same serving mode: the workflow builds the web app
   into a `GINI_DIST_DIR` production bundle, boots `next start -H 127.0.0.1`
   from it, and fails unless `/api/runtime/__healthz` answers
@@ -133,9 +140,9 @@ instead.
 ## Acceptance Checks
 
 - `updateRuntime` builds `web/.next-prod-<sha12>` for the new HEAD, skips
-  the build when a `BUILD_ID` is already present, deletes other
-  `.next-prod-*` dirs on success, and throws (scheduling no restart) on
-  build failure.
+  the build when a `BUILD_ID` is already present, keeps the new bundle and
+  the previous HEAD's bundle while deleting strictly-older `.next-prod-*`
+  dirs on success, and throws (scheduling no restart) on build failure.
 - The web shim and `webLaunchPlan` both serve `next start` with
   `-H 127.0.0.1` and `GINI_DIST_DIR=.next-prod-<sha12>` iff that dir
   matches the current HEAD and carries a `BUILD_ID`; otherwise they exec
