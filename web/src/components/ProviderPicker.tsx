@@ -251,22 +251,35 @@ export function ProviderPicker({
     else setError(message);
   };
 
+  // Freeze the payload and the success summary together at submit time and
+  // thread them through the mutation. Reading state in onSuccess instead would
+  // report whichever provider is selected when the POST RESOLVES — if the user
+  // clicks a different tile mid-flight, the toast/redirect would announce a
+  // provider the backend never received. A single frozen snapshot keeps the
+  // request body and the reported summary in agreement.
   const save = useMutation({
-    mutationFn: (): Promise<SetProviderResult> =>
+    mutationFn: ({ payload }: { payload: Record<string, unknown>; summary: ProviderSaveSummary }): Promise<SetProviderResult> =>
       api<SetProviderResult>("/setup/provider", {
         method: "POST",
-        body: JSON.stringify(buildProviderPayload(formState))
+        body: JSON.stringify(payload)
       }),
-    onSuccess: async (result) => {
+    onSuccess: async (result, { summary }) => {
       if (!result.ok) {
         reportError(result.error ?? "Failed to save provider.");
         return;
       }
       setError(null);
-      await onSaved({ provider: providerName, model: selectedModel, isCodex });
+      await onSaved(summary);
     },
     onError: (e: Error) => reportError(e.message)
   });
+
+  const submit = () => {
+    save.mutate({
+      payload: buildProviderPayload(formState),
+      summary: { provider: providerName, model: selectedModel, isCodex }
+    });
+  };
 
   const canSubmit = canSubmitProvider(formState, save.isPending);
 
@@ -289,7 +302,12 @@ export function ProviderPicker({
                   key={tile.id}
                   type="button"
                   onClick={() => onProviderChange(tile.name)}
-                  className={`relative flex flex-col items-start gap-2 rounded-xl border p-4 text-left transition ${
+                  // Lock tile switching while a save is in flight, matching the
+                  // config inputs below — the success summary is snapshotted at
+                  // submit, but disabling here also keeps the visible selection
+                  // honest about what's being saved.
+                  disabled={save.isPending}
+                  className={`relative flex flex-col items-start gap-2 rounded-xl border p-4 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${
                     selected
                       ? "border-[#4277FB] bg-[#EEF2FF] dark:border-[#3D3DC8] dark:bg-[#1B1B33]"
                       : "border-border bg-card hover:bg-accent"
@@ -340,7 +358,7 @@ export function ProviderPicker({
           className="space-y-5"
           onSubmit={(e) => {
             e.preventDefault();
-            if (canSubmit) save.mutate();
+            if (canSubmit) submit();
           }}
         >
           {isCodex ? (

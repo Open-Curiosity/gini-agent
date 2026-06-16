@@ -425,6 +425,28 @@ describe("ProviderPicker submit", () => {
     expect(await screen.findByRole("button", { name: "Verifying…" })).not.toBeNull();
   });
 
+  test("the tiles lock while a save is pending, so the summary can't drift to a switched provider", async () => {
+    const onSaved = mock(() => {});
+    // Resolve the POST only once the test releases it, so the save stays
+    // pending while we attempt to switch tiles.
+    let release!: (r: Response) => void;
+    setProvider = () => new Promise<Response>((resolve) => { release = resolve; });
+    const user = userEvent.setup();
+    render(<ProviderPicker onSaved={onSaved} />);
+    await selectTile(user, "OpenAI");
+    await user.type(screen.getByLabelText("API key"), "sk-test");
+    await user.click(screen.getByRole("button", { name: "Save provider" }));
+    // The Local tile is now disabled — clicking it must NOT change the selection.
+    const localTile = (await screen.findByText("Local", { exact: true })).closest("button") as HTMLButtonElement;
+    expect(localTile.disabled).toBe(true);
+    await user.click(localTile);
+    release(new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } }));
+    // The summary reports the SUBMITTED provider (openai), never the click target.
+    await waitFor(() =>
+      expect(onSaved).toHaveBeenCalledWith({ provider: "openai", model: "gpt-5.4-mini", isCodex: false })
+    );
+  });
+
   test("local needs no API key field and submits on model alone", async () => {
     const onSaved = mock(() => {});
     const user = userEvent.setup();
@@ -492,6 +514,10 @@ describe("ProviderPicker failure handling", () => {
 describe("ProviderPicker chrome", () => {
   test("renders a provided secondary action node next to submit", async () => {
     render(<ProviderPicker onSaved={mock(() => {})} secondaryAction={<button type="button">Cancel</button>} />);
-    expect(await screen.findByRole("button", { name: "Cancel" })).not.toBeNull();
+    // Wait for the catalog to settle and seed the first tile before asserting,
+    // so the test doesn't finish (and emit act warnings) mid-fetch. The codex
+    // verify button only renders once seeding has run.
+    await screen.findByRole("button", { name: "Verify Codex auth" });
+    expect(screen.getByRole("button", { name: "Cancel" })).not.toBeNull();
   });
 });
