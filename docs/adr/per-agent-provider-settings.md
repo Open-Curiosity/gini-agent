@@ -46,8 +46,10 @@ heavy secret-write/plist-refresh machinery per agent.
 Consequences of this split:
 
 - The Settings tab offers only providers reported `configured` by
-  `providerCatalogWithStatus` — an override to an unconfigured provider would
-  fail at the next turn, so it is not offered.
+  `providerCatalogWithStatus` — a turn through an unconfigured provider falls
+  back transiently to a configured one ([Transient Provider Fallback](./provider-fallback.md))
+  rather than running the chosen provider, so the tab still offers only
+  configured rows.
 - Because `resolveEffectiveContext` inherits the instance's transport config
   (baseUrl, apiKeyEnv, Azure routing, extraBody) only when the agent routes to
   the **same** provider name as the instance, a cross-provider agent takes
@@ -82,7 +84,9 @@ to be `configured`. The configured-only restriction is a UI affordance (the
 Settings tab filters to configured rows), not an API contract — the endpoint
 intentionally allows setting a known-but-unconfigured provider (e.g. to
 pre-select one before its credential is added). An override to an unconfigured
-provider simply surfaces the normal provider-auth error on the next turn.
+provider does not fail the turn: dispatch falls back transiently to a configured
+provider and the web surfaces a banner — see
+[Transient Provider Fallback](./provider-fallback.md).
 
 ## UI
 
@@ -144,8 +148,9 @@ agent.
 - `src/capabilities/agents.ts` — `setAgentProvider` (validation, no-op,
   audit).
 - `src/http.ts` — `POST /api/agents/:id/provider` route.
-- `src/execution/effective-context.ts` — unchanged resolution chokepoint the
-  override feeds.
+- `src/execution/effective-context.ts` — the resolution chokepoint the override
+  feeds; it also applies the transient credential fallback
+  ([Transient Provider Fallback](./provider-fallback.md)).
 - `web/src/components/chat/SettingsTab.tsx` — the per-agent provider/model
   picker.
 - `web/src/components/chat/ChatTabBar.tsx`, `web/src/app/chat/page.tsx` — the
