@@ -245,7 +245,14 @@ describe("tunnel integration", () => {
   // change a test's outcome — e.g. an ambient GINI_TUNNEL_RESUME_WAIT_MS=0 would
   // make the override poll time out immediately. Tests that need a specific value
   // set it themselves; afterEach restores the original.
-  const TUNNEL_ENV_KEYS = ["GINI_TUNNEL_PORT", "GINI_TUNNEL_RESUME_WAIT_MS", "GINI_TUNNEL_RESUME_POLL_MS"] as const;
+  const TUNNEL_ENV_KEYS = [
+    "GINI_TUNNEL_PORT",
+    "GINI_TUNNEL_RESUME_WAIT_MS",
+    "GINI_TUNNEL_RESUME_POLL_MS",
+    "GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS",
+    "GINI_TUNNEL_RECONNECT_BASE_MS",
+    "GINI_TUNNEL_RECONNECT_MAX_MS"
+  ] as const;
   let prevEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -1283,9 +1290,12 @@ describe("tunnel integration", () => {
     await stopAllTunnels();
   });
 
-  // A live tunnel whose frpc child exits on its own (crash/relay drop) flips
-  // "connected" -> "error" so the UI stops advertising a dead tunnel.
-  test("a tunnel child exiting on its own flips connected to error", async () => {
+  // With auto-reconnect disabled, a live tunnel whose frpc child exits on its
+  // own (crash/relay drop) flips "connected" -> "error" so the UI stops
+  // advertising a dead tunnel. (The default behavior — auto-reconnect — is
+  // covered in the reconnect tests below.)
+  test("a tunnel child exiting on its own flips connected to error (reconnect disabled)", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "0"; // restored in afterEach
     const child = crashableChild();
     setTunnelDeps(deps({ buildTunnel: () => child }));
     await connectTunnel(config, "gini-relay");
@@ -1401,11 +1411,13 @@ describe("manual tunnel drivers", () => {
 
   beforeEach(() => {
     config = testConfig(`m-${Math.random().toString(36).slice(2)}`);
+    delete process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS;
     setTunnelDeps(deps());
   });
 
   afterEach(() => {
     setTunnelDeps();
+    delete process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS;
     rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
   });
 
@@ -1477,7 +1489,8 @@ describe("manual tunnel drivers", () => {
     expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
   });
 
-  test("manual connect with a child supervises it: a crash flips connected -> error", async () => {
+  test("manual connect with a child supervises it: a crash flips connected -> error (reconnect disabled)", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "0"; // cleared in afterEach
     const child = crashableChild();
     setTunnelDeps(deps({
       drivers: fakeDrivers({
@@ -2882,5 +2895,430 @@ describe("makeDefaultDrivers", () => {
     // margin keeps this test bounded well under the per-test cap.
     const result = await defaultRunCommand(["sh", "-c", 'trap "" TERM; sleep 30'], 25);
     expect(result.exitCode).not.toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-reconnect after an unexpected child exit, and the relay readiness
+// timeout. frp's own loop recovers a transient drop without exiting; these
+// cover the gini-level recovery for the exits that DO reach the watcher (crash,
+// OOM, unrecoverable rejection) plus the start()-never-settles hang guard.
+// ---------------------------------------------------------------------------
+describe("tunnel auto-reconnect", () => {
+  let config: RuntimeConfig;
+  const KEYS = [
+    "GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS",
+    "GINI_TUNNEL_RECONNECT_BASE_MS",
+    "GINI_TUNNEL_RECONNECT_MAX_MS",
+    "GINI_TUNNEL_RELAY_READY_TIMEOUT_MS",
+    "GINI_TUNNEL_SHUTDOWN_DRAIN_MS"
+  ] as const;
+  let prev: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    config = testConfig(`rc-${Math.random().toString(36).slice(2)}`);
+    prev = {};
+    for (const k of KEYS) {
+      prev[k] = process.env[k];
+      delete process.env[k];
+    }
+    // Near-zero backoff so the bounded loop runs fast under the per-test cap.
+    process.env.GINI_TUNNEL_RECONNECT_BASE_MS = "1";
+    process.env.GINI_TUNNEL_RECONNECT_MAX_MS = "2";
+    setTunnelDeps(deps());
+  });
+
+  // Poll a counter until it reaches `want`. Used instead of waiting on status,
+  // because right after crash() the record still reads the pre-crash status for
+  // a microtask (the exit watcher fires async) and a status poll could observe
+  // the stale value; a build/connect counter only moves when a rebuild truly ran.
+  async function waitForCount(get: () => number, want: number): Promise<void> {
+    for (let i = 0; i < 600; i += 1) {
+      if (get() >= want) return;
+      await Bun.sleep(5);
+    }
+    throw new Error(`counter never reached ${want} (stuck at ${get()})`);
+  }
+
+  afterEach(() => {
+    setTunnelDeps();
+    for (const k of KEYS) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
+  });
+
+  // The headline fix: a relay child that exits unexpectedly is rebuilt by
+  // reusing the stored session — the record goes connected -> connecting ->
+  // connected without any user action, and the rebuilt child is supervised too.
+  test("a relay child exit auto-reconnects by reusing the session (no browser)", async () => {
+    const children = [crashableChild(), crashableChild()];
+    let built = 0;
+    let loginCalls = 0;
+    const opened: string[] = [];
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => children[built++] ?? crashableChild(),
+        loginUrl: () => {
+          loginCalls += 1;
+          return Promise.resolve(fakeLoginHandle());
+        },
+        openBrowser: (url) => opened.push(url)
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(built).toBe(1);
+
+    // First child dies unexpectedly; the watcher rebuilds with the second.
+    children[0].crash(1);
+    await waitForCount(() => built, 2);
+    await waitForStatus(config, "connected");
+    expect(getTunnel(config).url).toBe("https://subdom7.relay.test");
+    // Recovery reused the session: no browser, no re-login.
+    expect(loginCalls).toBe(0);
+    expect(opened).toEqual([]);
+    expect(readState(config.instance).audit.some((a) => a.action === "tunnel.reconnect")).toBe(true);
+
+    // The REBUILT child is supervised too — a second crash recovers again,
+    // proving each success re-arms a fresh retry budget.
+    children[1].crash(1);
+    await waitForCount(() => built, 3);
+    await waitForStatus(config, "connected");
+  });
+
+  // A manual child (ngrok) gets the same treatment: an unexpected exit rebuilds
+  // via the driver, no session involved.
+  test("a manual child exit auto-reconnects via the driver", async () => {
+    const children = [crashableChild(), crashableChild()];
+    let connects = 0;
+    setTunnelDeps(
+      deps({
+        drivers: fakeDrivers({
+          ngrok: scriptedDriver({
+            connect: () => Promise.resolve({ url: "https://abc.ngrok-free.app", child: children[connects++] ?? crashableChild() })
+          })
+        })
+      })
+    );
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(connects).toBe(1);
+
+    children[0].crash(2);
+    await waitForCount(() => connects, 2);
+    await waitForStatus(config, "connected");
+    expect(getTunnel(config).url).toBe("https://abc.ngrok-free.app");
+  });
+
+  // When every rebuild attempt fails (relay session keeps getting rejected), the
+  // loop exhausts its budget and surfaces a clear terminal error naming the
+  // attempt count — not an endless spin.
+  test("auto-reconnect exhausts its budget and settles error after repeated rebuild failures", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "2";
+    const live = crashableChild();
+    let built = 0;
+    // Modeled with a manual provider whose rebuild connect rejects (lands on
+    // "error"); the relay-with-session start-failure path is covered separately
+    // below.
+    setTunnelDeps(
+      deps({
+        drivers: fakeDrivers({
+          ngrok: scriptedDriver({
+            connect: () =>
+              built++ === 0
+                ? Promise.resolve({ url: "https://abc.ngrok-free.app", child: live })
+                : Promise.reject(new Error("agent exited (code 1) before reporting a public URL"))
+          })
+        })
+      })
+    );
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    live.crash(1);
+    // One initial build + two rebuild attempts, then the terminal exhaustion
+    // write. Poll for the final message specifically — intermediate attempts
+    // each write a transient per-attempt "error" before the loop retries.
+    await waitForCount(() => built, 3);
+    for (let i = 0; i < 600 && !(getTunnel(config).message ?? "").includes("auto-reconnect failed"); i += 1) {
+      await Bun.sleep(5);
+    }
+    const state = getTunnel(config);
+    expect(state.status).toBe("error");
+    expect(state.message).toContain("auto-reconnect failed after 2 attempts");
+    expect(state.url).toBeUndefined();
+    expect(readState(config.instance).audit.some((a) => a.action === "tunnel.error")).toBe(true);
+  });
+
+  // A relay rebuild whose stored-session start() keeps FAILING (readiness
+  // timeout / transient transport blip / revoked session) is a retryable error,
+  // NOT a needs-user idle: under reuseOnly the loop must consume its budget on
+  // the failures and finally settle "error" — never stop early at idle. (The
+  // stored session is present on every attempt; only start() throws.)
+  test("a relay rebuild whose start keeps failing retries the budget and settles error (not idle)", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "2";
+    let built = 0;
+    const live = crashableChild();
+    setTunnelDeps(
+      deps({
+        // Session always present (fakeStore), so this exercises the
+        // session-present-but-start-fails branch, not the no-session idle branch.
+        createStore: () => fakeStore(),
+        buildTunnel: () => {
+          built += 1;
+          // First build (initial connect) succeeds; every rebuild's start throws.
+          if (built === 1) return live;
+          return fakeChild({ startRejects: new Error("frpc: not ready within 45000ms") });
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    live.crash(1);
+    // initial build + 2 rebuild attempts (both start-fail), then exhaustion error.
+    await waitForCount(() => built, 3);
+    for (let i = 0; i < 600 && !(getTunnel(config).message ?? "").includes("auto-reconnect failed"); i += 1) {
+      await Bun.sleep(5);
+    }
+    const state = getTunnel(config);
+    expect(state.status).toBe("error"); // NOT idle — the regression this guards
+    expect(state.message).toContain("auto-reconnect failed after 2 attempts");
+  });
+
+  // A relay rebuild that settles idle (no stored session on the rebuild) is a
+  // needs-user condition retrying can't fix — the loop stops at idle rather than
+  // burning the whole budget or flipping to a misleading error. The reuseOnly
+  // resume hits its no-session branch and settles idle WITHOUT calling
+  // buildTunnel, so the build counter stays at 1 (only the initial connect).
+  test("auto-reconnect stops at idle when a rebuild has no usable session", async () => {
+    const live = crashableChild();
+    let connectStores = 0;
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => live,
+        // First connect has the session; the rebuild sees none (cleared creds).
+        createStore: () => (connectStores++ === 0 ? fakeStore() : fakeStoreNoSession())
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    live.crash(1);
+    await waitForStatus(config, "idle");
+    expect(getTunnel(config).status).toBe("idle");
+    expect(getTunnel(config).selectedProvider).toBe("gini-relay");
+    // The rebuild attempt ran (createStore consulted a second time) but found no
+    // session and settled idle before building anything.
+    expect(connectStores).toBeGreaterThanOrEqual(2);
+  });
+
+  // An intentional disconnect during the reconnect backoff must win: the loop
+  // sees the supervisor was replaced and bails without clobbering idle or
+  // rebuilding a tunnel the user tore down.
+  test("a disconnect during the reconnect backoff bails the loop without rebuilding", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_BASE_MS = "200"; // a backoff window to disconnect within
+    process.env.GINI_TUNNEL_RECONNECT_MAX_MS = "200";
+    const live = crashableChild();
+    let built = 0;
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => {
+          built += 1;
+          return built === 1 ? live : crashableChild();
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(built).toBe(1);
+
+    live.crash(1);
+    // The record flips to "connecting" while the loop sleeps in backoff.
+    await waitForStatus(config, "connecting");
+    // The user disconnects mid-backoff.
+    const after = await disconnectTunnel(config);
+    expect(after.status).toBe("idle");
+    // Give the loop time to wake from its sleep and observe the supersede.
+    await Bun.sleep(300);
+    expect(getTunnel(config).status).toBe("idle");
+    expect(built).toBe(1); // no rebuild happened
+  });
+
+  // With auto-reconnect disabled (max attempts 0), the watcher flips straight to
+  // error with the classic message — preserving the pre-fix behavior as an opt-out.
+  test("max attempts 0 disables auto-reconnect and flips straight to error", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "0";
+    const live = crashableChild();
+    let built = 0;
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => {
+          built += 1;
+          return live;
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    live.crash(9);
+    await waitForStatus(config, "error");
+    expect(getTunnel(config).message).toBe("Tunnel process exited (code 9).");
+    expect(built).toBe(1); // never rebuilt
+  });
+
+  // The readiness-timeout wiring: makeDefaultDeps' real buildTunnel passes a
+  // positive readyTimeoutMs to the gini-relay Frpc so a proxy that never
+  // registers can't hang start() forever. We assert the seam forwards the knob
+  // (the real Frpc honors readyTimeoutMs; that behavior is the library's).
+  test("makeDefaultDeps builds an frpc child carrying a readiness timeout", () => {
+    process.env.GINI_TUNNEL_RELAY_READY_TIMEOUT_MS = "1234";
+    const real = makeDefaultDeps();
+    const child = real.buildTunnel({
+      session: SESSION,
+      deviceId: "device-1",
+      port: 4321,
+      defaults: RELAY
+    }) as unknown as { options?: { readyTimeoutMs?: number } };
+    // The Frpc instance stores its options; the timeout we injected rides along.
+    expect(child.options?.readyTimeoutMs).toBe(1234);
+  });
+
+  // A reconnect interrupted by shutdown must be RESUMABLE. The loop bails on the
+  // registry clear (no respawn), but the record is left "connecting" — which
+  // reconcile would reset to idle. stopAllTunnels re-persists "connected" for a
+  // reconnecting entry, so the next boot's reconcile resumes the link.
+  test("a shutdown during auto-reconnect re-persists connected so the next boot resumes", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_BASE_MS = "5000"; // long backoff: stay parked in the loop
+    process.env.GINI_TUNNEL_RECONNECT_MAX_MS = "5000";
+    const live = crashableChild();
+    setTunnelDeps(deps({ buildTunnel: () => live }));
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    // Child dies; the watcher flips to connecting and parks in the long backoff.
+    live.crash(1);
+    await waitForStatus(config, "connecting");
+    // Shutdown lands mid-reconnect.
+    await stopAllTunnels();
+    // The persisted record was rewritten back to connected (resumable), NOT left
+    // at the transient connecting that reconcile would discard.
+    expect(readState(config.instance).tunnel?.status).toBe("connected");
+
+    // Prove the resume: a fresh reconcile (as on next boot) brings the link back
+    // by reusing the session — no browser.
+    let loginCalls = 0;
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => crashableChild(),
+        loginUrl: () => {
+          loginCalls += 1;
+          return Promise.resolve(fakeLoginHandle());
+        }
+      })
+    );
+    await reconcileTunnelOnStartup(config, { gatewayReady: Promise.resolve() });
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(loginCalls).toBe(0);
+  });
+
+  // While a MANUAL provider's rebuilds keep failing, the panel must read
+  // "connecting" (recovery in progress), not the transient per-attempt "error".
+  // With >1 attempt and a failing-then-succeeding driver, an observer polling
+  // between attempts sees connecting, and it ultimately recovers.
+  test("a failing manual rebuild shows connecting between attempts, then recovers", async () => {
+    process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS = "5";
+    process.env.GINI_TUNNEL_RECONNECT_BASE_MS = "30"; // a small window to observe connecting
+    process.env.GINI_TUNNEL_RECONNECT_MAX_MS = "30";
+    const live = crashableChild();
+    const recovered = crashableChild();
+    let connects = 0;
+    const seen = new Set<string>();
+    setTunnelDeps(
+      deps({
+        drivers: fakeDrivers({
+          ngrok: scriptedDriver({
+            connect: () => {
+              connects += 1;
+              if (connects === 1) return Promise.resolve({ url: "https://abc.ngrok-free.app", child: live });
+              if (connects === 2) return Promise.reject(new Error("agent exited (code 1) before reporting a public URL"));
+              return Promise.resolve({ url: "https://abc.ngrok-free.app", child: recovered });
+            }
+          })
+        })
+      })
+    );
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    // Sample the status across the recovery so we can assert connecting appears.
+    const sampler = (async () => {
+      for (let i = 0; i < 400; i += 1) {
+        seen.add(getTunnel(config).status);
+        if (getTunnel(config).status === "connected" && connects >= 3) return;
+        await Bun.sleep(2);
+      }
+    })();
+    live.crash(1);
+    await sampler;
+    await waitForStatus(config, "connected");
+    // The second attempt rejected, but the loop re-asserted connecting for the
+    // backoff before the third attempt — so the panel never got stuck on error.
+    expect(seen.has("connecting")).toBe(true);
+    expect(connects).toBeGreaterThanOrEqual(3);
+  });
+
+  // A shutdown landing DURING a boot-resume (the resume is still "connecting",
+  // its frpc start parked on gatewayReady) must also leave a resumable
+  // "connected" record — the resume supervisor is flagged `reconnecting`, so
+  // stopAllTunnels re-persists it. Without the flag the next boot's reconcile
+  // would discard the "connecting" record to idle and the link would stay down.
+  test("a shutdown during a boot-resume re-persists connected so the next boot resumes again", async () => {
+    // The resume parks on an unresolved gatewayReady, so its `settled` never
+    // resolves; shrink the shutdown drain bound so stopAllTunnels doesn't wait
+    // out its full default while racing that pending settle.
+    process.env.GINI_TUNNEL_SHUTDOWN_DRAIN_MS = "20";
+    const ready = Promise.withResolvers<void>(); // never resolved: resume parks here
+    let built = 0;
+    setTunnelDeps(
+      deps({
+        resolveLocalPort: (c) => c.port,
+        buildTunnel: () => {
+          built += 1;
+          return crashableChild();
+        }
+      })
+    );
+    // Seed a connected record (as if connected before the prior restart).
+    await mutateState(config.instance, (s) => {
+      s.tunnel = {
+        instance: config.instance,
+        selectedProvider: "gini-relay",
+        status: "connected",
+        url: "https://subdom7.relay.test",
+        subdomain: "subdom7",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    // The resume is parked on gatewayReady: record reads connecting, nothing built.
+    expect(getTunnel(config).status).toBe("connecting");
+    expect(built).toBe(0);
+
+    // Shutdown lands mid-resume.
+    await stopAllTunnels();
+    // The resumable record was preserved as connected (not the transient connecting).
+    expect(readState(config.instance).tunnel?.status).toBe("connected");
   });
 });

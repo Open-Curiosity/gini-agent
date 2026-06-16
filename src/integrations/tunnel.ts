@@ -638,10 +638,23 @@ export async function defaultLogout(
   }
 }
 
+// How long a relay frpc child gets to register its proxy before start() is
+// declared failed. frp's config sets loginFailExit:false, so without this the
+// process logs in, retries a never-registering proxy forever, and start() never
+// settles — pinning the record at "connecting" (or hanging an auto-reconnect
+// rebuild's await). A positive readyTimeoutMs makes Frpc.start() reject and kill
+// the child, folding the stuck connect into "error" instead. Read at call time
+// so tests can tighten it; mirrors the manual-driver discovery timeout default.
+function relayReadyTimeoutMs(): number {
+  const v = Number(process.env.GINI_TUNNEL_RELAY_READY_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 45_000;
+}
+
 export function makeDefaultDeps(): TunnelDeps {
   return {
     loginUrl: realLoginUrl,
-    buildTunnel: (opts: TunnelOptions): TunnelChild => realBuildTunnel(opts) as Frpc,
+    buildTunnel: (opts: TunnelOptions): TunnelChild =>
+      realBuildTunnel({ ...opts, frpc: { ...opts.frpc, readyTimeoutMs: relayReadyTimeoutMs() } }) as Frpc,
     createStore: (config: RuntimeConfig) => realCreateStore({ home: relayHome(config.instance) }),
     resolveDefaults: () => realResolveDefaults(),
     openBrowser: defaultOpenBrowser,
@@ -689,6 +702,12 @@ interface Supervisor {
   // Without it, cancel/shutdown during URL discovery would orphan the agent —
   // sup.child only exists after discovery resolves.
   pendingKill?: () => void;
+  // True while an auto-reconnect (reconnectAfterExit) is driving this entry: the
+  // record reads "connecting" but it descends from a tunnel that WAS connected,
+  // not a fresh user connect. Shutdown uses this to re-persist "connected" so the
+  // next boot's reconcile resumes it — a "connecting" record would otherwise reset
+  // to idle and the 24/7 link would silently stay down across that restart.
+  reconnecting?: boolean;
 }
 
 const supervisors = new Map<Instance, Supervisor>();
@@ -797,6 +816,16 @@ function teardown(instance: Instance): void {
   supervisors.delete(instance);
 }
 
+// How long the shutdown drain waits on a single in-flight connect's abort path
+// (or a queued provider-side `off`) before proceeding without it. Bounds the
+// drain so a wedged settle can't stall exit. Read at call time so tests — which
+// may park a resume on an unresolved gatewayReady, leaving `entry.settled`
+// pending — can shrink it instead of eating the full 2 s.
+function shutdownDrainBoundMs(): number {
+  const v = Number(process.env.GINI_TUNNEL_SHUTDOWN_DRAIN_MS);
+  return Number.isFinite(v) && v > 0 ? v : 2_000;
+}
+
 // Stop every live tunnel child + pending login across all instances. Called on
 // runtime shutdown so frpc children are torn down gracefully (their relay-side
 // registration severed) instead of left running through the drain window. The
@@ -833,9 +862,33 @@ export async function stopAllTunnels(): Promise<void> {
         // Give the killed connect a beat to run its abort path (log + no
         // state write) before exit; bounded so a wedged settle can't stall
         // the drain.
-        stops.push(Promise.race([entry.settled, Bun.sleep(2_000)]));
+        stops.push(Promise.race([entry.settled, Bun.sleep(shutdownDrainBoundMs())]));
       }
       if (entry.child) stops.push(entry.child.stop().catch(() => undefined));
+      // A reconnect interrupted by this shutdown left the record at "connecting"
+      // (reconnectAfterExit's flip), but it descends from a tunnel that WAS
+      // connected — and reconcile resets a "connecting" record to idle, so the
+      // 24/7 link would silently stay down across this restart. Re-persist
+      // "connected" so the next boot resumes it (reconcile reuses the stored
+      // session / re-runs the driver, exactly as for a cleanly-connected record).
+      // Read + guard INSIDE the mutation, not from a snapshot taken out here:
+      // a rebuild attempt's own idle/error write (settleResumeIdle / the error
+      // fold) may already be queued ahead of this restore on the per-instance
+      // mutateState FIFO. Re-reading `state.tunnel` in the callback collapses the
+      // check-then-write into the serialized critical section, so if that
+      // idle/error write landed first this restore sees status !== "connecting"
+      // and stands down — instead of resurrecting a stale "connecting" snapshot
+      // back to "connected". mutateState isolates its own queue on failure and
+      // server.ts swallows a rejected stopAllTunnels, so no extra catch is needed.
+      if (entry.reconnecting) {
+        stops.push(
+          mutateState(instance, (state) => {
+            const live = state.tunnel;
+            if (live?.status !== "connecting" || !live.selectedProvider) return;
+            applyTunnel(state, { ...live, selectedProvider: live.selectedProvider, status: "connected", message: undefined });
+          })
+        );
+      }
       // A connected CHILDLESS tunnel (tailscale serve) would keep fronting the
       // gateway PORT after this process exits — and whatever binds that port
       // next. Turn the provider-side state off; the record stays `connected`
@@ -865,7 +918,7 @@ export async function stopAllTunnels(): Promise<void> {
                 message: error instanceof Error ? error.message : String(error)
               });
             }),
-            Bun.sleep(2_000)
+            Bun.sleep(shutdownDrainBoundMs())
           ])
         );
       }
@@ -1523,16 +1576,29 @@ async function runConnect(
     if (session) {
       try {
         child = await startWith(session);
-      } catch {
+      } catch (startError) {
         sup.child = undefined;
+        // A stored session existed but the tunnel failed to start (readiness
+        // timeout, transient transport blip, or a revoked session — gini-relay
+        // doesn't surface a clean auth-vs-transport signal). Under reuseOnly
+        // (headless reconnect / boot resume) there's no browser fallback, so
+        // RETHROW into the error fold instead of nulling the session and
+        // settling idle: idle is reserved for "no session at all" (a genuine
+        // needs-user condition), whereas a failed start is a (retryable)
+        // failure the auto-reconnect loop must keep consuming its budget on —
+        // settling idle here would make a single transient drop terminal. The
+        // non-reuseOnly path still nulls the session and falls through to a
+        // fresh login below, self-healing a revoked session interactively.
+        if (opts.reuseOnly) throw startError;
         session = null;
       }
     }
     if (!session) {
-      // Boot resume with no usable stored session: do NOT open a browser / mint a
-      // login on a headless restart. Settle idle so the user reconnects manually.
-      // (A record that was "connected" at shutdown normally still has its session,
-      // so this is the defensive edge — e.g. the session file was cleared.)
+      // Boot resume / reconnect with NO stored session at all: do NOT open a
+      // browser / mint a login on a headless restart. Settle idle so the user
+      // reconnects manually. (A record that was "connected" at shutdown normally
+      // still has its session, so this is the defensive edge — e.g. the session
+      // file was cleared.)
       if (opts.reuseOnly) {
         if (isCurrent()) await settleResumeIdle(config, provider);
         appendLog(config.instance, "tunnel.resume.no_session", { provider });
@@ -1647,12 +1713,45 @@ async function runConnect(
   }
 }
 
+// Auto-reconnect knobs. frp's own client loop recovers a transient control-plane
+// drop WITHOUT exiting the process (gini-relay builds the config with
+// loginFailExit:false), so the exits that actually reach watchChildExit are the
+// real ones (crash, OOM, SIGKILL, an unrecoverable relay rejection). Rather than
+// dead-ending such an exit at "error", we rebuild the tunnel a bounded number of
+// times with capped exponential backoff — reusing the stored session, never
+// opening a browser — so a crashed frpc comes back on its own. Read at call time
+// so tests can tighten them; set max attempts to 0 to disable auto-reconnect (the
+// record then flips straight to "error" on exit, the pre-auto-reconnect behavior).
+// `0` is a MEANINGFUL value here (disable), unlike the backoff knobs whose `> 0`
+// guard makes 0 fall back to the default. So an UNSET or blank var must read as
+// the default, not as 0 — `Number("")` is `0`, so a bare
+// `export GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS=` (no value) would otherwise silently
+// disable the feature. Treat empty/whitespace as unset, and floor a fractional
+// value so the attempt count and the "after N attempts" message stay integers.
+function reconnectMaxAttempts(): number {
+  const raw = process.env.GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS;
+  if (raw === undefined || raw.trim() === "") return 5;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? Math.trunc(v) : 5;
+}
+function reconnectBackoffMs(attempt: number): number {
+  const base = Number(process.env.GINI_TUNNEL_RECONNECT_BASE_MS);
+  const cap = Number(process.env.GINI_TUNNEL_RECONNECT_MAX_MS);
+  // Both guards require a POSITIVE value, so a blank env (`Number("")` is `0`),
+  // `0`, or a negative/NaN value falls back to the default. A zero base would
+  // collapse the capped exponential backoff into a no-delay retry spin (every
+  // term is `0 * 2**n`), so it must NOT be honored — there is no sensible
+  // zero-backoff semantic here (unlike MAX_ATTEMPTS, where 0 means "disable").
+  const b = Number.isFinite(base) && base > 0 ? base : 1_000;
+  const c = Number.isFinite(cap) && cap > 0 ? cap : 30_000;
+  return Math.min(c, b * 2 ** (attempt - 1));
+}
+
 // After a successful connect, react to the frpc child exiting on its own (crash,
-// relay drop, network change). The guard inside mutateState runs atomically with
-// every other state write: it only flips "connected" -> "error" if this is still
-// the live child AND we're still connected, so an intentional cancel/disconnect
-// (which clears/replaces the entry and writes "idle" first) or a newer connect is
-// never clobbered. Without this a dead tunnel would advertise a live URL forever.
+// relay drop, network change). Delegates to reconnectAfterExit, whose state
+// writes are guarded so an intentional cancel/disconnect (which clears/replaces
+// the entry and writes "idle" first) or a newer connect is never clobbered.
+// Without this a dead tunnel would advertise a live URL forever.
 function watchChildExit(
   config: RuntimeConfig,
   provider: TunnelProviderId,
@@ -1661,42 +1760,152 @@ function watchChildExit(
 ): void {
   void child.exited.then(async (code) => {
     try {
+      await reconnectAfterExit(config, provider, sup, child, code);
+    } catch {
+      // Best-effort watcher: a failure anywhere in the reconnect machinery must
+      // never become an unhandled rejection (which the crash handlers would treat
+      // as fatal). Worst case the record is left as the last write made it.
+    }
+  });
+}
+
+// React to an unexpected frpc/child exit: flip "connected" -> "connecting" and
+// rebuild the tunnel up to reconnectMaxAttempts() times (capped backoff between
+// tries), reusing the stored session — no browser. A successful rebuild re-arms
+// watchChildExit on the NEW child, so each later drop gets its own fresh retry
+// budget. The flip's atomic guard mirrors the old exit watcher: it only acts if
+// this is still the live child AND we're still connected, so an intentional
+// teardown or a newer connect is never clobbered.
+async function reconnectAfterExit(
+  config: RuntimeConfig,
+  provider: TunnelProviderId,
+  sup: Supervisor,
+  child: TunnelChild,
+  code: number
+): Promise<void> {
+  const max = reconnectMaxAttempts();
+  const willReconnect = max > 0;
+  // Atomic: confirm the exit is unexpected, detach the dead child, and move to
+  // the transitional status. With auto-reconnect disabled this is the terminal
+  // "error" the watcher always wrote; with it enabled we go to "connecting" so
+  // the panel shows recovery in progress (and Cancel stays available).
+  const proceed = await mutateState(config.instance, (state) => {
+    if (
+      supervisors.get(config.instance) !== sup ||
+      sup.child !== child ||
+      state.tunnel?.status !== "connected"
+    ) {
+      return false;
+    }
+    sup.child = undefined;
+    applyTunnel(state, {
+      ...(state.tunnel ?? {}),
+      selectedProvider: provider,
+      status: willReconnect ? "connecting" : "error",
+      url: undefined,
+      subdomain: undefined,
+      message: willReconnect ? undefined : `Tunnel process exited (code ${code}).`
+    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: willReconnect ? "tunnel.reconnect" : "tunnel.error",
+        target: provider,
+        risk: "medium",
+        evidence: { provider, code, reconnect: willReconnect }
+      },
+      { system: true }
+    );
+    return true;
+  });
+  appendLog(config.instance, "tunnel.exited", { provider, code });
+  if (!proceed || !willReconnect) return;
+  // Mark this entry as an auto-reconnect in progress so a shutdown that lands
+  // mid-loop re-persists "connected" (resumable) instead of leaving "connecting".
+  sup.reconnecting = true;
+
+  // Bounded rebuild loop. Each attempt claims a fresh supervisor and runs the
+  // session-reuse connect (the same machinery the boot resume uses): no browser,
+  // and the gateway port is already ours (we're running), so gatewayReady is
+  // already resolved. A user action (cancel/disconnect/new connect) replaces the
+  // supervisor, and the supersede checks bail the loop without a clobber.
+  let current = sup;
+  for (let attempt = 1; attempt <= max; attempt += 1) {
+    if (supervisors.get(config.instance) !== current) return; // superseded
+    await Bun.sleep(reconnectBackoffMs(attempt));
+    if (supervisors.get(config.instance) !== current) return;
+    teardown(config.instance);
+    const next = supervisor(config.instance);
+    // Carry the reconnecting marker onto the fresh entry: teardown() deleted the
+    // prior one, and the new attempt is still an auto-reconnect, not a user connect.
+    next.reconnecting = true;
+    current = next;
+    appendLog(config.instance, "tunnel.reconnect.attempt", { provider, attempt, code });
+    const rebuild = isManualProviderId(provider)
+      ? runManualConnect(config, provider, next, { resume: true, gatewayReady: Promise.resolve() })
+      : runConnect(config, provider, next, { reuseOnly: true, gatewayReady: Promise.resolve() });
+    next.settled = rebuild;
+    await rebuild;
+    if (supervisors.get(config.instance) !== next) return; // superseded mid-rebuild
+    const status = getTunnel(config).status;
+    if (status === "connected") {
+      appendLog(config.instance, "tunnel.reconnect.recovered", { provider, attempt });
+      return; // the rebuilt child's watcher is armed — done
+    }
+    if (status === "idle") {
+      // reuseOnly/resume settled idle: no stored session, or the local port isn't
+      // serving — a needs-user condition retrying can't fix. Leave idle.
+      appendLog(config.instance, "tunnel.reconnect.needs_user", { provider, attempt });
+      return;
+    }
+    // status === "error": a transient transport failure — loop to retry. A manual
+    // rebuild writes "error" on a failed attempt (runManualConnect's error fold);
+    // leaving it would show "error" in the panel mid-recovery, contradicting the
+    // connecting-during-reconnect contract. Re-assert "connecting" when attempts
+    // remain so a polling client sees recovery still in progress. Guarded by the
+    // same supervisor-identity + still-error check (await-free before the enqueue)
+    // so it never clobbers a newer user action or a concurrent success.
+    if (attempt < max && supervisors.get(config.instance) === current && getTunnel(config).status === "error") {
       await mutateState(config.instance, (state) => {
-        if (
-          supervisors.get(config.instance) !== sup ||
-          sup.child !== child ||
-          state.tunnel?.status !== "connected"
-        ) {
-          return;
-        }
-        sup.child = undefined;
+        if (supervisors.get(config.instance) !== current || state.tunnel?.status !== "error") return;
         applyTunnel(state, {
           ...(state.tunnel ?? {}),
           selectedProvider: provider,
-          status: "error",
+          status: "connecting",
           url: undefined,
           subdomain: undefined,
-          message: `Tunnel process exited (code ${code}).`
+          message: undefined
         });
-        addAudit(
-          state,
-          {
-            actor: "runtime",
-            action: "tunnel.error",
-            target: provider,
-            risk: "medium",
-            evidence: { provider, code }
-          },
-          { system: true }
-        );
       });
-      appendLog(config.instance, "tunnel.exited", { provider, code });
-    } catch {
-      // Best-effort watcher: a state-write failure must never become an
-      // unhandled rejection (which the crash handlers would treat as fatal).
-      // Worst case the record stays "connected" — exactly the pre-watcher state.
     }
-  });
+  }
+  // Budget exhausted with every attempt erroring. Surface a clear terminal error
+  // (only while we still own the instance and aren't sitting on a later success).
+  if (supervisors.get(config.instance) === current && getTunnel(config).status !== "connected") {
+    await mutateState(config.instance, (state) => {
+      applyTunnel(state, {
+        ...(state.tunnel ?? {}),
+        selectedProvider: provider,
+        status: "error",
+        url: undefined,
+        subdomain: undefined,
+        message: `Tunnel process exited (code ${code}); auto-reconnect failed after ${max} attempts.`
+      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "tunnel.error",
+          target: provider,
+          risk: "medium",
+          evidence: { provider, code, attempts: max }
+        },
+        { system: true }
+      );
+    });
+    appendLog(config.instance, "tunnel.reconnect.exhausted", { provider, code, attempts: max });
+  }
 }
 
 // Abort a pending connect: status -> "idle", keeping the selection so the
@@ -1952,6 +2161,13 @@ export async function reconcileTunnelOnStartup(
     // terminal transition.
     teardown(config.instance);
     const sup = supervisor(config.instance);
+    // This resume's record reads "connecting" too, descending from a tunnel that
+    // WAS connected — so mark it `reconnecting`, symmetric with reconnectAfterExit.
+    // Without it, a shutdown landing mid-resume (rapid restart / deploy churn)
+    // leaves "connecting", which the NEXT boot's reconcile discards to idle —
+    // silently dropping the 24/7 link. stopAllTunnels re-persists "connected" for
+    // a reconnecting entry, so reconcile resumes it instead.
+    sup.reconnecting = true;
     sup.settled = isManualProviderId(provider.id)
       ? runManualConnect(config, provider.id, sup, { resume: true, gatewayReady: opts.gatewayReady })
       : runConnect(config, provider.id, sup, { reuseOnly: true, gatewayReady: opts.gatewayReady });
