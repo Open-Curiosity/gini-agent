@@ -5,6 +5,7 @@ import {
   createChatMessage,
   createChatSession,
   deleteChatSession,
+  enqueuePendingChatMessage,
   getLatestMessagesBySession,
   getMainChatBlock,
   insertChatBlock,
@@ -14,7 +15,10 @@ import {
   mutateState,
   publishChatSession,
   readState,
-  renameChatSession
+  removePendingChatMessage,
+  renameChatSession,
+  sessionHasInFlightChatTask,
+  shiftPendingChatMessage
 } from "../state";
 import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatClientSurface, ChatMessageRecord, ChatSessionRecord, ImageAttachment, Instance, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { readUpload, uploadStat } from "../state/uploads";
@@ -408,8 +412,21 @@ async function prepareChatSubmission(
   return { content, images, audio, liveSession, clientSurface: resolveClientSurface(input, liveSession) };
 }
 
-export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
-  const { content, images, audio, liveSession, clientSurface } = await prepareChatSubmission(config, sessionId, input);
+// The prepared submission returned by prepareChatSubmission. Shared between
+// the immediate run-now path and the auto-dispatch path so both create the
+// task, message, and block identically.
+type PreparedChatSubmission = Awaited<ReturnType<typeof prepareChatSubmission>>;
+
+// Actually run a prepared chat submission: create the conversation run, spawn
+// the chat task, persist the user message + ChatBlock. Extracted so the
+// immediate submit path and the queue auto-dispatch path share one
+// implementation.
+async function runChatSubmission(
+  config: RuntimeConfig,
+  sessionId: string,
+  prepared: PreparedChatSubmission
+) {
+  const { content, images, audio, liveSession, clientSurface } = prepared;
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
@@ -468,6 +485,83 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     });
   }
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
+}
+
+export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+  const prepared = await prepareChatSubmission(config, sessionId, input);
+  // Enqueue instead of running when a turn is already in flight for this
+  // session, or when the queue is already non-empty (so a later submit can't
+  // jump ahead of earlier queued messages while the current turn runs). The
+  // gateway is the source of truth — concurrent submits serialize here rather
+  // than starting parallel tasks. See ADR chat-message-queue.md.
+  const state = readState(config.instance);
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  const shouldQueue =
+    sessionHasInFlightChatTask(state, sessionId) || (session?.pendingMessages?.length ?? 0) > 0;
+  if (shouldQueue) {
+    const { content, images, clientSurface } = prepared;
+    const pending = await mutateState(config.instance, (current) =>
+      enqueuePendingChatMessage(current, sessionId, {
+        content,
+        ...(images.length > 0 ? { images } : {}),
+        ...(clientSurface ? { clientSurface } : {})
+      })
+    );
+    const updated = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
+    if (updated) publishChatSession(config.instance, updated);
+    return { sessionId, queued: true as const, pendingId: pending.id };
+  }
+  return runChatSubmission(config, sessionId, prepared);
+}
+
+// Auto-dispatch the next queued message for a session when the current turn
+// ends. Pops the first pending message (FIFO), publishes the shrunk queue,
+// then runs it as its own real chat turn. A run failure is logged and
+// swallowed so a single bad turn doesn't crash the dispatch chain; the rest
+// of the queue stays intact for the next terminal transition.
+export async function dispatchNextPendingChatMessage(config: RuntimeConfig, sessionId: string): Promise<void> {
+  const state = readState(config.instance);
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (!session) return;
+  if ((session.pendingMessages?.length ?? 0) === 0) return;
+  const popped = await mutateState(config.instance, (current) => shiftPendingChatMessage(current, sessionId));
+  if (!popped) return;
+  const afterShift = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
+  if (!afterShift) return;
+  publishChatSession(config.instance, afterShift);
+  const prepared: PreparedChatSubmission = {
+    content: popped.content,
+    images: popped.images ?? [],
+    audio: undefined,
+    liveSession: afterShift,
+    clientSurface: popped.clientSurface
+  };
+  try {
+    await runChatSubmission(config, sessionId, prepared);
+  } catch (error) {
+    appendLog(config.instance, "chat.queue.dispatch_failed", {
+      sessionId,
+      pendingId: popped.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// Remove a queued message by id (DELETE /api/chat/:id/pending/:pendingId).
+// Publishes the updated session so the queue pill updates live everywhere.
+export async function removePendingChatMessageById(
+  config: RuntimeConfig,
+  sessionId: string,
+  pendingId: string
+): Promise<boolean> {
+  const removed = await mutateState(config.instance, (current) =>
+    removePendingChatMessage(current, sessionId, pendingId)
+  );
+  if (removed) {
+    const updated = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
+    if (updated) publishChatSession(config.instance, updated);
+  }
+  return removed;
 }
 
 // Posts a user reply inside a thread, creating the thread on the first reply.
