@@ -215,7 +215,14 @@ async function performUpdate(runtimeDir: string, options: UpdateRuntimeOptions):
       // cache). On failure this throws like the install steps above, so the
       // caller never schedules a restart and the old server keeps serving.
       const sha12 = requireGit(runtimeDir, ["rev-parse", "--short=12", "HEAD"], "could not read new HEAD short sha");
-      await buildWebProdBundle(runtimeDir, sha12, stdio, { runStepImpl });
+      // Preserve the previous HEAD's bundle through the GC: the old web
+      // server is still serving from it until the restart lands, so deleting
+      // it would 500 the live server on not-yet-loaded routes. The old commit
+      // is still reachable after the reset, so its short-12 form resolves. A
+      // later update GCs it once it's two generations old.
+      const beforeSha12 = git(runtimeDir, ["rev-parse", "--short=12", beforeSha]);
+      const preserveDistDirs = beforeSha12 && beforeSha12 !== sha12 ? [`${WEB_PROD_DIST_PREFIX}${beforeSha12}`] : [];
+      await buildWebProdBundle(runtimeDir, sha12, stdio, { runStepImpl, preserveDistDirs });
     }
 
     const upToDate = beforeSha === afterSha;
@@ -389,20 +396,26 @@ export function resolveWebProdDistDir(repoDir: string): string | null {
 }
 
 // Test seam for buildWebProdBundle: tests inject an async runner recorder so
-// no real `next build` runs.
+// no real `next build` runs. preserveDistDirs names extra prod bundle dirs
+// (the <prefix><sha12> shape GINI_DIST_DIR uses) to keep through the GC —
+// the update flow passes the previous HEAD's bundle here so it isn't pulled
+// out from under a still-running server.
 export interface BuildWebProdOptions {
   runStepImpl?: RunStepImpl;
+  preserveDistDirs?: string[];
 }
 
 // Build the production web bundle for sha12 into web/<prefix><sha12>.
 // Idempotent: a dir that already carries a BUILD_ID is kept as-is (re-update
-// onto the same head). On success, every OTHER <prefix>* dir is deleted —
-// they can never be served again (the sha no longer matches) and each one
-// holds a full Next build. The still-running old server may 500 on a
-// not-yet-loaded route for the moment between this GC and its restart;
-// that's accepted (the updating tab sits behind the UpdateGate blur). On
-// build failure this throws so updateRuntime aborts before any restart is
-// scheduled.
+// onto the same head). On success, the new dir AND any dirs named in
+// preserveDistDirs (the previous HEAD's bundle, so a still-running server
+// isn't pulled out from under it) are kept; every other <prefix><sha> dir is
+// deleted — a strictly-older bundle can never be served again (the sha no
+// longer matches) and each one holds a full Next build. The preserved
+// previous bundle is reclaimed by a LATER update once it's two generations
+// old. On build failure this throws so updateRuntime aborts before any
+// restart is scheduled. GC is best-effort: a leftover dir wastes disk but is
+// never served.
 export async function buildWebProdBundle(
   runtimeDir: string,
   sha12: string,
@@ -420,13 +433,14 @@ export async function buildWebProdBundle(
       throw new Error(formatInstallFailure("bun run build in web/", result.status, result.stdout, result.stderr));
     }
   }
+  const preserve = new Set(options.preserveDistDirs ?? []);
   for (const entry of readdirSync(webDir)) {
     // GC only dirs shaped like OUR sha-keyed bundles (<prefix> + a hex sha
     // of >=12 chars, matching `git rev-parse --short=12`, which lengthens
     // on ambiguity). A bare prefix match would also delete the `next dev`
     // dist dir of an instance literally named e.g. `prod-foo`
     // (`.next-prod-foo`).
-    if (entry === distDir || !PROD_DIST_GC_PATTERN.test(entry)) continue;
+    if (entry === distDir || preserve.has(entry) || !PROD_DIST_GC_PATTERN.test(entry)) continue;
     try {
       rmSync(join(webDir, entry), { recursive: true, force: true });
     } catch {

@@ -148,6 +148,22 @@ describe("web production bundle", () => {
     expect(existsSync(join(runtimeDir, "web", ".next-prod-foo"))).toBe(true);
   });
 
+  test("preserves a named prod dir (the previous HEAD's bundle) while still GCing strictly-older ones", async () => {
+    const runtimeDir = makeRuntimeDir();
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
+    const preserved = `${WEB_PROD_DIST_PREFIX}0dd5a00000000`;
+    const older = `${WEB_PROD_DIST_PREFIX}1111aaaa2222`;
+    markBuilt(runtimeDir, preserved);
+    markBuilt(runtimeDir, older);
+    mkdirSync(join(runtimeDir, "web", ".next-default"), { recursive: true });
+    const { runStepImpl } = makeBuildRecorder();
+    await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl, preserveDistDirs: [preserved] });
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}${SHA}`))).toBe(true);
+    expect(existsSync(join(runtimeDir, "web", preserved))).toBe(true);
+    expect(existsSync(join(runtimeDir, "web", older))).toBe(false);
+    expect(existsSync(join(runtimeDir, "web", ".next-default"))).toBe(true);
+  });
+
   test("a failed build throws (so updateRuntime aborts before scheduling a restart) and GCs nothing", async () => {
     const runtimeDir = makeRuntimeDir();
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0dd5a00000000`);
