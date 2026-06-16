@@ -93,17 +93,21 @@ best-effort from `src/server.ts`) decides whether to ask:
    (`lastAskedAt` in the per-fingerprint state). If that set is empty, it
    returns.
 
-3. **Stamp, then ask once.** It stamps `lastAskedAt` for each fresh
-   fingerprint **before** creating the ask — so a crash that respawns the
-   gateway mid-ask can't double-ask — then creates one immediate one-shot job
-   bound to a dedicated `origin: "job"` chat session ("Crash report"). The job
-   prompt instructs the agent to post a **single** friendly chat message saying
-   it noticed N crash(es) (already redacted, captured locally) and asking
-   whether to file them, and to take no other action this turn. The job's
-   terminal task syncs the assistant message into the session, which fires the
-   usual "Gini has a new message" push.
+3. **Resolve target, stamp, then ask once.** It first resolves the delivery
+   surface — the active agent's canonical (`kind: "agent"`) chat, the
+   conversation the user actually reads. If no agent chat resolves it skips
+   **without** stamping, so a later boot can still ask once an agent exists.
+   Otherwise it stamps `lastAskedAt` for each fresh fingerprint **before**
+   creating the ask — so a crash that respawns the gateway mid-ask can't
+   double-ask — then creates one immediate one-shot job bound to that canonical
+   chat. A one-time consent ask belongs in the conversation the user reads, not a
+   separate channel; the job prompt instructs the agent to post a **single**
+   friendly chat message saying it noticed N crash(es) (already redacted,
+   captured locally) and asking whether to file them, and to take no other action
+   this turn. The job's terminal task syncs the assistant message into the chat,
+   which fires the usual "Gini has a new message" push.
 
-When the user replies in that thread, their answer drives a fresh agent turn in
+When the user replies in that chat, their answer drives a fresh agent turn in
 the same session, and the agent loads the `gini-bug-report` skill to act:
 
 - **Yes** → the skill reads the queued redacted report(s), loads the
@@ -183,9 +187,11 @@ distinct crash for one-click filing.
   value; the serialized `runtime.jsonl` tail carries no `data` payload — all
   before the report reaches the queue.
 - On a `default` launchd restart with fresh pending reports, exactly one ask job
-  is created, its prompt mentions the count and the `gini-bug-report` skill, and
-  `lastAskedAt` is stamped for each fresh fingerprint; a second restart within
-  the window creates no job (ask-once).
+  is created and bound to the agent's canonical chat (no dedicated channel), its
+  prompt mentions the count and the `gini-bug-report` skill, and `lastAskedAt` is
+  stamped for each fresh fingerprint; a second restart within the window creates
+  no job (ask-once). If no agent chat resolves, no job is created and
+  `lastAskedAt` is left unstamped so a later boot can still ask.
 - A non-`default` instance, or a `default` instance not under launchd, creates
   no ask job; pending reports belonging to a different instance are filtered
   out.
@@ -194,5 +200,3 @@ distinct crash for one-click filing.
   per distinct fingerprint through the `gini-bug-report` + `github-issues`
   skills.
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.
-</content>
-</invoke>
