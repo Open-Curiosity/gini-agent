@@ -49,6 +49,7 @@ import {
   scanForInjection,
   soulPath,
   userProfilePath,
+  withIdentityFileLock,
   writeSoul,
   writeUserProfile,
   type IdentityFileStatus
@@ -2374,6 +2375,23 @@ async function editSoulTool(
   if (!agentId) {
     throw new Error("Cannot edit SOUL.md: no active agent.");
   }
+  // Serialize the whole read-modify-write against concurrent edits to the
+  // SAME SOUL.md. Same-parent sibling subagents share an agentId (and thus
+  // this path), and they can now overlap, so without this lock two appends
+  // could both read the same body and last-write-wins. See
+  // withIdentityFileLock.
+  return withIdentityFileLock(soulPath(config.instance, agentId), () =>
+    editSoulToolLocked(config, taskId, args, action, agentId)
+  );
+}
+
+async function editSoulToolLocked(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>,
+  action: "set" | "append" | "remove",
+  agentId: string
+): Promise<string> {
   if (action === "remove") {
     const needle = requireString(args, "needle");
     // Pre-scan the post-remove body so a hostile pattern that survives
@@ -2549,6 +2567,21 @@ async function editUserProfileTool(
   if (action !== "set" && action !== "append" && action !== "remove") {
     throw new Error("Invalid input: action must be 'set', 'append', or 'remove'.");
   }
+  // Serialize the read-modify-write against concurrent edits to USER.md.
+  // USER.md is per-instance, so ANY two overlapping subagents in the
+  // instance contend on it; the lock prevents a lost append. See
+  // withIdentityFileLock.
+  return withIdentityFileLock(userProfilePath(config.instance), () =>
+    editUserProfileToolLocked(config, taskId, args, action)
+  );
+}
+
+async function editUserProfileToolLocked(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>,
+  action: "set" | "append" | "remove"
+): Promise<string> {
   if (action === "remove") {
     const needle = requireString(args, "needle");
     // Pre-scan the post-remove body so a hostile pattern that survives

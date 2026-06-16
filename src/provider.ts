@@ -653,7 +653,7 @@ export interface ToolCallingResult {
 // loop calls the provider multiple times. A stub with `error` set makes
 // the echo call throw instead, exercising callers' provider-failure paths
 // (context-overflow retries, auth tagging, task failure).
-const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string }> = [];
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string; delayMs?: number }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
@@ -671,9 +671,9 @@ const echoToolCallingToolNames: string[][] = [];
 export function setEchoToolCallingResponse(
   result: ToolCallingResult,
   tag?: string,
-  opts?: { nonStreaming?: boolean }
+  opts?: { nonStreaming?: boolean; delayMs?: number }
 ): void {
-  echoToolCallingStubs.push({ tag, result, nonStreaming: opts?.nonStreaming });
+  echoToolCallingStubs.push({ tag, result, nonStreaming: opts?.nonStreaming, delayMs: opts?.delayMs });
 }
 
 // Queue an echo tool-calling FAILURE: the next echo-backed
@@ -711,7 +711,7 @@ function nextEchoToolCallingResult(
   provider: ProviderConfig,
   lastUserText: string,
   onDelta?: (text: string) => void
-): { result: ToolCallingResult; nonStreaming: boolean } {
+): { result: ToolCallingResult; nonStreaming: boolean; delayMs?: number } {
   const stub = echoToolCallingStubs.shift();
   if (stub?.error !== undefined) {
     if (stub.streamTextBeforeFailure && onDelta) {
@@ -723,7 +723,7 @@ function nextEchoToolCallingResult(
     }
     throw new Error(stub.error);
   }
-  if (stub?.result) return { result: stub.result, nonStreaming: Boolean(stub.nonStreaming) };
+  if (stub?.result) return { result: stub.result, nonStreaming: Boolean(stub.nonStreaming), delayMs: stub.delayMs };
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
   // a deterministic shape.
@@ -766,7 +766,11 @@ export async function generateToolCallingResponse(
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
     echoToolCallingToolNames.push(tools.map((t) => t.function.name));
-    const { result, nonStreaming } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
+    const { result, nonStreaming, delayMs } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
+    // Optional injected latency so concurrency tests can measure overlap:
+    // a serial dispatch of N delayed children costs ~N*delay wall time; a
+    // concurrent dispatch costs ~delay. Defaults to no delay (instant).
+    if (delayMs && delayMs > 0) await Bun.sleep(delayMs);
     if (result.text && onDelta && !nonStreaming) {
       // Synthesize a single streamed delta so callers exercise their
       // streaming pipelines in echo-backed tests.

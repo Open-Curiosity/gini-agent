@@ -530,6 +530,39 @@ export function loadUserProfile(instance: Instance, opts?: LoadOptions): string 
 // API to promote a proposal to the approved file.
 // ---------------------------------------------------------------------------
 
+// In-process per-path async mutex for identity-file edits. The edit_soul /
+// edit_user_profile handlers read the current body (loadSoul/loadUserProfile),
+// compute a new body (append concatenation, section removal), then write —
+// a read-modify-write that is NOT atomic on its own. Concurrent sibling
+// subagents (which now overlap, since contiguous spawn_subagent batches
+// dispatch under Promise.all) can both read the same body and last-write-wins,
+// silently dropping one append. USER.md is per-instance and SOUL.md is shared
+// by same-parent siblings (they inherit the parent's agentId), so the
+// contention is real. A single gateway process owns every task in an instance
+// (subagents run in-process via fire-and-forget runTask), so an in-process
+// mutex keyed by the absolute file path is sufficient — there is no
+// cross-process writer to coordinate with.
+//
+// The lock is a promise chain per path: each caller awaits the previous
+// holder (success or failure) before running, and the tail entry is pruned
+// once no one is queued behind it so the map stays bounded.
+const identityFileLocks = new Map<string, Promise<void>>();
+
+export async function withIdentityFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const prev = identityFileLocks.get(path) ?? Promise.resolve();
+  // Run fn after the previous holder settles, regardless of how it settled.
+  const result = prev.then(fn, fn);
+  const guard = result.then(() => undefined, () => undefined);
+  identityFileLocks.set(path, guard);
+  try {
+    return await result;
+  } finally {
+    // Drop the map entry only if we're still the tail (nobody chained after
+    // us), so a long-lived instance doesn't accumulate one entry per path.
+    if (identityFileLocks.get(path) === guard) identityFileLocks.delete(path);
+  }
+}
+
 export type IdentityFileStatus = "proposed" | "approved";
 
 export interface IdentityFileWriteResult {
