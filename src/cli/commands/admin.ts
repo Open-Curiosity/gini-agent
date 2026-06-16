@@ -22,13 +22,12 @@ import {
   stopRuntime,
   waitForRuntimeStopped
 } from "../process";
-import { url } from "../api";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall, enable, stopViaBootout } from "./autostart";
 import { isLoaded, kickstart, plistPathFor, supervisor, type PlistKind } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
-import { api } from "../api";
+import { api, url } from "../api";
 
 // How long the foreground parent waits for a runtime child to exit on its own
 // after forwarding SIGTERM, before escalating to SIGKILL. This MUST exceed the
@@ -242,18 +241,17 @@ export async function startViaLaunchd(
     await deps.sleep(deps.healthIntervalMs);
   }
 
-  const banner: Record<string, unknown> = {
-    started: true,
-    url: url(config),
-    instance,
-    webUrl: operatorWebUrl(config)
-  };
-  if (!healthyWebUrl) {
-    // Mirror how startLifecycle reports a web failure: keep the gateway-up
-    // result, carry a webError string rather than throwing.
-    banner.webError = `Web did not become healthy within ${Math.round(deps.healthDeadlineMs / 1000)}s.`;
-  }
-  return { banner, runtimeStarted: !runtimeUp };
+  // Mirror startLifecycle's banner contract (src/cli/process.ts): the verb is
+  // `started` only when the runtime was actually down and brought up, else
+  // `running`; webUrl and webError are mutually exclusive — set webUrl only
+  // when the web is healthy, otherwise carry a webError string (no throw).
+  const runtimeStarted = !runtimeUp;
+  const banner: Record<string, unknown> = runtimeStarted
+    ? { started: true, url: url(config), instance }
+    : { running: true, url: url(config), instance };
+  if (healthyWebUrl) banner.webUrl = operatorWebUrl(config);
+  else banner.webError = `Web did not become healthy within ${Math.round(deps.healthDeadlineMs / 1000)}s.`;
+  return { banner, runtimeStarted };
 }
 
 // Route `gini start` on the TARGET INSTANCE's launchd state, symmetric to

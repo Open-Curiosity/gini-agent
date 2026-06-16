@@ -494,7 +494,7 @@ describe("startViaLaunchd (ensure via launchd, never spawn a daemon)", () => {
       webUp: false,
       healthyAfterRevive: true
     });
-    const { runtimeStarted } = await startViaLaunchd(config, web, deps);
+    const { banner, runtimeStarted } = await startViaLaunchd(config, web, deps);
     // gateway was already up → not revived.
     expect(rec.kickstarts.some((k) => k.kind === "gateway")).toBe(false);
     expect(rec.enables.some((e) => e.kinds.includes("gateway"))).toBe(false);
@@ -502,6 +502,12 @@ describe("startViaLaunchd (ensure via launchd, never spawn a daemon)", () => {
     expect(rec.kickstarts.some((k) => k.kind === "web")).toBe(true);
     expect(rec.enables.some((e) => e.kinds.includes("watchdog"))).toBe(true);
     expect(runtimeStarted).toBe(false);
+    // Runtime was already up (only web/watchdog revived) → verb is `running`,
+    // and the revived web becomes healthy so its URL is advertised.
+    expect(banner.running).toBe(true);
+    expect(banner.started).toBeUndefined();
+    expect(banner.webUrl).toBe("http://localhost:7777");
+    expect(banner.webError).toBeUndefined();
   });
 
   test("health never comes up within deadline -> banner with webError, no throw/hang", async () => {
@@ -516,6 +522,9 @@ describe("startViaLaunchd (ensure via launchd, never spawn a daemon)", () => {
     const { banner, runtimeStarted } = await startViaLaunchd(config, web, deps);
     expect(banner.started).toBe(true);
     expect(typeof banner.webError).toBe("string");
+    // webUrl and webError are mutually exclusive (mirrors startLifecycle): a
+    // failed web carries webError only, never a webUrl.
+    expect(banner.webUrl).toBeUndefined();
     expect(banner.url).toBe("http://127.0.0.1:7777");
     expect(runtimeStarted).toBe(true);
   });
