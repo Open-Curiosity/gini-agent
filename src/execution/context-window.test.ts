@@ -63,7 +63,12 @@ describe("prior context packing", () => {
       ]
     };
     const tokens = estimateToolCallingMessageTokens(message);
+    const textOnly = estimateToolCallingMessageTokens({ role: "user", content: "is it good quality?" });
     expect(tokens).toBeLessThan(5_000);
+    // The image must carry a real, bounded cost — never collapse toward the
+    // text part's count. That under-count is the regression the cap guards
+    // against (the estimate must never fall below a real image's token cost).
+    expect(tokens).toBeGreaterThan(textOnly + 1_000);
   });
 
   test("prefers active-thread history over unrelated thread history", () => {
