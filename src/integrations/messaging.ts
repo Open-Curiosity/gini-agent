@@ -372,7 +372,10 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   // runtime can mirror assistant replies back out to the originating
   // chat. demo / generic bridges keep the standalone-task path for
   // tests and CLI parity.
-  let taskId: string;
+  // Undefined when the submit was queued behind an in-flight turn (ADR
+  // chat-message-queue.md) — the task is created later at auto-dispatch, so
+  // the inbound record lands without a task linkage in that case.
+  let taskId: string | undefined;
   let target: string;
   if (bridge.kind === "telegram") {
     // Strict integer parse: `Number.parseInt("123abc", 10)` returns 123
@@ -403,7 +406,7 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       return sess;
     });
     const result = await submitChatMessage(config, session.id, { content: text });
-    taskId = result.taskId;
+    taskId = "queued" in result ? undefined : result.taskId;
   } else if (bridge.kind === "discord") {
     const channelId = rawTarget.trim();
     if (!channelId) {
@@ -423,7 +426,7 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       return sess;
     });
     const result = await submitChatMessage(config, session.id, { content: text });
-    taskId = result.taskId;
+    taskId = "queued" in result ? undefined : result.taskId;
   } else {
     target = rawTarget || "local";
     const task = await submitTask(config, text);

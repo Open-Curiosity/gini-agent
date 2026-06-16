@@ -84,6 +84,7 @@ import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
+import { dispatchNextPendingChatMessage } from "./execution/chat";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import {
   emitPhase,
@@ -224,7 +225,19 @@ export async function submitTask(
     created.auditIds.push(audit.id);
   });
   await updateRunFromTask(config, created);
-  runTask(config, created.id).catch((error) => failTask(config, created.id, error));
+  // Single chokepoint for draining the per-session message queue (ADR
+  // chat-message-queue.md). When a top-level chat task settles for ANY
+  // reason, dispatch the next queued message: .finally fires on normal
+  // completion, on failure (failTask runs in the .catch first), and on user
+  // cancel (cancelTask makes runChatTask return so runTask resolves). Only
+  // top-level chat tasks drain a queue — subagent/imperative tasks have none.
+  runTask(config, created.id)
+    .catch((error) => failTask(config, created.id, error))
+    .finally(() => {
+      if (options.mode === "chat" && options.chatSessionId && !options.parentTaskId) {
+        void dispatchNextPendingChatMessage(config, options.chatSessionId);
+      }
+    });
   return created;
 }
 
