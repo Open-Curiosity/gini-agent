@@ -162,9 +162,21 @@ function estimateContentTokens(content: ToolCallingMessage["content"]): number {
   return content.reduce((sum, part) => sum + estimatePartTokens(part), 0);
 }
 
+// Bounded per-image token estimate. An inline image is a base64 data URL, but
+// providers tile it to a small, capped visual-token cost that has no relation
+// to the data-URL byte length: Anthropic caps a single image at 1568 visual
+// tokens (4784 on Claude Opus 4.7 and later); OpenAI caps it at its patch/tile
+// budget. Counting the data-URL string at chars/4 over-estimates a
+// multi-megabyte photo by orders of magnitude (a 3.9 MB JPEG drove a turn
+// estimate to 891276 tokens against a 200000 window while the provider
+// reported 32406), which spuriously trips in-turn compaction against a
+// protected, non-summarizable image and bails the whole turn. Use the largest
+// documented single-image cap so the estimate never UNDER-counts a real image.
+const INLINE_IMAGE_TOKEN_ESTIMATE = 4784;
+
 function estimatePartTokens(part: MessageContentPart): number {
   if (part.type === "text") return approxTokens(part.text);
-  if (part.type === "image_url") return approxTokens(part.image_url.url) + 32;
+  if (part.type === "image_url") return INLINE_IMAGE_TOKEN_ESTIMATE;
   return approxTokens(part.document.data) + approxTokens(part.document.filename ?? "") + 32;
 }
 
