@@ -66,9 +66,15 @@ esac
 // landed). STUB_GIT_ALWAYS_OK forces it to succeed regardless — combined with a
 // huge STUB_READY_AFTER (xcode-select -p never succeeds) this presents a working
 // non-Apple git (the stub resolves under stubDir, not /usr/bin/git) so the
-// preflight's "working non-Apple git" branch can be exercised.
+// preflight's "working non-Apple git" branch can be exercised. STUB_GIT_BROKEN
+// forces it to always FAIL (the Xcode-license / broken-DEVELOPER_DIR case where
+// xcode-select -p succeeds but git can't actually run).
 const GIT_STUB = `#!/usr/bin/env bash
 if [ "$1" = "--version" ]; then
+  if [ -n "\${STUB_GIT_BROKEN:-}" ]; then
+    echo "xcode-select: error: tool 'git' requires Xcode, agree to the license" >&2
+    exit 1
+  fi
   if [ -n "\${STUB_GIT_ALWAYS_OK:-}" ]; then
     echo "git version 2.50.1 (stub)"
     exit 0
@@ -160,11 +166,30 @@ describe("install.sh ensure_git_macos preflight", () => {
     expect(existsSync(join(stubDir, "poll"))).toBe(false);
   });
 
-  test("fast path: CLT active (xcode-select -p ok), no install triggered", () => {
-    const res = runPreflight({ OS: "darwin", STUB_READY_AFTER: "1" });
+  test("fast path: CLT active (xcode-select -p ok) and git runs, no install triggered", () => {
+    const res = runPreflight({ OS: "darwin", STUB_READY_AFTER: "1", STUB_GIT_ALWAYS_OK: "1" });
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Git ready");
     expect(res.installCalled).toBe(false);
+  });
+
+  test("active developer dir but git broken (unaccepted Xcode license): not 'ready', triggers install", () => {
+    // xcode-select -p succeeds (READY_AFTER 1) but git always fails — the Xcode
+    // license / broken DEVELOPER_DIR case. clt_tools_present must NOT report ready
+    // off xcode-select alone; it falls through to trigger the install. With the
+    // appear window at 0 and no helper, it aborts via the no-dialog path.
+    const res = runPreflight({
+      OS: "darwin",
+      STUB_READY_AFTER: "1",
+      STUB_GIT_BROKEN: "1",
+      STUB_HELPER_UNTIL: "0",
+      GINI_CLT_HELPER_APPEAR_S: "0",
+      GINI_CLT_WAIT_TIMEOUT_S: "9999"
+    });
+    expect(res.status).toBe(1);
+    expect(res.stdout).not.toContain("Git ready");
+    expect(res.installCalled).toBe(true);
+    expect(res.stderr).toContain("No Command Line Tools installer dialog appeared");
   });
 
   test("working non-Apple git with no active developer dir: accepted, no install", () => {

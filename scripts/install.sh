@@ -197,8 +197,13 @@ ensure_bun() {
 #
 # Poll interval, timeout, and the helper-match pattern are env-injectable for tests.
 clt_tools_present() {
-  # CLT installed and active -> /usr/bin/git works and clones succeed.
-  if xcode-select -p >/dev/null 2>&1; then
+  # Active developer dir AND git actually runs. xcode-select -p succeeding isn't
+  # enough on its own: a set-but-broken DEVELOPER_DIR, or a full Xcode whose
+  # license hasn't been accepted, makes `git` exit non-zero ("You have not agreed
+  # to the Xcode/iOS license") even though the dir resolves — so the clone would
+  # still fail. Running git here is safe (the dir is set, so it won't trip the
+  # install dialog): it either works or surfaces the real error.
+  if xcode-select -p >/dev/null 2>&1 && git --version >/dev/null 2>&1; then
     return 0
   fi
   # No active developer dir. A non-Apple git on PATH clones without the CLT; only
