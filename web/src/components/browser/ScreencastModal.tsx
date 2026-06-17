@@ -59,6 +59,12 @@ export function ScreencastModal({
   const pageSize = useRef({ w: 1280, h: 800 });
   const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
   const dragStart = useRef<{ x: number; y: number; clientX: number; clientY: number; mods: number } | null>(null);
+  // Move-coalescing: pointer move fires far faster than a round-trip, so cap it
+  // to one in-flight POST and remember only the latest position, flushed when
+  // the in-flight one returns. Keeps hover responsive without flooding the one
+  // shared CDP socket with stale intermediate coordinates.
+  const moveInFlight = useRef(false);
+  const pendingMove = useRef<Record<string, unknown> | null>(null);
 
   // Open the frames SSE. EventSource hits /api/runtime/... so the BFF injects
   // the bearer; the browser never sees it. Reconnect is EventSource-native.
@@ -88,6 +94,32 @@ export function ScreencastModal({
         method: "POST",
         body: JSON.stringify(payload)
       }).catch(() => undefined);
+    },
+    [setupRequestId]
+  );
+
+  // Coalesced move sender: at most one move POST outstanding; the latest move
+  // that arrives while one is in flight is stashed and sent when it settles.
+  const sendMove = useCallback(
+    (payload: Record<string, unknown>) => {
+      if (moveInFlight.current) {
+        pendingMove.current = payload;
+        return;
+      }
+      moveInFlight.current = true;
+      void api(`/browser/screencast/${setupRequestId}/input`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+        .catch(() => undefined)
+        .finally(() => {
+          moveInFlight.current = false;
+          const next = pendingMove.current;
+          if (next) {
+            pendingMove.current = null;
+            sendMove(next);
+          }
+        });
     },
     [setupRequestId]
   );
@@ -167,7 +199,7 @@ export function ScreencastModal({
             draggable={false}
             onMouseDown={onMouseDown}
             onMouseUp={onMouseUp}
-            onMouseMove={(e) => { if (dragStart.current) return; const p = toPage(e); sendInput({ kind: "move", x: p.x, y: p.y, modifiers: cdpModifiers(e) }); }}
+            onMouseMove={(e) => { if (dragStart.current) return; const p = toPage(e); sendMove({ kind: "move", x: p.x, y: p.y, modifiers: cdpModifiers(e) }); }}
             onWheel={onWheel}
             onDoubleClick={(e) => e.preventDefault()}
           />

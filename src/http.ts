@@ -945,7 +945,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // headless with no relaunch (completeBrowserConnectSetup's managed
         // relaunch only applies to the visible-window fallback).
         if (setup.payload.screencast === true) {
-          await stopActiveBridge();
+          await stopActiveBridge(setupId);
           const result = JSON.stringify({ success: true, connected: true, mode: "screencast" });
           await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
           return json({ ok: true });
@@ -1065,7 +1065,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // browser itself stays up (the bridge is only the screencast channel).
       const cancelled = readState(config.instance).setupRequests.find((s) => s.id === params[0]);
       if (cancelled?.action === "browser.connect" && cancelled.payload.screencast === true) {
-        await stopActiveBridge();
+        await stopActiveBridge(params[0]);
       }
       return json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false }));
     }],
@@ -1258,7 +1258,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge(preferUrl);
+        bridge = await getOrStartBridge(setup.id, preferUrl);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }
@@ -1327,7 +1327,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge(preferUrl);
+        bridge = await getOrStartBridge(setup.id, preferUrl);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }

@@ -104,10 +104,9 @@ export class ScreencastBridge {
   private currentWsUrl: string | undefined;
   private knownTargetIds = new Set<string>();
   private targetWatch: ReturnType<typeof setInterval> | undefined;
-  // True while switchTo is re-pointing the socket: suppresses the old socket's
-  // close handler from tearing the whole bridge down, and pauses the watcher.
+  // True for the whole switchTo window: suppresses the dropped socket's close
+  // handler from tearing the whole bridge down, and pauses the watcher.
   private switching = false;
-  private swapInProgress = false;
   private readonly targetWatchMs: number;
 
   constructor(
@@ -145,7 +144,7 @@ export class ScreencastBridge {
     // Remember the page targets present at attach time so the watcher can
     // recognize a NEW one (a popup the sign-in flow opens) as it appears.
     this.knownTargetIds = new Set(pages.map((p) => p.id).filter((id): id is string => typeof id === "string"));
-    await this.attachTo(pageTarget.webSocketDebuggerUrl, true);
+    await this.attachTo(pageTarget.webSocketDebuggerUrl);
     // Follow popup / new-tab sign-in: many OAuth flows open a popup window
     // (a new page target) the user must complete in. Poll the target list and
     // re-point the screencast to a freshly-opened page, falling back to the
@@ -155,10 +154,13 @@ export class ScreencastBridge {
   }
 
   // Open a raw CDP socket to one page target's wsUrl and start its screencast.
-  // When `settleStart` is true the returned promise rejects on a close/error
-  // that happens before the screencast starts, so start()'s caller can't hang;
-  // a target SWITCH passes false (a failed switch just leaves the prior frame).
-  private attachTo(wsUrl: string, settleStart: boolean): Promise<void> {
+  // The returned promise ALWAYS settles: it resolves once the screencast starts,
+  // and rejects if the socket closes/errors before that. Both start() (the
+  // initial attach) and switchTo() (a target swap) await it, so neither can hang
+  // on a target that dies mid-attach — a rejected switch is caught and leaves
+  // the prior frame. A reject after a post-open resolve is a no-op, so this also
+  // stays correct for steady-state teardown.
+  private attachTo(wsUrl: string): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     const socket = this.deps.openSocket(wsUrl);
     this.cdp = socket;
@@ -186,19 +188,21 @@ export class ScreencastBridge {
     });
     socket.addEventListener("message", (ev) => this.onCdpMessage(ev.data));
     // A close/error BEFORE open (Chrome died mid-attach, the page target
-    // vanished, the handshake dropped) must settle the start() promise, or the
-    // awaiting request hangs forever. reject after a post-open resolve is a
-    // no-op, so this stays correct for steady-state teardown too.
+    // vanished, the handshake dropped) must settle this promise unconditionally,
+    // or the awaiting caller (start() or switchTo()) hangs forever.
     socket.addEventListener("close", () => {
-      if (settleStart) reject(new Error("CDP socket closed before the screencast started."));
-      // A deliberate switch closes the old socket on purpose — don't let that
-      // tear the whole bridge down; only a real drop of the live socket does.
-      if (this.swapInProgress || socket !== this.cdp) return;
+      reject(new Error("CDP socket closed before the screencast started."));
+      // A deliberate switch closes the old socket and may attach a new one that
+      // dies mid-handshake — neither should tear the whole bridge down (the
+      // watcher falls back on its next tick). Only an unexpected drop of the
+      // live socket outside a swap does. A stale socket (already replaced) is
+      // likewise ignored.
+      if (this.switching || socket !== this.cdp) return;
       this.handleClosed();
     });
     socket.addEventListener("error", () => {
-      if (settleStart) reject(new Error("CDP socket errored before the screencast started."));
-      if (this.swapInProgress || socket !== this.cdp) return;
+      reject(new Error("CDP socket errored before the screencast started."));
+      if (this.switching || socket !== this.cdp) return;
       this.handleClosed();
     });
     return promise;
@@ -247,16 +251,26 @@ export class ScreencastBridge {
     try {
       const old = this.cdp;
       this.cdp = undefined;
-      // Drop the old socket's listeners' effect: mark it so its close handler
-      // (which calls handleClosed) is bypassed during a deliberate switch.
-      this.swapInProgress = true;
+      // The old socket's close handler is bypassed during a deliberate switch,
+      // so it never drains this.pending. Resolve any in-flight send awaiting the
+      // old socket now (its reply can never arrive on the new session) — mirrors
+      // handleClosed's resolve(undefined) so a dispatchInput await can't hang.
+      for (const resolve of this.pending.values()) resolve(undefined);
+      this.pending.clear();
+      // The old socket's close handler is suppressed for the whole swap window
+      // (this.switching stays true, and this.cdp is already nulled), so closing
+      // it can't tear the bridge down.
       try {
         old?.close();
       } catch {
         // ignore
       }
-      this.swapInProgress = false;
-      await this.attachTo(wsUrl, false);
+      // A new target that dies mid-attach rejects here; swallow it so switching
+      // always clears and the next watch tick can fall back to a live page. Null
+      // the dead socket so send() short-circuits until that fallback re-attaches.
+      await this.attachTo(wsUrl).catch(() => {
+        if (this.currentWsUrl === wsUrl) this.cdp = undefined;
+      });
     } finally {
       this.switching = false;
     }
@@ -378,11 +392,18 @@ export class ScreencastBridge {
   // regardless — otherwise /complete and /cancel, which await this, would hang.
   async stop(): Promise<void> {
     if (this.cdp && !this.closed) {
-      const timeout = new Promise<void>((resolve) => setTimeout(resolve, this.stopTimeoutMs));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, this.stopTimeoutMs);
+      });
       try {
         await Promise.race([this.send("Page.stopScreencast").then(() => undefined), timeout]);
       } catch {
         // ignore — we're tearing down
+      } finally {
+        // Clear the bound so the fast path (stopScreencast replied first) doesn't
+        // leave a ref'd timer pending until it fires.
+        if (timer) clearTimeout(timer);
       }
     }
     try {
@@ -398,6 +419,16 @@ export class ScreencastBridge {
 // on first screencast request and reused across the frames-SSE and input-POST
 // endpoints; torn down when the sign-in completes or the socket drops.
 let activeBridge: ScreencastBridge | undefined;
+// The setupRequest id that owns the active/starting bridge. The screencast is a
+// single per-instance channel, but two concurrent browser.connect sign-ins (two
+// tasks, or one task on two hosts) can be pending at once. Without an owner, the
+// second sign-in's frames/input would bind to the FIRST sign-in's page (the
+// operator would see and type into the wrong task's login), and completing or
+// cancelling either would tear down the other's live screencast. So the bridge
+// is claimed by one setup id; a different owner is rejected (the HTTP layer
+// turns the throw into a 409) until the holder finishes.
+let activeOwner: string | undefined;
+let startingOwner: string | undefined;
 // In-flight start promise so concurrent first-callers (the frames-SSE GET and
 // the input-POST arriving together on the first request) share ONE bridge
 // instead of each launching a CDP socket and leaking the loser's. Cleared once
@@ -412,18 +443,37 @@ let startingBridge: Promise<ScreencastBridge> | undefined;
 // nothing ever closes.
 let bridgeGeneration = 0;
 
-// Get the live bridge, creating + starting one if none is active (or the
-// previous one closed). `preferUrl` is forwarded to start() so the bridge
-// attaches to the requesting task's page. Test seam: pass a factory to inject
-// a fake bridge.
+// Raised when a screencast request targets the instance's bridge while another
+// sign-in setup already owns it. The HTTP layer maps this to a 409.
+export class ScreencastBusyError extends Error {
+  constructor() {
+    super("Another sign-in is using the agent's browser screencast.");
+    this.name = "ScreencastBusyError";
+  }
+}
+
+// Get the live bridge for `owner` (the setupRequest id), creating + starting one
+// if none is active (or the previous one closed). A request from a DIFFERENT
+// owner while the bridge is held throws ScreencastBusyError → 409, so two
+// concurrent sign-ins can't cross-wire onto one page. `preferUrl` is forwarded
+// to start() so the bridge attaches to the requesting task's page. Test seam:
+// pass a factory to inject a fake bridge.
 export async function getOrStartBridge(
+  owner: string,
   preferUrl?: string,
   factory: () => ScreencastBridge = () => new ScreencastBridge()
 ): Promise<ScreencastBridge> {
-  if (activeBridge && !activeBridge.isClosed()) return activeBridge;
-  if (startingBridge) return startingBridge;
+  if (activeBridge && !activeBridge.isClosed()) {
+    if (activeOwner !== owner) throw new ScreencastBusyError();
+    return activeBridge;
+  }
+  if (startingBridge) {
+    if (startingOwner !== owner) throw new ScreencastBusyError();
+    return startingBridge;
+  }
   const bridge = factory();
   const startedAtGeneration = bridgeGeneration;
+  startingOwner = owner;
   startingBridge = bridge
     .start(preferUrl)
     .then(() => {
@@ -434,34 +484,49 @@ export async function getOrStartBridge(
         return bridge;
       }
       activeBridge = bridge;
+      activeOwner = owner;
       return bridge;
     })
     .finally(() => {
       startingBridge = undefined;
+      startingOwner = undefined;
     });
   return startingBridge;
 }
 
 // Tear down the active bridge (sign-in completed / cancelled / shutdown). Bumps
 // the generation so any start() still in flight tears its own bridge down
-// instead of installing it after this returns.
-export async function stopActiveBridge(): Promise<void> {
+// instead of installing it after this returns. When `owner` is given, only the
+// bridge OWNED by that setup is torn down — completing or cancelling one sign-in
+// must not kill another's live screencast; a mismatch is a no-op. Pass no owner
+// for an unconditional teardown (shutdown / closeAll).
+export async function stopActiveBridge(owner?: string): Promise<void> {
+  if (owner !== undefined && activeOwner !== undefined && activeOwner !== owner && startingOwner !== owner) {
+    return;
+  }
   bridgeGeneration += 1;
   const bridge = activeBridge;
   activeBridge = undefined;
+  activeOwner = undefined;
   startingBridge = undefined;
+  startingOwner = undefined;
   if (bridge) await bridge.stop();
 }
 
 // Test-only: install a ready bridge as the active one so the HTTP endpoints
-// reuse it (exercises the success-path wiring without launching Chrome).
-export function __setActiveBridgeForTest(bridge: ScreencastBridge): void {
+// reuse it (exercises the success-path wiring without launching Chrome). The
+// owner must match the setup id the reusing request carries, or it would 409.
+export function __setActiveBridgeForTest(bridge: ScreencastBridge, owner?: string): void {
   activeBridge = bridge;
+  activeOwner = owner;
   startingBridge = undefined;
+  startingOwner = undefined;
 }
 
 // Test-only reset so a suite doesn't leak the module-level bridge.
 export function __resetActiveBridgeForTest(): void {
   activeBridge = undefined;
+  activeOwner = undefined;
   startingBridge = undefined;
+  startingOwner = undefined;
 }

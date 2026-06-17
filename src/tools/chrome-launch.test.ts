@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, type Server } from "node:net";
+import { createServer, type AddressInfo, type Server } from "node:net";
 import {
   DEFAULT_CDP_PORT_BASE,
   defaultDeps,
@@ -48,9 +48,16 @@ describe("findFreePort", () => {
   });
 
   test("rolls forward past an occupied port", async () => {
-    const base = DEFAULT_CDP_PORT_BASE + 600;
+    // Bind :0 so the OS hands back a guaranteed-free port — a hard-coded base
+    // could already be held by a parallel worker or a TIME_WAIT socket and make
+    // this listen() throw instead of testing the roll-forward.
     const occupied: Server = createServer();
-    await new Promise<void>((resolve) => occupied.listen(base, "127.0.0.1", () => resolve()));
+    occupied.on("error", () => undefined); // never an unhandled server error
+    await new Promise<void>((resolve, reject) => {
+      occupied.once("error", reject);
+      occupied.listen(0, "127.0.0.1", () => resolve());
+    });
+    const base = (occupied.address() as AddressInfo).port;
     try {
       const port = await findFreePort(base);
       expect(port).toBeGreaterThan(base);
@@ -136,6 +143,27 @@ describe("launchSpawnedChrome", () => {
       });
       expect(launchArgs[0].options.acceptDownloads).toBe(true);
       expect(launchArgs[0].options.downloadsPath).toBe("/tmp/dl");
+    } finally {
+      rmSync(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("extraOptions cannot override the launch invariants (args / headless / port)", async () => {
+    const profileDir = tempProfile();
+    try {
+      const { deps, launchArgs } = fakeDeps();
+      await launchSpawnedChrome({
+        profileDir,
+        port: 9412,
+        // A caller (or a future footgun) tries to clobber the invariants.
+        extraOptions: { args: ["--evil"], headless: false },
+        deps
+      });
+      const opts = launchArgs[0].options;
+      // The stealth args + the debug port survive; the override is discarded.
+      expect((opts.args as string[])).toContain("--remote-debugging-port=9412");
+      expect((opts.args as string[])).not.toEqual(["--evil"]);
+      expect(opts.headless).toBe(true);
     } finally {
       rmSync(profileDir, { recursive: true, force: true });
     }

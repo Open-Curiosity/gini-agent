@@ -619,10 +619,11 @@ describe("browser-connect managed launch via playwright", () => {
 
 // The visible Connect flow still launches a headed persistent context via
 // chromium.launchPersistentContext against the per-instance chrome-profile
-// dir (the agent's DEFAULT browser path now spawns its own per-agent Chrome,
-// covered in src/tools/browser.test.ts — it no longer shares this dir). This
-// pins that Connect keeps using launchPersistentContext, headed, against the
-// per-instance profile so user sign-ins persist there.
+// dir (the agent's DEFAULT browser path now spawns its own per-instance Chrome,
+// covered in src/tools/browser.test.ts — it shares this same per-instance
+// chrome-profile dir). This pins that Connect keeps using
+// launchPersistentContext, headed, against the per-instance profile so user
+// sign-ins persist there.
 describe("Connect launches a headed persistent context on the per-instance profile dir", () => {
   test("Connect uses launchPersistentContext(headless: false) against the per-instance chrome-profile dir", async () => {
     const config = testConfig("profile-stable");

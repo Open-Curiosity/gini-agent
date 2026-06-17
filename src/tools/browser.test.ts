@@ -3277,7 +3277,7 @@ describe("spawned launch internals", () => {
 
 // The managed (visible Connect) and cdp (external attach) provider bodies are
 // reached via ensureShared when state.browser carries the matching record. The
-// agent's DEFAULT path no longer routes here (it spawns per-agent), so these
+// agent's DEFAULT path no longer routes here (it spawns per-instance), so these
 // drive the providers directly with a mocked playwright-core.
 describe("ensureShared managed + cdp provider bodies", () => {
   const TEST_ROOT = "/tmp/gini-shared-providers";

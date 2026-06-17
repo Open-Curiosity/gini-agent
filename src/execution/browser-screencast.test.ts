@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   ScreencastBridge,
+  ScreencastBusyError,
   defaultDeps,
   getOrStartBridge,
   stopActiveBridge,
@@ -497,6 +498,79 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(h.dialed.length).toBe(dialsAtStop);
   });
+
+  test("recovers (does not permanently stall) when a popup dies mid-attach", async () => {
+    const opener = page("opener", "https://app.example/");
+    const popup = page("popup", "https://idp.example/authorize");
+    const sockets = new Map<string, FakeSocket>();
+    const dialed: string[] = [];
+    const openSocket = (url: string): WebSocketLike => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        // The popup's socket dies before it ever opens (target vanished
+        // mid-handshake); every other socket opens normally.
+        if (event === "open") {
+          queueMicrotask(() => (url === popup.webSocketDebuggerUrl ? socket.close() : socket.open()));
+        }
+      };
+      sockets.set(url, socket);
+      dialed.push(url);
+      return socket;
+    };
+    let targets: CdpVersionTarget[] = [opener];
+    const bridge = new ScreencastBridge(
+      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333 },
+      20,
+      5
+    );
+    await bridge.start("https://app.example/");
+    // Popup appears; its attach will fail. The bridge must NOT close, and the
+    // switching flag must clear so the next tick can recover.
+    targets = [opener, popup];
+    await waitUntil(() => dialed.includes(popup.webSocketDebuggerUrl));
+    // Popup is gone now; only the opener remains. The watcher must re-point to it.
+    targets = [opener];
+    const dialsBeforeRecovery = dialed.length;
+    await waitUntil(() => dialed.length > dialsBeforeRecovery && dialed.at(-1) === opener.webSocketDebuggerUrl);
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
+
+  test("an input command issued during a switch resolves instead of hanging", async () => {
+    const opener = page("opener", "https://app.example/");
+    const popup = page("popup", "https://idp.example/authorize");
+    // The opener's socket never auto-replies, so a send() on it stays pending
+    // until something drains this.pending — which the switch must do.
+    let openerSocket: FakeSocket | undefined;
+    const openSocket = (url: string): WebSocketLike => {
+      const socket = new FakeSocket();
+      if (url === opener.webSocketDebuggerUrl) openerSocket = socket;
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      return socket;
+    };
+    let targets: CdpVersionTarget[] = [opener];
+    const bridge = new ScreencastBridge(
+      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333 },
+      20,
+      5
+    );
+    await bridge.start("https://app.example/");
+    // Wedge the opener socket: stop auto-replying so the next send() stays open.
+    openerSocket!.autoReply = false;
+    // An operator click lands while a popup is about to be switched to.
+    const inputDone = bridge.dispatchInput({ kind: "move", x: 5, y: 5 });
+    targets = [opener, popup]; // triggers switchTo, which drains this.pending
+    // The orphaned send must be resolved by the switch, so dispatchInput settles.
+    await inputDone;
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
 });
 
 describe("getOrStartBridge / stopActiveBridge", () => {
@@ -516,13 +590,13 @@ describe("getOrStartBridge / stopActiveBridge", () => {
         resolvePort: () => 9333
       });
     };
-    const b1 = await getOrStartBridge(undefined, factory);
-    const b2 = await getOrStartBridge(undefined, factory);
+    const b1 = await getOrStartBridge("setup-1", undefined, factory);
+    const b2 = await getOrStartBridge("setup-1", undefined, factory);
     expect(b2).toBe(b1); // reused while alive
-    await stopActiveBridge();
-    const b3 = await getOrStartBridge(undefined, factory);
+    await stopActiveBridge("setup-1");
+    const b3 = await getOrStartBridge("setup-1", undefined, factory);
     expect(b3).not.toBe(b1); // recreated after teardown
-    await stopActiveBridge();
+    await stopActiveBridge("setup-1");
   });
 
   test("concurrent first-callers share a single bridge (single-flight)", async () => {
@@ -543,12 +617,12 @@ describe("getOrStartBridge / stopActiveBridge", () => {
       });
     };
     const [a, b] = await Promise.all([
-      getOrStartBridge(undefined, factory),
-      getOrStartBridge(undefined, factory)
+      getOrStartBridge("setup-1", undefined, factory),
+      getOrStartBridge("setup-1", undefined, factory)
     ]);
     expect(a).toBe(b);
     expect(built).toBe(1); // only one bridge constructed despite two callers
-    await stopActiveBridge();
+    await stopActiveBridge("setup-1");
   });
 
   test("stopActiveBridge with no active bridge is a no-op", async () => {
@@ -580,21 +654,21 @@ describe("getOrStartBridge / stopActiveBridge", () => {
       built.push(b);
       return b;
     };
-    const startP = getOrStartBridge(undefined, factory);
+    const startP = getOrStartBridge("setup-1", undefined, factory);
     await Promise.resolve(); // getOrStartBridge builds the bridge + calls start()
     // Teardown fires while start() is parked at the fetchJson await.
-    await stopActiveBridge();
+    await stopActiveBridge("setup-1");
     // Release the launch; start() proceeds, opens the socket, and resolves.
     openGate();
     await startP;
-    // The post-start guard fires `void bridge.stop()` (not awaited), so let it
-    // settle before asserting the bridge was torn down rather than installed.
-    await new Promise((r) => setTimeout(r, 10));
+    // The post-start guard fires `void bridge.stop()` (not awaited), so poll the
+    // actual condition rather than racing a fixed delay.
+    await waitUntil(() => built.length === 1 && built[0].isClosed());
     expect(built.length).toBe(1);
     expect(built[0].isClosed()).toBe(true);
     // Nothing is left installed: the next get builds a fresh bridge.
     const probe = new FakeSocket();
-    const next = await getOrStartBridge(undefined, () => {
+    const next = await getOrStartBridge("setup-1", undefined, () => {
       const b = new ScreencastBridge({
         openSocket: () => probe,
         fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://y" }],
@@ -608,14 +682,67 @@ describe("getOrStartBridge / stopActiveBridge", () => {
       return b;
     });
     expect(next).not.toBe(built[0]); // a fresh bridge, not the orphaned one
-    await stopActiveBridge();
+    await stopActiveBridge("setup-1");
   });
 
   test("the default factory builds a real bridge (throws with no spawned browser)", async () => {
     // No factory arg → exercises the default `() => new ScreencastBridge()`
     // arrow. With no spawned Chrome the real start() throws and nothing is
     // installed as the active bridge.
-    await expect(getOrStartBridge()).rejects.toThrow(/No spawned browser/);
+    await expect(getOrStartBridge("setup-1")).rejects.toThrow(/No spawned browser/);
+  });
+
+  test("a different owner is rejected while the bridge is held (no cross-wiring)", async () => {
+    const factory = () => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      return new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+        resolvePort: () => 9333
+      });
+    };
+    const held = await getOrStartBridge("setup-A", undefined, factory);
+    // Setup B's frames/input must NOT bind to setup A's live bridge.
+    await expect(getOrStartBridge("setup-B", undefined, factory)).rejects.toThrow(ScreencastBusyError);
+    // Setup A keeps reusing it.
+    expect(await getOrStartBridge("setup-A", undefined, factory)).toBe(held);
+    await stopActiveBridge("setup-A");
+  });
+
+  test("teardown by a non-owner leaves the active bridge alone", async () => {
+    let stopped = 0;
+    const factory = () => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      const b = new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+        resolvePort: () => 9333
+      });
+      const origStop = b.stop.bind(b);
+      b.stop = async () => {
+        stopped += 1;
+        return origStop();
+      };
+      return b;
+    };
+    const held = await getOrStartBridge("setup-A", undefined, factory);
+    // Setup B cancelling/completing must not stop setup A's screencast.
+    await stopActiveBridge("setup-B");
+    expect(stopped).toBe(0);
+    expect(held.isClosed()).toBe(false);
+    // The owner's teardown does stop it.
+    await stopActiveBridge("setup-A");
+    expect(stopped).toBe(1);
   });
 });
 

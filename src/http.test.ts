@@ -2777,7 +2777,7 @@ describe("runtime api", () => {
       start: async () => undefined,
       stop: async () => undefined
     };
-    sc.__setActiveBridgeForTest(fakeBridge as never);
+    sc.__setActiveBridgeForTest(fakeBridge as never, setup.id);
     try {
       const framesRes = await handler(
         new Request(`http://127.0.0.1:${config.port}/api/browser/screencast/${setup.id}/frames`, {

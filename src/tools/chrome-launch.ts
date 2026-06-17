@@ -160,12 +160,16 @@ export async function launchSpawnedChrome(options: LaunchSpawnedChromeOptions): 
   // from the bundled binary rather than reusing the branded binary's UA.
   const buildOptions = async (execPath: string): Promise<Record<string, unknown>> => {
     const userAgent = headless ? await deps.cleanUserAgent(execPath) : undefined;
+    // extraOptions is spread FIRST so the launch invariants below always win —
+    // a caller-supplied `args` (or headless/executablePath/userAgent) can never
+    // silently drop the stealth flags or the --remote-debugging-port the
+    // screencast bridge attaches to.
     return {
+      ...(options.extraOptions ?? {}),
       headless,
       executablePath: execPath,
       args: [...CHROME_LAUNCH_ARGS, `--remote-debugging-port=${port}`],
-      ...(userAgent ? { userAgent } : {}),
-      ...(options.extraOptions ?? {})
+      ...(userAgent ? { userAgent } : {})
     };
   };
 
