@@ -5196,6 +5196,45 @@ describe("anthropic provider", () => {
       restoreAk();
     }
   });
+
+  // A plain assistant row interleaved between a tool_use and its result must be
+  // HOISTED so the toolResult leads the message immediately after the toolUse
+  // turn. Bedrock Converse rejects an interposed assistant turn ("toolResult
+  // blocks ... exceeds the number of toolUse blocks of previous turn"). The
+  // backstop re-emits the matched result adjacent to its call, then the
+  // interleaved row after.
+  test("bedrock: hoists a tool_result over an interleaved assistant row", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "go" },
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_x", type: "function", function: { name: "search", arguments: "{}" } }] },
+        { role: "assistant", content: "thinking out loud" }, // interleaved plain text
+        { role: "tool", tool_call_id: "tu_x", content: "{\"ok\":true}" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // Find the assistant turn carrying the toolUse; the VERY NEXT message must
+      // be a user turn leading with the matching toolResult.
+      const idx = body.messages.findIndex((m) => m.role === "assistant" && m.content.some((b) => b.toolUse));
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const next = body.messages[idx + 1]!;
+      expect(next.role).toBe("user");
+      expect(next.content[0]!.toolResult).toBeDefined();
+      expect(String((next.content[0]!.toolResult as Record<string, unknown>).toolUseId)).toBe("tu_x");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
 });
 
 describe("codex no-tools dispatch", () => {

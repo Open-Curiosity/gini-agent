@@ -716,34 +716,50 @@ function stripDocumentPartsIfUnsupported(
 // kept only when EVERY id it carries is answered in its window; otherwise the
 // turn and its partial results drop together (a partial tool_use set still
 // 400s). A `tool` row survives only as a matched result of a kept turn; any
-// other `tool` row is an orphan and is dropped. Order is preserved.
+// other `tool` row is an orphan and is dropped.
+//
+// Matched results are emitted IMMEDIATELY after their assistant tool_use turn,
+// hoisting them over any interleaved approval_reason / plain-text row that sat
+// between the call and its result. Bedrock Converse requires the toolResult to
+// lead the very next message after the toolUse turn (an interposed assistant
+// text turn 400s with "toolResult blocks ... exceeds the number of toolUse
+// blocks of previous turn"); the interleaved row is re-emitted in its original
+// order right after the hoisted results. This mirrors priorChatMessages so the
+// rebuild-time and request-build guards agree.
 function pairToolCallingMessages(messages: ToolCallingMessage[]): ToolCallingMessage[] {
   const isToolUseTurn = (m: ToolCallingMessage): boolean =>
     m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
-  // Tool rows default to dropped; everything non-tool defaults to kept. An
-  // assistant tool_use turn flips to kept (and marks its window's results
-  // kept) only when its whole id set is answered in-window.
-  const keep: boolean[] = messages.map((m) => m.role !== "tool");
+  const out: ToolCallingMessage[] = [];
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]!;
-    if (!isToolUseTurn(message)) continue;
-    const ids = new Set(message.tool_calls!.map((call) => call.id));
-    const resultIndexById = new Map<string, number>();
-    for (let j = i + 1; j < messages.length; j++) {
-      const next = messages[j]!;
-      if (next.role === "user") break; // turn boundary
-      if (isToolUseTurn(next)) break; // next tool round
-      if (next.role !== "tool") continue; // skip interleaved approval_reason / plain text
-      const id = next.tool_call_id;
-      if (typeof id === "string" && ids.has(id) && !resultIndexById.has(id)) {
-        resultIndexById.set(id, j);
+    if (isToolUseTurn(message)) {
+      const ids = message.tool_calls!.map((call) => call.id);
+      const idSet = new Set(ids);
+      const resultIndexById = new Map<string, number>();
+      for (let j = i + 1; j < messages.length; j++) {
+        const next = messages[j]!;
+        if (next.role === "user") break; // turn boundary
+        if (isToolUseTurn(next)) break; // next tool round
+        if (next.role !== "tool") continue; // skip interleaved approval_reason / plain text
+        const id = next.tool_call_id;
+        if (typeof id === "string" && idSet.has(id) && !resultIndexById.has(id)) {
+          resultIndexById.set(id, j);
+        }
       }
+      if (!ids.every((id) => resultIndexById.has(id))) continue; // drop the unanswered turn
+      out.push(message);
+      // Emit results in the assistant turn's id order, immediately adjacent —
+      // hoisted over any interleaved row, which the outer loop re-emits after.
+      for (const id of ids) out.push(messages[resultIndexById.get(id)!]!);
+      continue;
     }
-    const allAnswered = [...ids].every((id) => resultIndexById.has(id));
-    keep[i] = allAnswered;
-    if (allAnswered) for (const j of resultIndexById.values()) keep[j] = true;
+    // A `tool` row reached directly by the outer loop is either an orphan or a
+    // result already emitted next to its (kept) assistant turn above — drop it
+    // so no result leads without its tool_use and none double-emits.
+    if (message.role === "tool") continue;
+    out.push(message);
   }
-  return messages.filter((_, index) => keep[index]);
+  return out;
 }
 
 export interface ToolCallingResult {
