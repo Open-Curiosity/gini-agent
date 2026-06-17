@@ -33,7 +33,7 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { browserNavigate, getScreencastPort, safetyCheck } from "./tools/browser";
+import { browserNavigate, getScreencastPort, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import {
   getOrStartBridge,
   stopActiveBridge,
@@ -1242,9 +1242,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!setup || setup.action !== "browser.connect") {
         return json({ error: "Screencast setup request not found" }, 404);
       }
+      // Attach to the page the requesting task is actually on, not whatever
+      // tab happens to be first, so the operator signs in on the right page.
+      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge();
+        bridge = await getOrStartBridge(preferUrl);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }
@@ -1304,9 +1307,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       } catch {
         return json({ error: "Invalid JSON body" }, 400);
       }
+      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge();
+        bridge = await getOrStartBridge(preferUrl);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }

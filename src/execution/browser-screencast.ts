@@ -40,6 +40,7 @@ export type ScreencastInput =
 
 interface CdpVersionTarget {
   type?: string;
+  url?: string;
   webSocketDebuggerUrl?: string;
 }
 
@@ -94,13 +95,22 @@ export class ScreencastBridge {
   // Open the raw CDP socket to the spawned Chrome's first page target and start
   // the screencast. Throws when no spawned Chrome is live (the caller surfaces
   // that as "the agent's browser isn't running").
-  async start(): Promise<void> {
+  // `preferUrl` is the URL of the page the requesting task is actually on
+  // (from peekCurrentBrowserUrl). Because the spawned Chrome is a single
+  // shared context that can hold several page targets (other tasks, agent-
+  // opened tabs), we attach to the target whose URL matches the requesting
+  // task rather than blindly taking the first page — otherwise the operator
+  // could sign in on the wrong tab. Falls back to the first page target when
+  // no preferred URL is given or none matches.
+  async start(preferUrl?: string): Promise<void> {
     const port = this.deps.resolvePort();
     if (port === null) {
       throw new Error("No spawned browser is running to screencast.");
     }
     const targets = await this.deps.fetchJson(`http://127.0.0.1:${port}/json`);
-    const pageTarget = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    const pages = targets.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    const pageTarget =
+      (preferUrl ? pages.find((t) => t.url === preferUrl) : undefined) ?? pages[0];
     if (!pageTarget?.webSocketDebuggerUrl) {
       throw new Error("No page target available on the spawned browser.");
     }
@@ -129,8 +139,18 @@ export class ScreencastBridge {
       })();
     });
     socket.addEventListener("message", (ev) => this.onCdpMessage(ev.data));
-    socket.addEventListener("close", () => this.handleClosed());
-    socket.addEventListener("error", () => this.handleClosed());
+    // A close/error BEFORE open (Chrome died mid-attach, the page target
+    // vanished, the handshake dropped) must settle the start() promise, or the
+    // awaiting request hangs forever. reject after a post-open resolve is a
+    // no-op, so this stays correct for steady-state teardown too.
+    socket.addEventListener("close", () => {
+      reject(new Error("CDP socket closed before the screencast started."));
+      this.handleClosed();
+    });
+    socket.addEventListener("error", () => {
+      reject(new Error("CDP socket errored before the screencast started."));
+      this.handleClosed();
+    });
     await promise;
   }
 
@@ -261,27 +281,45 @@ export class ScreencastBridge {
 // on first screencast request and reused across the frames-SSE and input-POST
 // endpoints; torn down when the sign-in completes or the socket drops.
 let activeBridge: ScreencastBridge | undefined;
+// In-flight start promise so concurrent first-callers (the frames-SSE GET and
+// the input-POST arriving together on the first request) share ONE bridge
+// instead of each launching a CDP socket and leaking the loser's. Cleared once
+// the start settles.
+let startingBridge: Promise<ScreencastBridge> | undefined;
 
 // Get the live bridge, creating + starting one if none is active (or the
-// previous one closed). Test seam: pass a factory to inject a fake bridge.
+// previous one closed). `preferUrl` is forwarded to start() so the bridge
+// attaches to the requesting task's page. Test seam: pass a factory to inject
+// a fake bridge.
 export async function getOrStartBridge(
+  preferUrl?: string,
   factory: () => ScreencastBridge = () => new ScreencastBridge()
 ): Promise<ScreencastBridge> {
   if (activeBridge && !activeBridge.isClosed()) return activeBridge;
+  if (startingBridge) return startingBridge;
   const bridge = factory();
-  await bridge.start();
-  activeBridge = bridge;
-  return bridge;
+  startingBridge = bridge
+    .start(preferUrl)
+    .then(() => {
+      activeBridge = bridge;
+      return bridge;
+    })
+    .finally(() => {
+      startingBridge = undefined;
+    });
+  return startingBridge;
 }
 
 // Tear down the active bridge (sign-in completed / cancelled / shutdown).
 export async function stopActiveBridge(): Promise<void> {
   const bridge = activeBridge;
   activeBridge = undefined;
+  startingBridge = undefined;
   if (bridge) await bridge.stop();
 }
 
 // Test-only reset so a suite doesn't leak the module-level bridge.
 export function __resetActiveBridgeForTest(): void {
   activeBridge = undefined;
+  startingBridge = undefined;
 }

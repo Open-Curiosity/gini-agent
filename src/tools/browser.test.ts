@@ -3067,6 +3067,10 @@ describe("spawned launch internals", () => {
     browserTest.clearPendingSharedForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.resetBrowserInstanceForTest();
+    // Remove the state root this test wrote so the fixed /tmp/gini-spawn-*
+    // dirs don't accumulate as cruft (and don't collide across processes).
+    const root = process.env["GINI_STATE_ROOT"];
+    if (root) rmSync(root, { recursive: true, force: true });
     delete process.env["GINI_STATE_ROOT"];
   });
 

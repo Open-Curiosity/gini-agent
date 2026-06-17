@@ -352,7 +352,7 @@ type Mode = "spawned" | "persistent" | "cdp";
 
 function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
   // The agent's DEFAULT path ("no record") now launches its own branded
-  // Chrome via the spawned provider (per-agent profile + free debug port).
+  // Chrome via the spawned provider (per-instance profile + free debug port).
   // The visible "managed" Connect window still uses the persistent provider
   // (chromium.launchPersistentContext); an explicit cdp record still attaches
   // to the user's own Chrome. The headed/headless distinction for managed is

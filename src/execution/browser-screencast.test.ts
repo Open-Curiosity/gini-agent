@@ -61,8 +61,8 @@ function bridgeWith(over: Partial<ScreencastDeps> = {}): { bridge: ScreencastBri
 
 // start() awaits the open handler, which fires async CDP sends. Drive it by
 // opening the socket on the next tick.
-async function startWithOpen(bridge: ScreencastBridge, socket: FakeSocket): Promise<void> {
-  const p = bridge.start();
+async function startWithOpen(bridge: ScreencastBridge, socket: FakeSocket, preferUrl?: string): Promise<void> {
+  const p = bridge.start(preferUrl);
   await Promise.resolve();
   socket.open();
   await p;
@@ -109,6 +109,64 @@ describe("ScreencastBridge.start", () => {
     };
     socket.open();
     await expect(p).rejects.toThrow(/socket dead/);
+  });
+
+  test("rejects (does not hang) when the socket closes before open", async () => {
+    const socket = new FakeSocket();
+    const bridge = new ScreencastBridge({
+      openSocket: () => socket,
+      fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+      resolvePort: () => 9333
+    });
+    const p = bridge.start();
+    await Promise.resolve();
+    // Chrome dies mid-attach: close fires before open ever does.
+    socket.close();
+    await expect(p).rejects.toThrow(/closed before the screencast started/);
+    expect(bridge.isClosed()).toBe(true);
+  });
+
+  test("rejects when the socket errors before open", async () => {
+    const socket = new FakeSocket();
+    const bridge = new ScreencastBridge({
+      openSocket: () => socket,
+      fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+      resolvePort: () => 9333
+    });
+    const p = bridge.start();
+    await Promise.resolve();
+    socket.fire("error", {});
+    await expect(p).rejects.toThrow(/errored before the screencast started/);
+  });
+
+  test("attaches to the page matching preferUrl, not the first page", async () => {
+    const socket = new FakeSocket();
+    let dialed = "";
+    const bridge = new ScreencastBridge({
+      openSocket: (url) => { dialed = url; return socket; },
+      fetchJson: async () => [
+        { type: "page", url: "https://other.example/", webSocketDebuggerUrl: "ws://first" },
+        { type: "page", url: "https://signin.example/", webSocketDebuggerUrl: "ws://wanted" }
+      ],
+      resolvePort: () => 9333
+    });
+    await startWithOpen(bridge, socket, "https://signin.example/");
+    expect(dialed).toBe("ws://wanted");
+  });
+
+  test("falls back to the first page when preferUrl matches nothing", async () => {
+    const socket = new FakeSocket();
+    let dialed = "";
+    const bridge = new ScreencastBridge({
+      openSocket: (url) => { dialed = url; return socket; },
+      fetchJson: async () => [
+        { type: "page", url: "https://a.example/", webSocketDebuggerUrl: "ws://first" },
+        { type: "page", url: "https://b.example/", webSocketDebuggerUrl: "ws://second" }
+      ],
+      resolvePort: () => 9333
+    });
+    await startWithOpen(bridge, socket, "https://nomatch.example/");
+    expect(dialed).toBe("ws://first");
   });
 });
 
@@ -275,12 +333,38 @@ describe("getOrStartBridge / stopActiveBridge", () => {
         resolvePort: () => 9333
       });
     };
-    const b1 = await getOrStartBridge(factory);
-    const b2 = await getOrStartBridge(factory);
+    const b1 = await getOrStartBridge(undefined, factory);
+    const b2 = await getOrStartBridge(undefined, factory);
     expect(b2).toBe(b1); // reused while alive
     await stopActiveBridge();
-    const b3 = await getOrStartBridge(factory);
+    const b3 = await getOrStartBridge(undefined, factory);
     expect(b3).not.toBe(b1); // recreated after teardown
+    await stopActiveBridge();
+  });
+
+  test("concurrent first-callers share a single bridge (single-flight)", async () => {
+    // Two requests racing the first start() must not each launch a CDP socket.
+    let built = 0;
+    const factory = () => {
+      built += 1;
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      return new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+        resolvePort: () => 9333
+      });
+    };
+    const [a, b] = await Promise.all([
+      getOrStartBridge(undefined, factory),
+      getOrStartBridge(undefined, factory)
+    ]);
+    expect(a).toBe(b);
+    expect(built).toBe(1); // only one bridge constructed despite two callers
     await stopActiveBridge();
   });
 

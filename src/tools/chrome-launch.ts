@@ -1,6 +1,6 @@
-// Per-agent Chrome launcher. The agent's default browser is launched by
-// driving a real branded Chrome ourselves — `--headless=new` plus the shared
-// stealth args, a clean (non-"HeadlessChrome") User-Agent, a dedicated
+// Spawned Chrome launcher. The agent's default browser is launched by driving
+// a real branded Chrome ourselves — `--headless=new` plus the shared stealth
+// args, a clean (non-"HeadlessChrome") User-Agent, the caller-supplied
 // `--user-data-dir` profile, and a free-picked `--remote-debugging-port`.
 //
 // Transport: chromium.launchPersistentContext, NOT spawn + connectOverCDP.
@@ -9,15 +9,16 @@
 // TCP CDP endpoint via connectOverCDP hangs on the WebSocket handshake under
 // playwright-core 1.60 + Bun (the same flakiness documented for the `cdp`
 // provider). We still inject a free `--remote-debugging-port` into the launch
-// args so each agent's Chrome ALSO exposes a unique debug endpoint (distinct
-// per agent so they never collide), without routing the agent's automation
-// through that endpoint.
+// args so the spawned Chrome ALSO exposes a debug endpoint — the sign-in
+// screencast bridge attaches to it over raw CDP — without routing the agent's
+// automation through that endpoint.
 //
-// Why this over the per-instance launchPersistentChrome helper: each agent
-// gets its OWN profile dir and its OWN free debug port, so multiple agents
-// browse concurrently with isolated cookies/logins. The user's own Chrome on
-// the conventional :9222 is never launched onto, attached to, or killed — we
-// pick a port strictly above it.
+// Why this over the launchPersistentChrome helper: it free-picks the debug
+// port (which launchPersistentChrome does not) and owns the launch directly.
+// The caller (the spawned BrowserSessionProvider in browser.ts) passes the
+// per-instance profile dir, so there is one shared browser per instance. The
+// user's own Chrome on the conventional :9222 is never launched onto, attached
+// to, or killed — we pick a port strictly above it.
 //
 // Everything above this seam (the @eN snapshot walker, secret redaction,
 // SSRF/domain-policy gating, approvals, traces) runs in-process against the
@@ -32,7 +33,7 @@ import {
   resolveBrowserLaunchTarget
 } from "./chrome-discovery";
 
-// First port we probe for the per-agent debug endpoint. Deliberately well
+// First port we probe for the spawned Chrome's debug endpoint. Deliberately well
 // above 9222 so we never probe (let alone bind) the port a user's personal
 // debugging Chrome conventionally uses. The free-port walk rolls forward.
 export const DEFAULT_CDP_PORT_BASE = 9333;
@@ -95,11 +96,10 @@ function probePort(port: number): Promise<boolean> {
 }
 
 // Walk forward from `base` and return the first bindable port. Used to pick a
-// fresh debug port per agent Chrome so multiple per-agent instances never
-// collide on the debug endpoint. There is an inherent TOCTOU gap between
-// probing free and Chrome binding it; a collision just means that agent's
-// debug endpoint is unavailable — the automation itself runs over the pipe and
-// is unaffected.
+// fresh debug port for the spawned Chrome. There is an inherent TOCTOU gap
+// between probing free and Chrome binding it; a collision just means that
+// Chrome's debug endpoint is unavailable — the automation itself runs over the
+// pipe and is unaffected.
 export async function findFreePort(base: number = DEFAULT_CDP_PORT_BASE): Promise<number> {
   for (let port = base; port < base + PORT_SEARCH_WINDOW; port += 1) {
     if (await probePort(port)) return port;
@@ -107,22 +107,22 @@ export async function findFreePort(base: number = DEFAULT_CDP_PORT_BASE): Promis
   throw new Error(`No free CDP port found from ${base} to ${base + PORT_SEARCH_WINDOW - 1}.`);
 }
 
-// A launched per-agent Chrome: the persistent BrowserContext the agent drives,
+// A launched spawned Chrome: the persistent BrowserContext the agent drives,
 // the binary that backed it, and the debug port it bound.
 export interface SpawnedChrome {
-  // Persistent BrowserContext backed by the per-agent profile dir on disk.
+  // Persistent BrowserContext backed by the profile dir on disk.
   // Closing it (context.close()) terminates the Chrome Playwright launched.
   context: BrowserContext;
   // The free debug port injected into the launch args.
   port: number;
   // Absolute path of the Chrome binary that backed the launch (UI display).
   chromePath: string | null;
-  // The per-agent profile dir the launch used (for profile-dir-scoped reaping).
+  // The profile dir the launch used (for profile-dir-scoped reaping).
   profileDir: string;
 }
 
 export interface LaunchSpawnedChromeOptions {
-  // Per-agent profile dir. Created if absent. Cookies, localStorage, and any
+  // Profile dir. Created if absent. Cookies, localStorage, and any
   // cf_clearance token persist here across launches.
   profileDir: string;
   // Always true in the agent's default path; the param exists so a future
@@ -137,7 +137,7 @@ export interface LaunchSpawnedChromeOptions {
   deps?: Partial<ChromeLaunchDeps>;
 }
 
-// Launch a branded Chrome with the stealth identity against a per-agent profile
+// Launch a branded Chrome with the stealth identity against the given profile
 // dir, over Playwright's pipe transport. Resolves the binary, applies the
 // shared stealth args plus a free `--remote-debugging-port`, normalizes the
 // headless UA, and returns the live persistent context.
