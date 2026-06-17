@@ -69,13 +69,16 @@ describe("with-approval-notification-service", () => {
     );
   });
 
-  test("buildExtensionInfoPlist tracks the host app version via build settings", () => {
-    // Hardcoding the version (e.g. "1.0") fails archive validation when the
-    // app's version differs; the Info.plist must reference the build
-    // settings the plugin stamps from the app version.
-    const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}));
-    expect(info.CFBundleShortVersionString).toBe("$(MARKETING_VERSION)");
-    expect(info.CFBundleVersion).toBe("$(CURRENT_PROJECT_VERSION)");
+  test("buildExtensionInfoPlist writes concrete version literals (EAS rewrites CFBundleVersion server-side)", () => {
+    // CFBundleShortVersionString must equal the app's marketing version
+    // (Apple rejects an app/extension mismatch). CFBundleVersion is a "1"
+    // literal that EAS's server-side version sync rewrites to the app's
+    // autoIncremented build number on production builds (it only rewrites
+    // physical Info.plist files — so these must be literals, not
+    // $(BUILD_SETTING) refs, which would resolve empty locally).
+    const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile", "2.3.4"));
+    expect(info.CFBundleShortVersionString).toBe("2.3.4");
+    expect(info.CFBundleVersion).toBe("1");
   });
 
   test("resolveOptions takes the host app version for the NSE marketing version", () => {

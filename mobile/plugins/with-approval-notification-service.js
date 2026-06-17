@@ -89,13 +89,24 @@ function readCanonicalSwiftSource() {
 // the generic banner. Mirror the host app's posture so the rich preview
 // works for the same gateway set the app already talks to.
 //
-// Version strings track the host app via the shared build settings
-// $(MARKETING_VERSION) / $(CURRENT_PROJECT_VERSION). Apple requires an
-// extension's CFBundleShortVersionString + CFBundleVersion to match its
-// containing app, so hardcoding (e.g. "1.0"/"1") fails archive validation
-// when the app version differs. The expo-build-properties / prebuild
-// pipeline stamps these build settings on every target from app.json's
-// version, so referencing them keeps the NSE in lockstep automatically.
+// Version strings: Apple requires an extension's CFBundleShortVersionString
+// + CFBundleVersion to equal its containing app's, or archive validation
+// fails. We write CONCRETE LITERALS into this physical Info.plist (not
+// $(BUILD_SETTING) references) because:
+//   - CFBundleShortVersionString = the app's marketing version (app.json
+//     `version`), so the NSE matches the app for both local and EAS builds.
+//   - CFBundleVersion = "1" literal. On EAS production builds with
+//     `appVersionSource: remote` + `autoIncrement`, EAS computes one build
+//     number from the app target and rewrites the CFBundleVersion *in every
+//     target's physical INFOPLIST_FILE* server-side (build-tools
+//     updateVersionsAsync) — so this NSE plist's "1" is overwritten to the
+//     synced number, matching the app. For local `expo run:ios` the app's
+//     build number is also "1", so they match there too.
+// This is why the target must keep a real INFOPLIST_FILE and must NOT set
+// GENERATE_INFOPLIST_FILE=YES (which would synthesize CFBundleVersion from
+// CURRENT_PROJECT_VERSION and defeat the server-side rewrite). A $(...)
+// reference here would resolve EMPTY locally (no project-level value under
+// remote versioning) and isn't a literal EAS overwrites — hence literals.
 function buildExtensionInfoPlist(opts) {
   return {
     CFBundleDevelopmentRegion: "$(DEVELOPMENT_LANGUAGE)",
@@ -105,8 +116,8 @@ function buildExtensionInfoPlist(opts) {
     CFBundleInfoDictionaryVersion: "6.0",
     CFBundleName: "$(PRODUCT_NAME)",
     CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)",
-    CFBundleShortVersionString: "$(MARKETING_VERSION)",
-    CFBundleVersion: "$(CURRENT_PROJECT_VERSION)",
+    CFBundleShortVersionString: opts.marketingVersion,
+    CFBundleVersion: "1",
     NSAppTransportSecurity: {
       NSAllowsArbitraryLoads: true
     },
@@ -281,13 +292,16 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
         // extension is signed with access to the shared container.
         buildSettings.CODE_SIGN_ENTITLEMENTS = `"${targetName}/${targetName}.entitlements"`;
         buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${productBundleId}"`;
-        // Version build settings the NSE Info.plist references via
-        // $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION). Apple requires
-        // an extension's version to match its containing app, so stamp the
-        // host app's marketing version here. CURRENT_PROJECT_VERSION mirrors
-        // the RN template default of "1" the main app ships with.
-        buildSettings.MARKETING_VERSION = opts.marketingVersion;
-        buildSettings.CURRENT_PROJECT_VERSION = "1";
+        // Versions are NOT set as build settings here: they live as
+        // concrete literals in the physical Info.plist (buildExtensionInfoPlist),
+        // and the target keeps a real INFOPLIST_FILE with no
+        // GENERATE_INFOPLIST_FILE=YES. That's what lets EAS's server-side
+        // version sync rewrite the NSE's CFBundleVersion to match the
+        // app's autoIncremented build number. Setting MARKETING_VERSION /
+        // CURRENT_PROJECT_VERSION build settings here would be redundant
+        // at best and, paired with GENERATE_INFOPLIST_FILE, would
+        // synthesize over the plist and break the sync — so we leave them
+        // off and let the plist literals stand.
         buildSettings.IPHONEOS_DEPLOYMENT_TARGET = opts.iosDeployment;
         buildSettings.SWIFT_VERSION = "5.0";
         buildSettings.SKIP_INSTALL = "NO";
