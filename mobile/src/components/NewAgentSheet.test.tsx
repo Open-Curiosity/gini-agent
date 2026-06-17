@@ -127,6 +127,20 @@ describe("bug #371: New Agent sheet keyboard + backdrop", () => {
     expect(hasKAV).toBe(true);
   });
 
+  test("centers the card vertically rather than pinning it to the bottom edge", () => {
+    const kav = flatten(render()).find((n) => n.type === KeyboardAvoidingView);
+    const style = kav?.props?.style as
+      | { justifyContent?: string }
+      | Array<{ justifyContent?: string } | undefined>
+      | undefined;
+    const layers = Array.isArray(style) ? style : [style];
+    const justify = layers.reduce<string | undefined>(
+      (acc, s) => s?.justifyContent ?? acc,
+      undefined
+    );
+    expect(justify).toBe("center");
+  });
+
   test("renders a dimmed backdrop scrim behind the sheet", () => {
     const tree = render();
     const nodes = flatten(tree);
