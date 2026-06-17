@@ -5,10 +5,10 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { createSkillOutcome } from "../state/records";
-import { mutateState, readState } from "../state";
+import { addAudit, mutateState, readState } from "../state";
+import { recordObjectiveOutcomes } from "./outcomes";
 import { ensureSkillReviewSession, runDailyReview } from "./daily-review";
-import type { RuntimeConfig } from "../types";
+import type { RuntimeConfig, Task } from "../types";
 
 const ROOT = "/tmp/gini-daily-review-test";
 
@@ -36,6 +36,48 @@ function makeConfig(instance: string): RuntimeConfig {
     stateRoot: ROOT,
     logRoot: `${ROOT}-logs`
   };
+}
+
+function makeTask(instance: string, id: string, status: Task["status"]): Task {
+  const at = new Date().toISOString();
+  return {
+    id,
+    title: "t",
+    input: "t",
+    status,
+    instance,
+    agentId: "agent_test",
+    createdAt: at,
+    updatedAt: at,
+    tracePath: "",
+    auditIds: [],
+    approvalIds: [],
+    skillIds: []
+  };
+}
+
+// Produce a realistic tier-2 feedback candidate the way recordObjectiveOutcomes
+// does in production: a consequential side-effecting completion with no skill
+// script -> one unattributed success that is consequential && !selfVerifiable.
+async function recordConsequentialCompletion(
+  config: RuntimeConfig,
+  instance: string,
+  taskId: string
+): Promise<void> {
+  await mutateState(instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "messaging.sent",
+        target: `thread_${taskId}`,
+        risk: "medium",
+        taskId
+      },
+      { taskId }
+    );
+  });
+  await recordObjectiveOutcomes(config, makeTask(instance, taskId, "completed"));
 }
 
 describe("ensureSkillReviewSession", () => {
@@ -67,21 +109,17 @@ describe("runDailyReview", () => {
   test("samples feedback candidates, marks them prompted, and posts a digest", async () => {
     const instance = "feedback";
     const config = makeConfig(instance);
-    await mutateState(instance, (state) => {
-      // 4 consequential, unverifiable successes -> only 3 should be sampled.
-      for (let i = 0; i < 4; i++) {
-        createSkillOutcome(state, {
-          taskId: `task_${i}`,
-          skillName: "emailer",
-          signal: "success",
-          source: "objective",
-          consequential: true,
-          selfVerifiable: false,
-          reviewed: false,
-          feedbackPrompted: false
-        });
-      }
-    });
+    readState(instance);
+    // 4 consequential, unverifiable successes produced via the real production
+    // path (recordObjectiveOutcomes) -> only 3 should be sampled.
+    for (let i = 0; i < 4; i++) {
+      await recordConsequentialCompletion(config, instance, `task_${i}`);
+    }
+    // Sanity: the production path really did produce sample-able rows.
+    const candidates = readState(instance).skillOutcomes.filter(
+      (o) => o.signal === "success" && o.consequential && !o.selfVerifiable
+    );
+    expect(candidates).toHaveLength(4);
 
     const result = await runDailyReview(config);
     expect(result.feedbackAsked).toBe(3);
@@ -94,6 +132,5 @@ describe("runDailyReview", () => {
     expect(session.messageIds.length).toBe(1);
     const message = state.chatMessages.find((m) => m.id === session.messageIds[0]);
     expect(message!.content).toContain("Quick questions about recent actions");
-    expect(message!.content).toContain("emailer");
   });
 });

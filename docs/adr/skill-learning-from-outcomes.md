@@ -123,8 +123,12 @@ safety boundary edits must preserve).
   source:"objective"|"user_feedback", exitCode?, errorDetail?(redacted, capped), consequential:boolean,
   selfVerifiable:boolean, defectClass?, reviewed:boolean, feedbackPrompted:boolean, createdAt }`.
   `consequential` is true when the attributed skill declares `requiredPermissions` or the
-  task carried an approval/side-effecting audit row; `selfVerifiable` is true when an
-  objective signal existed (a script ok/exit, a terminal status). CRUD in
+  task carried an approval/side-effecting audit row; `selfVerifiable` is present when an
+  objective signal of **CORRECTNESS** exists, i.e. `selfVerifiable = !consequential` for a
+  success — a consequential side-effecting action's script-`ok` means "executed", not
+  "correct", so it is never self-verifiable, and the sampled-human-feedback tier exists to
+  judge exactly those rows. A failure's terminal/exit status is itself an objective signal,
+  so failures stay self-verifiable. CRUD in
   `src/state/records.ts`; all writes via `mutateState`. `normalizeState` defaults the array
   to `[]` so older state files load.
 
@@ -133,7 +137,11 @@ safety boundary edits must preserve).
   It reads the task's already-persisted `skill.script.invoked` audit rows + `task.status` and
   writes one `SkillOutcome` per script invocation (`failure` when `ok:false`/non-zero exit,
   else `success`), attributed by `target`/evidence. A `failed` task with no script invocation
-  yields one unattributed (`skillId` unset) failure row for the digest only. Error text is
+  yields one unattributed (`skillId` unset) failure row for the digest only. A **non-failed**
+  completion that carried a side effect (an approval/messaging audit row) but produced no
+  consequential success row above records ONE consequential `success` (`selfVerifiable:false`,
+  attributed to the single consequential skill when exactly one script ran, else unattributed)
+  — this is the tier-2 population the daily review samples for human feedback. Error text is
   scrubbed and truncated. It only reads + appends a bounded array, so it adds negligible
   terminal-path cost and never throws into the task.
 

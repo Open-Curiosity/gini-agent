@@ -111,9 +111,14 @@ describe("recordObjectiveOutcomes", () => {
     expect(failure!.scriptName).toBe("pay.sh");
     // requiredPermissions on the skill makes it consequential.
     expect(failure!.consequential).toBe(true);
+    // A failure's terminal/exit status is an objective signal.
     expect(failure!.selfVerifiable).toBe(true);
     expect(success).toBeDefined();
     expect(success!.skillId).toBe(skillId);
+    // The success ran a consequential skill (messaging.send permission), so the
+    // ok exit proves it EXECUTED, not that it was correct -> not self-verifiable.
+    expect(success!.consequential).toBe(true);
+    expect(success!.selfVerifiable).toBe(false);
   });
 
   test("script-less failed task yields one unattributed failure row", async () => {
@@ -139,6 +144,73 @@ describe("recordObjectiveOutcomes", () => {
     readState(instance);
     await recordObjectiveOutcomes(config, makeTask(instance, "task_ok", "completed"));
     expect(readState(instance).skillOutcomes).toHaveLength(0);
+  });
+
+  test("an ok script with no consequence is self-verifiable", async () => {
+    const instance = "selfverif";
+    const config = makeConfig(instance);
+    await mutateState(instance, (state) => {
+      const skill = createSkill(state, {
+        name: "lookup",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "enabled"
+      });
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "skill.script.invoked",
+          target: skill.id,
+          risk: "low",
+          taskId: "task_lu",
+          evidence: { skill: "lookup", script: "lookup.sh", ok: true, exitCode: 0, stdoutBytes: 4, stderrBytes: 0 }
+        },
+        { taskId: "task_lu" }
+      );
+    });
+    await recordObjectiveOutcomes(config, makeTask(instance, "task_lu", "completed"));
+    const outcomes = readState(instance).skillOutcomes.filter((o) => o.taskId === "task_lu");
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.signal).toBe("success");
+    // No requiredPermissions and no side-effecting audit row -> not consequential
+    // -> self-verifiable (the ok exit is an objective signal of correctness).
+    expect(outcomes[0]!.consequential).toBe(false);
+    expect(outcomes[0]!.selfVerifiable).toBe(true);
+  });
+
+  test("a consequential side-effecting completion with no script records a tier-2 sample row", async () => {
+    const instance = "tier2";
+    const config = makeConfig(instance);
+    await mutateState(instance, (state) => {
+      // A messaging send the task carried out, but no skill script ran.
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "messaging.sent",
+          target: "thread_1",
+          risk: "medium",
+          taskId: "task_t2"
+        },
+        { taskId: "task_t2" }
+      );
+    });
+    await recordObjectiveOutcomes(config, makeTask(instance, "task_t2", "completed"));
+    const outcomes = readState(instance).skillOutcomes.filter((o) => o.taskId === "task_t2");
+    expect(outcomes).toHaveLength(1);
+    const row = outcomes[0]!;
+    expect(row.signal).toBe("success");
+    expect(row.source).toBe("objective");
+    expect(row.consequential).toBe(true);
+    // The defining property: a consequential action with no objective
+    // correctness check is NOT self-verifiable, so the daily review can sample it.
+    expect(row.selfVerifiable).toBe(false);
+    // No single skill script ran -> unattributed.
+    expect(row.skillId).toBeUndefined();
   });
 });
 

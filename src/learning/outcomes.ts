@@ -48,10 +48,9 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
       );
       const sideEffect = taskCarriedSideEffect(state.audit, task.id);
 
-      if (invocations.length === 0) {
-        // No skill script ran. Only a failed task produces a row here — an
-        // unattributed failure for the digest's summary, never a skill edit.
-        if (task.status !== "failed") return;
+      // A failed task with no skill script yields one unattributed failure row
+      // for the digest's summary only, never a skill edit.
+      if (invocations.length === 0 && task.status === "failed") {
         createSkillOutcome(state, {
           taskId: task.id,
           agentId: task.agentId,
@@ -67,6 +66,9 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
         return;
       }
 
+      // Track whether a consequential SUCCESS row was already produced for this
+      // completion so the side-effect-only fallback below doesn't double-count.
+      let recordedConsequentialSuccess = false;
       for (const row of invocations) {
         const evidence = (row.evidence ?? {}) as Record<string, unknown>;
         const ok = evidence.ok === true;
@@ -76,6 +78,8 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
         // `target` on the row is the skill id (see skill-scripts.ts).
         const skill = state.skills.find((s) => s.id === row.target);
         const signal = ok && (exitCode === undefined || exitCode === 0) ? "success" : "failure";
+        const consequential = isConsequential(skill, sideEffect);
+        if (signal === "success" && consequential) recordedConsequentialSuccess = true;
         createSkillOutcome(state, {
           taskId: task.id,
           agentId: task.agentId,
@@ -90,9 +94,38 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
           // task error when the task itself failed; otherwise it's left unset
           // and the script's exit code/name is the signal.
           errorDetail: signal === "failure" ? scrubError(task.error) : undefined,
-          consequential: isConsequential(skill, sideEffect),
-          // A script ok/exit is an objective signal.
-          selfVerifiable: true,
+          consequential,
+          // A failure's terminal/exit status is an objective signal, but a
+          // consequential success only proves the action EXECUTED, not that it
+          // was correct — so it is NOT self-verifiable. selfVerifiable =
+          // !consequential for success rows.
+          selfVerifiable: signal === "failure" ? true : !consequential,
+          reviewed: false,
+          feedbackPrompted: false
+        });
+      }
+
+      // A non-failed completion that carried a side effect (an approval /
+      // messaging send) is a consequential action with NO objective
+      // correctness check — exactly the tier-2 population the daily review
+      // samples for human feedback. Record ONE consequential success so it can
+      // be sampled, unless a consequential success row was already produced
+      // above (avoid double-counting). Attribute it to the single consequential
+      // skill when exactly one script ran, else leave it unattributed.
+      if (task.status !== "failed" && sideEffect && !recordedConsequentialSuccess) {
+        const attributedSkillId = invocations.length === 1 ? invocations[0]!.target : undefined;
+        const attributedSkill = attributedSkillId
+          ? state.skills.find((s) => s.id === attributedSkillId)
+          : undefined;
+        createSkillOutcome(state, {
+          taskId: task.id,
+          agentId: task.agentId,
+          skillId: attributedSkillId,
+          skillName: attributedSkill?.name,
+          signal: "success",
+          source: "objective",
+          consequential: true,
+          selfVerifiable: false,
           reviewed: false,
           feedbackPrompted: false
         });

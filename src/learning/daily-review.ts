@@ -52,9 +52,11 @@ export async function runDailyReview(config: RuntimeConfig): Promise<DailyReview
   const feedback = await mutateState(config.instance, (state) => {
     const candidates = state.skillOutcomes
       .filter(
+        // !selfVerifiable already implies consequential for a success row
+        // (selfVerifiable = !consequential), so the consequential check is
+        // redundant and is dropped. user_feedback rows are already prompted.
         (o) =>
           o.signal === "success" &&
-          o.consequential &&
           !o.selfVerifiable &&
           !o.feedbackPrompted &&
           o.source === "objective"
