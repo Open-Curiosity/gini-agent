@@ -187,11 +187,3 @@ export function bucketTokensByDay(
   }
   return buckets;
 }
-
-/** True if at least one task has a non-zero input or output token count. */
-export function hasAnyTokens(tasks: Task[]): boolean {
-  return tasks.some((t) => {
-    const { input, output } = taskTokens(t);
-    return input > 0 || output > 0;
-  });
-}

@@ -1,6 +1,12 @@
+// Pin the zone before any Date is constructed so calendar-day bucketing is
+// deterministic across machines AND so the DST test below actually crosses a
+// transition (America/Los_Angeles springs forward Mar 8 2026). bun --isolate
+// runs each test file in its own worker, so this doesn't leak to other files.
+process.env.TZ = "America/Los_Angeles";
+
 import { describe, expect, it } from "bun:test";
 import type { Task } from "@runtime/types";
-import { bucketTokensByDay, hasAnyTokens, taskTokens } from "./observability";
+import { bucketTokensByDay, taskTokens } from "./observability";
 
 // Minimal Task factory — only the fields the token helpers read. Everything
 // else is filled with throwaway-but-valid values so the cast is honest.
@@ -104,25 +110,38 @@ describe("bucketTokensByDay", () => {
     const buckets = bucketTokensByDay([makeTask({ createdAt: localDaysAgoAt(0, 9) })], 7, now);
     expect(buckets[6]).toMatchObject({ input: 0, output: 0 });
   });
-});
 
-describe("hasAnyTokens", () => {
-  const createdAt = "2026-06-17T10:00:00Z";
-  it("is false with no token-bearing tasks", () => {
-    expect(hasAnyTokens([])).toBe(false);
-    expect(hasAnyTokens([makeTask({ createdAt })])).toBe(false);
-    expect(
-      hasAnyTokens([
-        makeTask({ createdAt, cost: { provider: "p", model: "m", inputTokens: 0, outputTokens: 0 } })
-      ])
-    ).toBe(false);
+  it("attributes correctly across a DST spring-forward (the Math.round defense)", () => {
+    // America/Los_Angeles springs forward 2026-03-08 02:00. Viewed from
+    // Mar 12 noon, a task created Mar 7 (pre-transition) is 5 calendar days
+    // back, but only ~4.96 * 24h of wall-clock — the gap a naive Math.floor
+    // would misattribute to Mar 8 (4 days back). With a 14-day window: Mar 12
+    // is index 13, so Mar 7 must land in index 13 - 5 = 8, NOT 9.
+    const mar12noon = new Date(2026, 2, 12, 12, 0, 0).getTime();
+    const mar7 = new Date(2026, 2, 7, 9, 0, 0).toISOString();
+    const buckets = bucketTokensByDay(
+      [makeTask({ createdAt: mar7, cost: { provider: "p", model: "m", inputTokens: 70, outputTokens: 7 } })],
+      14,
+      mar12noon
+    );
+    expect(buckets[8]).toMatchObject({ input: 70, output: 7 });
+    expect(buckets[9]).toMatchObject({ input: 0, output: 0 });
+    // The bucket day-start must be a true local midnight (built via setDate),
+    // not an hour off because of the DST shift.
+    expect(new Date(buckets[8].dayStart).getHours()).toBe(0);
   });
 
-  it("is true once any task carries input or output tokens", () => {
-    expect(
-      hasAnyTokens([
-        makeTask({ createdAt, cost: { provider: "p", model: "m", inputTokens: 0, outputTokens: 12 } })
-      ])
-    ).toBe(true);
+  it("attributes correctly across a month boundary", () => {
+    const apr2noon = new Date(2026, 3, 2, 12, 0, 0).getTime();
+    const mar31 = new Date(2026, 2, 31, 9, 0, 0).toISOString();
+    const buckets = bucketTokensByDay(
+      [makeTask({ createdAt: mar31, cost: { provider: "p", model: "m", inputTokens: 5, outputTokens: 1 } })],
+      7,
+      apr2noon
+    );
+    // Apr 2 is index 6; Mar 31 is 2 days back → index 4.
+    expect(buckets[4]).toMatchObject({ input: 5, output: 1 });
+    expect(new Date(buckets[6].dayStart).getDate()).toBe(2);
+    expect(new Date(buckets[4].dayStart).getDate()).toBe(31);
   });
 });
