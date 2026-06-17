@@ -14,9 +14,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { family, theme } from "@/src/theme";
 
 // Name-entry modal for creating an agent. Presented over a dimmed scrim
-// (tap to dismiss) and lifted above the keyboard so the "Agent name" field
-// stays visible while typing. The card floats above the home indicator with
-// side margins rather than sitting flush at the screen's bottom edge.
+// (tap to dismiss) as a vertically centered card, lifted above the keyboard
+// so the "Agent name" field stays visible while typing.
 export function NewAgentSheet({
   visible,
   name,
@@ -63,14 +62,18 @@ export function NewAgentSheet({
         </Pressable>
         {/* `box-none` lets taps in the empty area around the card fall through
             to the scrim Pressable behind it, while the card still captures its
-            own touches. `padding` lifts the card by the keyboard's height. */}
+            own touches. `padding` shrinks this centered box by the keyboard's
+            height, so the card rides up to stay clear of the keyboard. */}
         <KeyboardAvoidingView
           behavior={Platform.OS === "ios" ? "padding" : undefined}
           keyboardVerticalOffset={0}
-          style={styles.avoider}
+          style={[
+            styles.avoider,
+            { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 16 }
+          ]}
           pointerEvents="box-none"
         >
-          <View style={[styles.card, { marginBottom: insets.bottom + 16 }]}>
+          <View style={styles.card}>
             <Text style={styles.title}>New agent</Text>
             <TextInput
               value={name}
@@ -127,12 +130,12 @@ export function NewAgentSheet({
 const styles = StyleSheet.create({
   root: { flex: 1 },
   backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)" },
-  // Fills the screen above the scrim and parks the card at the bottom; the
-  // padding behavior shrinks this box when the keyboard opens, sliding the
-  // card up with it.
-  avoider: { flex: 1, justifyContent: "flex-end" },
+  // Fills the screen above the scrim and centers the card. The `padding`
+  // behavior shrinks this box from the bottom when the keyboard opens, which
+  // lifts the centered card up to stay clear of it.
+  avoider: { flex: 1, justifyContent: "center" },
   card: {
-    marginHorizontal: 16,
+    marginHorizontal: 24,
     backgroundColor: theme.bg,
     borderRadius: 16,
     borderWidth: 1,
