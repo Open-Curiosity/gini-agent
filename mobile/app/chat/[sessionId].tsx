@@ -268,10 +268,14 @@ export default function ChatDetailScreen() {
 
   // Map a job run's runId → its job name so messages delivered by a scheduled
   // job render with a "from <job name>" badge. The session detail carries the
-  // full run records (kind/jobId); the jobs list resolves jobId → name.
+  // full run records (kind/jobId); the jobs list resolves jobId → name. The
+  // name lookup uses the UNSCOPED jobs list (not the per-agent `jobs` above):
+  // a job owned by a different agent can still deliver into this session, so
+  // scoping the name join to this agent would drop its badge.
   const chatRuns = useChatRuns(sessionId ?? null);
+  const allJobs = useJobs("all");
   const runIdToJobName = useMemo(() => {
-    const jobNameById = new Map((jobs.data ?? []).map((j) => [j.id, j.name]));
+    const jobNameById = new Map((allJobs.data ?? []).map((j) => [j.id, j.name]));
     const map = new Map<string, string>();
     for (const run of chatRuns.data ?? []) {
       if (run.kind !== "job" || !run.jobId) continue;
@@ -279,7 +283,7 @@ export default function ChatDetailScreen() {
       if (name) map.set(run.id, name);
     }
     return map;
-  }, [chatRuns.data, jobs.data]);
+  }, [chatRuns.data, allJobs.data]);
 
   // Segment the render items into consecutive runs sharing one job name (a
   // file_artifact card inherits the preceding item's name since it trails its
@@ -290,8 +294,9 @@ export default function ChatDetailScreen() {
     const segments: { jobName?: string; items: ChatRenderItem[] }[] = [];
     let lastJobName: string | undefined;
     for (const item of renderItems) {
-      const jobName = itemJobName(item, runIdToJobName) ?? (item.kind === "file_artifact" ? lastJobName : undefined);
-      lastJobName = item.kind === "file_artifact" ? lastJobName : itemJobName(item, runIdToJobName);
+      const ownJobName = itemJobName(item, runIdToJobName);
+      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
+      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
       const tail = segments[segments.length - 1];
       if (tail && tail.jobName === jobName) tail.items.push(item);
       else segments.push({ jobName, items: [item] });

@@ -479,6 +479,14 @@ function findRunningRun(state: RuntimeState, jobId: string): JobRunRecord | unde
 // spawned by a job (job-spawned tasks carry `jobId`). Used to defer a
 // scheduled chat-bound job while the user's own conversation turn is in
 // flight, so the job's messages never interleave with the active turn.
+//
+// EVERY non-terminal status counts, including `waiting_approval` — do NOT
+// narrow this to `status === "running"`. A parked turn (awaiting approval)
+// resumes and emits higher-ordinal blocks that bracket a job's blocks; a job
+// allowed to run in that gap would re-trigger the `groupExchanges` reorder
+// bug (its group renders out of order relative to the resumed turn). Deferring
+// through the entire non-terminal lifetime is what keeps jobs off the live
+// turn's ordinal range.
 function sessionHasActiveLiveTurn(state: RuntimeState, sessionId: string): boolean {
   return state.tasks.some(
     (t) => t.chatSessionId === sessionId && t.jobId === undefined && !isTerminalTaskStatus(t.status)
