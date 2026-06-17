@@ -165,6 +165,31 @@ describe("api() request timeout (issue #396)", () => {
     expect((err as Error).message).toContain("aborted");
   });
 
+  test("a caller cancel near the deadline is not misclassified as a timeout (timer disarmed)", async () => {
+    // Race guard: the caller aborts, but the abort rejection only reaches
+    // the catch a few macrotasks later — long enough that an un-disarmed
+    // timer (short timeoutMs) would fire in between and flip didTimeout,
+    // mislabeling the cancellation as a timeout. onCallerAbort clears the
+    // timer, so didTimeout stays false and the raw cancellation survives.
+    const controller = new AbortController();
+    setFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            // Delay the rejection well past the timeoutMs so a still-armed
+            // timer would have fired by the time the catch runs.
+            setTimeout(() => reject(makeFetchError()), 60);
+          });
+        })
+    );
+
+    const pending = api("/agents", { signal: controller.signal, timeoutMs: 10 }).catch((e) => e);
+    controller.abort();
+    const err = await pending;
+    expect(err).not.toBeInstanceOf(ApiError); // not relabeled as ApiError(0) "timed out"
+    expect((err as Error).message).toContain("aborted");
+  });
+
   test("an already-aborted caller signal aborts the request immediately", async () => {
     const controller = new AbortController();
     controller.abort();

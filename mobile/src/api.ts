@@ -142,9 +142,18 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     didTimeout = true;
     controller.abort();
   }, timeout);
-  const onCallerAbort = () => controller.abort();
+  // A caller-driven abort disarms the timer before aborting, so the timer
+  // can't fire afterward and flip didTimeout — that would misclassify a
+  // genuine caller cancellation as a timeout (the abort rejection reaches
+  // the catch a microtask later, leaving a window for the macrotask timer
+  // to run first). Both the already-aborted and the later-abort paths go
+  // through here so neither can race the flag.
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    controller.abort();
+  };
   if (callerSignal) {
-    if (callerSignal.aborted) controller.abort();
+    if (callerSignal.aborted) onCallerAbort();
     else callerSignal.addEventListener("abort", onCallerAbort);
   }
 
