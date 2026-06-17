@@ -288,6 +288,38 @@ describe("ScreencastBridge.stop + close", () => {
     expect(socket.sent.some((m) => m["method"] === "Page.stopScreencast")).toBe(true);
   });
 
+  test("stop returns within the timeout even when stopScreencast never responds", async () => {
+    // A wedged CDP socket: opens, but never replies to any send. stop() must
+    // still resolve (bounded by stopTimeoutMs) and force the socket shut, so
+    // /complete and /cancel can't hang on it.
+    const socket = new FakeSocket();
+    socket.autoReply = false; // sends never resolve on their own
+    const origAdd = socket.addEventListener.bind(socket);
+    socket.addEventListener = (event, listener) => {
+      origAdd(event, listener);
+      if (event === "open") queueMicrotask(() => socket.open());
+    };
+    const bridge = new ScreencastBridge(
+      {
+        openSocket: () => socket,
+        fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://x" }],
+        resolvePort: () => 9333
+      },
+      20 // tiny stopTimeoutMs so the test doesn't wait the production budget
+    );
+    // start() itself awaits sends, so with autoReply off it would hang — open
+    // the socket and let start() race; instead drive start to its open then
+    // flip autoReply for the startup sends only.
+    socket.autoReply = true;
+    await startWithOpen(bridge, socket);
+    socket.autoReply = false; // now wedge: stopScreencast will never respond
+    const t0 = Date.now();
+    await bridge.stop();
+    expect(Date.now() - t0).toBeLessThan(1000); // bounded, not the full hang
+    expect(bridge.isClosed()).toBe(true);
+    expect(socket.closed).toBe(true);
+  });
+
   test("close event clears subscribers and resolves pending", async () => {
     const { bridge, socket } = bridgeWith();
     await startWithOpen(bridge, socket);
@@ -404,7 +436,9 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     // Release the launch; start() proceeds, opens the socket, and resolves.
     openGate();
     await startP;
-    // The bridge that finished starting must have been stopped, not installed.
+    // The post-start guard fires `void bridge.stop()` (not awaited), so let it
+    // settle before asserting the bridge was torn down rather than installed.
+    await new Promise((r) => setTimeout(r, 10));
     expect(built.length).toBe(1);
     expect(built[0].isClosed()).toBe(true);
     // Nothing is left installed: the next get builds a fresh bridge.

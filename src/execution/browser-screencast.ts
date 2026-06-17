@@ -26,6 +26,10 @@ import { getScreencastPort } from "../tools/browser";
 // Meta so page-level Cmd shortcuts fire.
 const CTRL_OR_META = 0b0110;
 
+// Upper bound on the Page.stopScreencast teardown send, so a wedged CDP socket
+// can't hang the /complete or /cancel HTTP response.
+const STOP_SCREENCAST_TIMEOUT_MS = 2_000;
+
 // The input events the modal can send. Deliberately does NOT include page
 // navigation: the modal is for signing in on the page the agent already
 // reached, and a free URL bar would bypass the agent's SSRF / domain-policy
@@ -87,9 +91,14 @@ export class ScreencastBridge {
   private readonly subscribers = new Set<(frame: ScreencastFrame) => void>();
   private readonly deps: ScreencastDeps;
   private closed = false;
+  // How long stop() waits for Page.stopScreencast before forcing the socket
+  // shut. Bounded so a wedged CDP socket can't hang the /complete or /cancel
+  // HTTP response (those await stopActiveBridge → stop()). Test-injectable.
+  private readonly stopTimeoutMs: number;
 
-  constructor(deps: Partial<ScreencastDeps> = {}) {
+  constructor(deps: Partial<ScreencastDeps> = {}, stopTimeoutMs = STOP_SCREENCAST_TIMEOUT_MS) {
     this.deps = { ...defaultDeps(), ...deps };
+    this.stopTimeoutMs = stopTimeoutMs;
   }
 
   // Open the raw CDP socket to the spawned Chrome's first page target and start
@@ -259,11 +268,16 @@ export class ScreencastBridge {
     return this.closed;
   }
 
-  // Stop the screencast and drop the socket. Best-effort; never throws.
+  // Stop the screencast and drop the socket. Best-effort; never throws. The
+  // stopScreencast send is bounded by stopTimeoutMs: if the CDP socket is
+  // wedged (an unresponsive renderer on a heavy login page) the send never
+  // resolves, so we race it against a timer and force the socket shut
+  // regardless — otherwise /complete and /cancel, which await this, would hang.
   async stop(): Promise<void> {
     if (this.cdp && !this.closed) {
+      const timeout = new Promise<void>((resolve) => setTimeout(resolve, this.stopTimeoutMs));
       try {
-        await this.send("Page.stopScreencast");
+        await Promise.race([this.send("Page.stopScreencast").then(() => undefined), timeout]);
       } catch {
         // ignore — we're tearing down
       }
