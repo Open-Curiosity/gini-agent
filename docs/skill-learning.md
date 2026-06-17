@@ -93,6 +93,18 @@ Without a benchmark answer key, the honest measure is **"did the same failure st
 recurring"** after an edit was applied, together with your answers in the daily review.
 It is slow and noisy on purpose — a single user's tasks don't form a clean held-out set.
 
+Each skill also carries a read-only **reliability score** (`GET /api/learning/scores`) — an
+*observed-reliability* indicator, not a verdict. It excludes failures that aren't the skill's
+fault (a service outage classified `environment` doesn't count), never lets an unverified
+side-effecting action read as a confirmed success, and shows **UNRATED** until there's enough
+verified signal. It gates nothing — it's there for you to read, not for the system to act on.
+
+## What it does NOT do
+
+The loop *improves* skills that already exist; it never *creates* one. New skills are still
+authored on request (ask the agent to "make a skill for X"). Proactively proposing a brand-new
+skill from things you do repeatedly is a separate, harder problem and a future step.
+
 ## What's intentionally out of scope (for now)
 
 - A web "Skill review" panel (review happens via the API / `gini improvement` CLI / the

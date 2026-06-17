@@ -117,20 +117,22 @@ safety boundary edits must preserve).
 
 ## Required Now
 
-- **`SkillOutcome`** on `RuntimeState.skillOutcomes` (bounded ring, newest-first), one row
-  per attributable run outcome:
+- **`SkillOutcome`** on `RuntimeState.skillOutcomes` (**per-skill** bounded ring, newest-first), one
+  row per attributable run outcome:
   `{ id, instance, taskId, agentId?, skillId?, skillName?, scriptName?, signal:"success"|"failure",
   source:"objective"|"user_feedback", exitCode?, errorDetail?(redacted, capped), consequential:boolean,
-  selfVerifiable:boolean, defectClass?, reviewed:boolean, feedbackPrompted:boolean, createdAt }`.
+  selfVerifiable:boolean, defectClass?, attributable?, reviewed:boolean, feedbackPrompted:boolean, createdAt }`.
   `consequential` is true when the attributed skill declares `requiredPermissions` or the
   task carried an approval/side-effecting audit row; `selfVerifiable` is present when an
   objective signal of **CORRECTNESS** exists, i.e. `selfVerifiable = !consequential` for a
   success — a consequential side-effecting action's script-`ok` means "executed", not
   "correct", so it is never self-verifiable, and the sampled-human-feedback tier exists to
   judge exactly those rows. A failure's terminal/exit status is itself an objective signal,
-  so failures stay self-verifiable. CRUD in
-  `src/state/records.ts`; all writes via `mutateState`. `normalizeState` defaults the array
-  to `[]` so older state files load.
+  so failures stay self-verifiable. `defectClass`/`attributable` are stamped by the reflection
+  pass (below) when a batch is reviewed. CRUD in `src/state/records.ts`; all writes via
+  `mutateState`. Retention is **per skill** (a chatty skill can't evict a quiet skill's history,
+  which would corrupt a per-skill reliability metric), with a generous global backstop.
+  `normalizeState` defaults the array to `[]` so older state files load.
 
 - **Objective extraction** (`src/learning/outcomes.ts`): `recordObjectiveOutcomes(config, task)`
   is called fire-and-forget at **every** task-terminal site alongside `scheduleAutoRetain` —
@@ -147,12 +149,13 @@ safety boundary edits must preserve).
   environment fault from a skill defect; it falls back to the task error when the task itself
   failed. A `failed` task with no script invocation
   yields one unattributed (`skillId` unset) failure row for the digest only. A **non-failed**
-  completion that carried a side effect (an approval/messaging audit row) but produced no
-  consequential success row above records ONE consequential `success` (`selfVerifiable:false`,
-  attributed to the single consequential skill when exactly one script ran, else unattributed)
-  — this is the tier-2 population the daily review samples for human feedback. Error text is
-  scrubbed and truncated. It only reads + appends a bounded array, so it adds negligible
-  terminal-path cost and never throws into the task.
+  completion that carried a side effect (an approval/messaging audit row) but ran **no attributed
+  skill script** records ONE unattributed consequential `success` (`selfVerifiable:false`) — the
+  tier-2 population the daily review samples for human feedback. When a script DID run, the per-skill
+  rows already represent the task, so no fallback fires (a fallback on a *failed* script would
+  otherwise contradict it with a phantom success). Error text is scrubbed and truncated (re-scrubbed
+  at capture, so the layer is self-protecting). It only reads + appends a bounded array, so it adds
+  negligible terminal-path cost and never throws into the task.
 
 - **Edit contract** (`src/learning/edits.ts`): `SkillEditOp =
   { op:"append", content } | { op:"insert_after", anchor, content } | { op:"replace", target, content }
@@ -167,8 +170,11 @@ safety boundary edits must preserve).
   nonSkillFinding? }`. Routing: `skill_defect` + a **user** skill + non-empty edits → create an
   `ImprovementProposal` (below); `environment`/`credential`/`model_ignored` → a `LearningFinding`;
   a `skill_defect` on a **bundled** skill → a finding (no disk edit). All processed outcomes are
-  marked `reviewed:true`. Proposals are clipped to `maxProposals` (SkillOpt's edit-budget floor
-  of 2). The prompt forbids instance-specific edits (names, values) — only generalizable procedure.
+  marked `reviewed:true`, and the verdict's `defectClass` + `attributable` are **persisted onto each
+  consumed outcome** (so a `defectClass`-aware score can exclude non-skill failures rather than
+  discarding the classification). A `maxProposals`-clipped user-skill defect stays **unreviewed** for
+  a later pass. Proposals are clipped to `maxProposals` (SkillOpt's edit-budget floor of 2). The
+  prompt forbids instance-specific edits (names, values) — only generalizable procedure.
 
 - **Proposal payload (edit mode).** A skill-edit proposal reuses `ImprovementProposal`
   (`kind:"skill"`) with `payload = { mode:"edit", targetSkillId, baseVersion, baseBody, edits:
@@ -186,14 +192,17 @@ safety boundary edits must preserve).
   read-only endpoint; never auto-actioned.
 
 - **Daily review** (`src/learning/daily-review.ts`): `runDailyReview(config)` calls
-  `reflectOnSkillOutcomes`, selects up to 3 **feedback candidates** (recent `success` outcomes that
-  are `consequential && !feedbackPrompted`, marked `feedbackPrompted:true`), assembles a digest
-  (proposals awaiting approval + open findings + the targeted questions), and posts it as a message
-  into a dedicated, auto-provisioned **"Skill review"** chat session (a `channel`-kind session with a
-  stable feature marker, created once). Hosted by a slow, abortable loop in `src/server.ts`
-  modeled on the connector-reprobe loop (default 24h, `GINI_SKILL_REVIEW_TICK_MS` override; runs DB
-  writes off the agent-turn path), plus a manual `POST /api/learning/review` for testing. The loop
-  participates in the existing SIGTERM drain.
+  `reflectOnSkillOutcomes`, selects up to 3 **feedback candidates** (recent `objective` `success`
+  outcomes that are `!selfVerifiable` — i.e. consequential and unverified — and `!feedbackPrompted`,
+  marked `feedbackPrompted:true`), assembles a digest (proposals awaiting approval + open findings +
+  the targeted questions), and posts it both as a durable message AND a renderable `assistant_text`
+  **block** (the chat UI reads the block stream, not the transcript) into a dedicated, auto-provisioned
+  **"Skill review"** `channel` session (stable feature marker, created once, never the main chat).
+  Proposals/findings carry a per-item `digestedAt` flag set when surfaced, so a standing item is never
+  re-posted and a same-millisecond item is never lost (a timestamp watermark would collide).
+  Single-flighted per instance. Hosted by a slow, abortable loop in `src/server.ts` modeled on the
+  connector-reprobe loop (default 24h, `GINI_SKILL_REVIEW_TICK_MS` override; runs DB writes off the
+  agent-turn path), plus a manual `POST /api/learning/review`. The loop participates in the SIGTERM drain.
 
 - **Feedback capture** (`record_skill_feedback` agent tool, low-risk): when the user answers a
   review question, the agent records the verdict as a `SkillOutcome` with `source:"user_feedback"`
@@ -201,10 +210,22 @@ safety boundary edits must preserve).
   tier of the loop into the same store the next review reads. Registered in the tool catalog +
   dispatch.
 
-- **Read surfaces.** `GET /api/learning/outcomes`, `GET /api/learning/findings`, and the existing
-  `GET /api/improvements` (+ `gini improvement` CLI) are the review surfaces for v1. A dedicated web
-  "Skill review" panel is a fast-follow (the backend `useImprovements()` query already exists with
-  no renderer).
+- **Skill score (read-only).** `src/learning/score.ts` derives a per-skill **observed-reliability**
+  indicator from `SkillOutcome` rows for human display only — it **gates nothing** (no control flow
+  reads it). It is `defectClass`-filtered (failures classified `environment`/`credential`/`transient`,
+  or `attributable:false`, are excluded — a service outage is not the skill's fault; `skill_defect`,
+  `model_ignored`, and **unclassified** failures count at full weight, so exclusion is *earned*).
+  The rate is a recency-weighted, Bayesian-smoothed success rate over the **verified** set only
+  (objective failures + human verdicts + non-consequential successes); **unverified consequential
+  successes never raise it** (they only lower *coverage*). It renders **UNRATED** below a minimum
+  verified weight and is capped below "reliable" when coverage is low and unverified work dominates —
+  so a side-effecting skill we've barely adjudicated, or one that is silently wrong, can never read
+  healthy. Honest-by-construction; it is an indicator, not a verdict.
+
+- **Read surfaces.** `GET /api/learning/outcomes`, `GET /api/learning/findings`, `GET /api/learning/scores`,
+  and the existing `GET /api/improvements` (+ `gini improvement` CLI) are the review surfaces for v1.
+  A dedicated web "Skill review" panel is a fast-follow (the backend `useImprovements()` query already
+  exists with no renderer).
 
 ## Trust Boundary
 
@@ -246,11 +267,22 @@ safety boundary edits must preserve).
   future option.
 
 - **Reply → outcome wiring** depends on the agent calling `record_skill_feedback` when the user
-  answers; a structured "answer this review question" affordance (instead of free-text) is a
-  follow-up.
+  answers; a structured "answer this review question" affordance (instead of free-text) is a follow-up.
 
-- **Web review panel** and a **fleet-offline, verifier-backed** SkillOpt for checkable-artifact
-  skills are the two larger follow-ups; both are deliberately out of v1.
+- **The score is an indicator, not a verdict.** A single authoritative 0–100 for *consequential*
+  skills is not achievable in a no-verifier single-user domain (silent-wrong is invisible to every
+  signal, including an LLM-judge that shares the agent's trajectory-only blind spot). The shipped score
+  is therefore read-only, `defectClass`-filtered, coverage-gated, and renders UNRATED rather than
+  over-claim; it gates nothing.
+
+- **Skill genesis is out of scope.** This loop *improves* existing skills; it never *creates* one.
+  New-skill authoring stays user-prompted (the `create-skill` meta-skill). Proactively proposing a
+  *new* skill from recurring successful trajectories is a separate, harder problem (skill induction),
+  tracked as a follow-up.
+
+- **Web review panel** (act on proposals, body-diff history, an over-time view) and a **fleet-offline,
+  verifier-backed** SkillOpt for checkable-artifact skills are the larger follow-ups; both are
+  deliberately out of v1.
 
 ## Verification
 
@@ -263,9 +295,16 @@ safety boundary edits must preserve).
   bounded edit proposal; a bundled skill produces a finding not a disk edit; `environment`/`credential`
   verdicts produce findings; the ≥2 floor and `maxProposals` clip hold; instance-specific edits are
   refused.
-- `bun test src/state` — `SkillOutcome` / `LearningFinding` CRUD + `normalizeState` defaults; the
-  `applyImprovement` edit branch (user-skill body rewritten via `installSkillFromBody`; bundled
-  target rejected; `baseBody` stored).
+- `bun test src/state` — `SkillOutcome` / `LearningFinding` CRUD + per-skill retention +
+  `normalizeState` defaults; the `applyImprovement` edit branch (user-skill body rewritten via
+  `installSkillFromBody`; bundled target rejected; `baseBody` stored).
+- `bun test src/learning/score.test.ts` — the read-only score: UNRATED below the floor;
+  environment/credential/transient failures excluded; unclassified failures counted at full weight;
+  unverified consequential successes never raise the score; the low-coverage "reliable" cap; recency decay.
+- Adversarial **probe suites** (`*.probe.test.ts` across `src/learning`, `src/governance`, `src/state`)
+  cover capture/attribution + the phantom-success guard, classification routing + classification
+  persistence, edit-apply/revert/concurrency, daily-review single-flight + digest rendering + no-respam,
+  scoring honesty, and per-skill retention.
 - `bun run typecheck && bun run test && bun run gini smoke`.
 - **Dogfood (the real surface).** On the worktree's instance, run a chat turn that invokes a skill
   whose script fails, confirm a `SkillOutcome` failure row is attributed, trigger `runDailyReview`
