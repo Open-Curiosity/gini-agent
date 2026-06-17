@@ -2,7 +2,7 @@
 name: google-workspace-setup
 description: "One-time setup for gws: install, OAuth, scopes, auto-approve."
 license: MIT
-compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
+compatibility: "macOS and Linux. Needs a Google account; installs gws via npm or a checksum-verified release binary (Homebrew optional)."
 metadata:
   gini:
     version: 3.8.0
@@ -63,27 +63,69 @@ command -v gws
 command -v gcloud
 ```
 
-Install whichever is missing:
+### The canonical `gws` source — do not discover it
+
+`gws` is **`github.com/googleworkspace/cli`** (published to npm as `@googleworkspace/cli`, to Homebrew as `googleworkspace-cli`). This is the only source. **Never web-search for the repo, the release URL, or the package name, and never download `gws` from any other GitHub repo, mirror, or URL.** A look-alike repo (`google-workspace-cli`, `gws-cli`, a fork, a typosquat) could ship a malicious binary; treat any other source as untrusted and stop rather than guess. Every install path below is checksum- or registry-verified — use one of them exactly as written; do not improvise an alternative.
+
+### Install `gws` — pick the first method that fits, in this order
+
+Homebrew is **not** required and is not the first choice. Try the methods top to bottom and stop at the first that works:
+
+1. **npm (preferred when Node 18+ is present).** The `@googleworkspace/cli` package is published by Google with npm provenance, and its install step downloads the matching binary from the canonical GitHub release and verifies its SHA256 before installing:
+
+   ```bash
+   command -v node && node -v   # need v18+
+   npm install -g @googleworkspace/cli
+   ```
+
+2. **Pre-built release binary (no Node, no Homebrew — works with just `curl`/`tar`/`shasum`).** This is upstream's own recommended method. Resolve the platform target triple, download the binary AND its `.sha256`, and **verify the checksum before installing — abort if it fails**:
+
+   ```bash
+   case "$(uname -s)-$(uname -m)" in
+     Darwin-arm64)   TARGET=aarch64-apple-darwin ;;
+     Darwin-x86_64)  TARGET=x86_64-apple-darwin ;;
+     Linux-x86_64)   TARGET=x86_64-unknown-linux-gnu ;;
+     Linux-aarch64)  TARGET=aarch64-unknown-linux-gnu ;;
+     *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+   esac
+   ASSET="google-workspace-cli-$TARGET.tar.gz"
+   BASE="https://github.com/googleworkspace/cli/releases/latest/download"
+   workdir="$(mktemp -d)" && cd "$workdir"
+   curl -fsSL -O "$BASE/$ASSET"
+   curl -fsSL -O "$BASE/$ASSET.sha256"
+   shasum -a 256 -c "$ASSET.sha256" || { echo "CHECKSUM FAILED — aborting" >&2; exit 1; }
+   tar -xzf "$ASSET"
+   mkdir -p "$HOME/.local/bin" && mv gws "$HOME/.local/bin/" && chmod +x "$HOME/.local/bin/gws"
+   ```
+
+   If `~/.local/bin` isn't on `$PATH` for the login shell, tell the user the one line to add (`export PATH="$HOME/.local/bin:$PATH"`) rather than retrying.
+
+3. **Homebrew — only if `brew` is already installed.** Check first; do not install Homebrew itself.
+
+   ```bash
+   command -v brew && brew install googleworkspace-cli
+   ```
+
+### Install `gcloud`
 
 ```bash
-# gws (macOS / Linux)
-brew install googleworkspace-cli
+# Homebrew, only if brew already exists:
+command -v brew && brew install --cask google-cloud-sdk
 
-# gcloud (macOS)
-brew install --cask google-cloud-sdk
-
-# gcloud (Linux) — see https://docs.cloud.google.com/sdk/docs/install for the
-# tarball install. Use the platform-appropriate command via terminal_exec.
+# Otherwise (macOS or Linux) — official tarball install, no package manager:
+# https://docs.cloud.google.com/sdk/docs/install-sdk
+# Download google-cloud-cli-<platform>.tar.gz from dl.google.com, extract, run
+# ./google-cloud-sdk/install.sh --quiet, via terminal_exec.
 ```
 
-Verify both are on `$PATH` afterwards:
+### Verify and the no-thrash rule
 
 ```bash
 gws --version
 gcloud --version
 ```
 
-If either install fails (network, sudo, broken Homebrew), STOP and tell the user verbatim what failed and the one-line command to try manually. Do not loop.
+**Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically: do **not** try to install Homebrew, do **not** repeatedly `ls /opt/homebrew/...` probing for a brew that isn't there, do **not** open a PTY to coax an interactive installer, and do **not** web-search for an install command. If all three `gws` methods fail (or `gcloud`'s both fail), STOP and tell the user verbatim what failed plus the single command to run manually — one of the blocks above — then wait. A clean hand-off beats a long loop.
 
 ## Step 3 — Sign in with `gcloud`
 
@@ -354,7 +396,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 
 ## Manual Fallback
 
-If `gcloud` cannot be installed at all (uncommon — Homebrew is the standard path on macOS, and Linux has a documented tarball install), hand off the Cloud Console flow to the user manually:
+If `gcloud` cannot be installed at all (uncommon — both macOS and Linux have a documented tarball install at https://docs.cloud.google.com/sdk/docs/install-sdk), hand off the Cloud Console flow to the user manually:
 
 1. Tell them to open https://console.cloud.google.com/ and create a project named `gini-workspace`.
 2. Enable the seven APIs at https://console.cloud.google.com/apis/library — Gmail, Calendar, Drive, Docs, Sheets, Forms, Meet.
