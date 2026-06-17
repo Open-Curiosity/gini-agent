@@ -24,7 +24,8 @@ export type {
   SetupRequestStatus,
   SystemNoteBlock,
   ThreadSummary,
-  JobRecord
+  JobRecord,
+  RunRecord
 } from "@runtime/types";
 
 // Cross-agent thread row from GET /api/threads. Same shape as the

@@ -17,6 +17,7 @@ import type {
   ChatSession,
   InboxThreadSummary,
   JobRecord,
+  RunRecord,
   RuntimeStatus,
   SetupRequest,
   Task,
@@ -240,6 +241,21 @@ export function useSetupRequests() {
     queryKey: ["setup-requests"],
     queryFn: () => api<SetupRequest[]>("/setup-requests"),
     refetchInterval: 30_000
+  });
+}
+
+// Run records for one session — used to mark job-delivered chat messages
+// with a "from <job name>" badge. GET /chat/:id returns the session's full
+// run list (incl. kind/jobId); we select just `runs` and join jobId → name
+// against the jobs list at the call site. The stream hook only carries
+// runIds, so this is the cheapest source of the kind/jobId join.
+export function useChatRuns(sessionId: string | null) {
+  return useQuery<{ runs: RunRecord[] }, Error, RunRecord[]>({
+    queryKey: ["chat-runs", sessionId],
+    queryFn: () => api<{ runs: RunRecord[] }>(`/chat/${sessionId}`),
+    enabled: Boolean(sessionId),
+    refetchInterval: 30_000,
+    select: (detail) => detail.runs ?? []
   });
 }
 
