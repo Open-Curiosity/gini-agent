@@ -157,7 +157,15 @@ describe("recordObjectiveOutcomes", () => {
             target: skill.id,
             risk: "medium",
             taskId: "task_d",
-            evidence: { skill: "flaky", script: "run.sh", ok: false, exitCode: 1, stdoutBytes: 0, stderrBytes: 5 }
+            evidence: {
+              skill: "flaky",
+              script: "run.sh",
+              ok: false,
+              exitCode: 1,
+              stdoutBytes: 0,
+              stderrBytes: 5,
+              stderrSnippet: "Script exited 1: upstream service returned 503"
+            }
           },
           { taskId: "task_d" }
         );
@@ -170,6 +178,9 @@ describe("recordObjectiveOutcomes", () => {
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0]!.signal).toBe("failure");
     expect(outcomes[0]!.exitCode).toBe(1);
+    // The scrubbed failure reason persisted on the audit row flows into
+    // errorDetail so the classifier sees WHY the script failed.
+    expect(outcomes[0]!.errorDetail).toContain("503");
   });
 
   test("script-less failed task yields one unattributed failure row", async () => {

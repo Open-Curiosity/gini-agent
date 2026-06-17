@@ -74,7 +74,7 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
       // failed, and the representative exit/script comes from the first failure.
       const bySkill = new Map<
         string,
-        { failed: boolean; exitCode?: number; skillName?: string; scriptName?: string }
+        { failed: boolean; exitCode?: number; skillName?: string; scriptName?: string; detail?: string }
       >();
       for (const row of invocations) {
         const evidence = (row.evidence ?? {}) as Record<string, unknown>;
@@ -83,6 +83,8 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
         const failed = !(ok && (exitCode === undefined || exitCode === 0));
         const skillName = typeof evidence.skill === "string" ? evidence.skill : undefined;
         const scriptName = typeof evidence.script === "string" ? evidence.script : undefined;
+        // skill-scripts.ts persists a scrubbed failure reason on the audit row.
+        const snippet = typeof evidence.stderrSnippet === "string" ? evidence.stderrSnippet : undefined;
         // `target` on the row is the skill id (see skill-scripts.ts).
         const prior = bySkill.get(row.target);
         if (!prior) {
@@ -90,13 +92,15 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
             failed,
             exitCode: failed ? exitCode : undefined,
             skillName,
-            scriptName
+            scriptName,
+            detail: failed ? snippet : undefined
           });
         } else if (failed && !prior.failed) {
           // First failure for this skill wins the representative detail.
           prior.failed = true;
           prior.exitCode = exitCode;
           prior.scriptName = scriptName ?? prior.scriptName;
+          prior.detail = snippet;
         }
       }
 
@@ -117,11 +121,10 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
           signal,
           source: "objective",
           exitCode: agg.exitCode,
-          // Only failures carry detail. The audit row doesn't store stderr text
-          // (only byte counts), so a script failure's detail comes from the
-          // task error when the task itself failed; otherwise it's left unset
-          // and the script's exit code/name is the signal.
-          errorDetail: signal === "failure" ? scrubError(task.error) : undefined,
+          // A failure's detail is the scrubbed reason persisted on the script
+          // audit row (so the classifier can tell environment from skill defect),
+          // falling back to the task error when the task itself failed.
+          errorDetail: signal === "failure" ? (agg.detail ?? scrubError(task.error)) : undefined,
           consequential,
           // A failure's terminal/exit status is an objective signal, but a
           // consequential success only proves the action EXECUTED, not that it

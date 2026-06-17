@@ -141,7 +141,11 @@ safety boundary edits must preserve).
   across that task's invocations** (a task is one trajectory, so retries of the same skill do
   not inflate the per-skill failure count that gates the ≥2-distinct-trajectory floor): the
   skill's outcome is a `failure` when any of its invocations failed (`ok:false`/non-zero exit),
-  else `success`, attributed by `target`/evidence. A `failed` task with no script invocation
+  else `success`, attributed by `target`/evidence. A failure's `errorDetail` is the **scrubbed,
+  capped reason** the script runner persists on the `skill.script.invoked` audit row
+  (`stderrSnippet`) — without it the classifier sees only an exit code and can't tell an
+  environment fault from a skill defect; it falls back to the task error when the task itself
+  failed. A `failed` task with no script invocation
   yields one unattributed (`skillId` unset) failure row for the digest only. A **non-failed**
   completion that carried a side effect (an approval/messaging audit row) but produced no
   consequential success row above records ONE consequential `success` (`selfVerifiable:false`,
