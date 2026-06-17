@@ -12,6 +12,7 @@ import type {
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
+  RunRecord,
   RuntimeEvent,
   RuntimeStatus,
   SetupRequest,
@@ -345,7 +346,7 @@ export function useChatSessions() {
   });
 }
 
-export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
+export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[]; runs: RunRecord[] };
 
 // Statuses where a chat task is no longer producing partial text — used to
 // decide polling cadence below.
