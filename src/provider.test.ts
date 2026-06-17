@@ -5146,6 +5146,56 @@ describe("anthropic provider", () => {
       restoreEnv();
     }
   });
+
+  // Pairing is turn-window-bounded, not global-id. Synthesized text-backstop
+  // ids (name:args:index, index resets per turn) can recur across turns, so a
+  // turn-1 result must NOT satisfy a turn-2 dangling tool_use with the same id.
+  // Global pairing would keep turn 2's tool_use → an unanswered tool_use on the
+  // wire → 400. Here `dup_id` is answered in turn 1 but dangling in turn 2: the
+  // turn-1 pair survives, the turn-2 tool_use is dropped.
+  test("bedrock: a reused tool_call id is paired per-turn, not globally", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "turn 1" },
+        { role: "assistant", content: "", tool_calls: [{ id: "dup_id", type: "function", function: { name: "search", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "dup_id", content: "{\"ok\":true}" },
+        { role: "user", content: "turn 2" },
+        // Same id, but NO result this turn — must be dropped, not rescued by turn 1's result.
+        { role: "assistant", content: "", tool_calls: [{ id: "dup_id", type: "function", function: { name: "search", arguments: "{}" } }] }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // Every assistant toolUse on the wire must be immediately followed by a
+      // user turn whose first block is a matching toolResult.
+      for (let i = 0; i < body.messages.length; i++) {
+        const m = body.messages[i]!;
+        if (m.role !== "assistant") continue;
+        const toolUseIds = m.content.filter((b) => b.toolUse).map((b) => String((b.toolUse as Record<string, unknown>).toolUseId));
+        if (toolUseIds.length === 0) continue;
+        const next = body.messages[i + 1];
+        const resultIds = (next?.content ?? []).filter((b) => b.toolResult).map((b) => String((b.toolResult as Record<string, unknown>).toolUseId));
+        for (const id of toolUseIds) expect(resultIds).toContain(id);
+      }
+      // Exactly ONE toolUse survives (turn 1's), since turn 2's is dangling.
+      const toolUseCount = body.messages.reduce(
+        (n, m) => n + (m.role === "assistant" ? m.content.filter((b) => b.toolUse).length : 0),
+        0
+      );
+      expect(toolUseCount).toBe(1);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
 });
 
 describe("codex no-tools dispatch", () => {

@@ -702,44 +702,48 @@ function stripDocumentPartsIfUnsupported(
 // this is the request-build backstop that catches ANY path (resume snapshots,
 // in-turn compaction, future callers) regardless of how the gap arose.
 //
-// An assistant message is kept only when EVERY id it carries has a matching
-// later `tool` result; otherwise the message and any partial results for its
-// ids are dropped together (a partial tool_use set still 400s). A `tool`
-// message is kept only when a retained assistant message claimed its id. The
-// pass preserves order and never merges turns.
+// Pairing is TURN-WINDOW-bounded, not global: each assistant tool_use turn is
+// answered only by the `tool` results in its own turn window — the rows that
+// follow it up to, but not including, the next user message (a turn boundary)
+// or the next assistant tool_use turn. A global "id answered anywhere later"
+// check is wrong because synthesized text-backstop ids (synthesizeToolCallId
+// hashes name:args:index, and index resets each turn) can recur across turns:
+// a turn-1 result would then falsely satisfy a turn-2 dangling tool_use with
+// the same id, leaving an unanswered tool_use on the wire. Interleaved plain
+// assistant text inside the window is skipped (a gated tool persists an
+// approval_reason / text row between its tool_use and its on-resume result),
+// but a user row or the next tool round ends the window. An assistant turn is
+// kept only when EVERY id it carries is answered in its window; otherwise the
+// turn and its partial results drop together (a partial tool_use set still
+// 400s). A `tool` row survives only as a matched result of a kept turn; any
+// other `tool` row is an orphan and is dropped. Order is preserved.
 function pairToolCallingMessages(messages: ToolCallingMessage[]): ToolCallingMessage[] {
-  // First sweep: which tool_call ids does each assistant turn carry, and which
-  // ids are answered by some later tool message? Answered = a `tool` message
-  // with that id appears anywhere after the assistant message (Converse and
-  // Messages both want it in the very next message, which our translators
-  // already guarantee by collapsing consecutive tool messages — so a present
-  // result is always positioned correctly once the unpaired ones are removed).
-  const resultIds = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "tool" && typeof message.tool_call_id === "string") {
-      resultIds.add(message.tool_call_id);
+  const isToolUseTurn = (m: ToolCallingMessage): boolean =>
+    m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+  // Tool rows default to dropped; everything non-tool defaults to kept. An
+  // assistant tool_use turn flips to kept (and marks its window's results
+  // kept) only when its whole id set is answered in-window.
+  const keep: boolean[] = messages.map((m) => m.role !== "tool");
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (!isToolUseTurn(message)) continue;
+    const ids = new Set(message.tool_calls!.map((call) => call.id));
+    const resultIndexById = new Map<string, number>();
+    for (let j = i + 1; j < messages.length; j++) {
+      const next = messages[j]!;
+      if (next.role === "user") break; // turn boundary
+      if (isToolUseTurn(next)) break; // next tool round
+      if (next.role !== "tool") continue; // skip interleaved approval_reason / plain text
+      const id = next.tool_call_id;
+      if (typeof id === "string" && ids.has(id) && !resultIndexById.has(id)) {
+        resultIndexById.set(id, j);
+      }
     }
+    const allAnswered = [...ids].every((id) => resultIndexById.has(id));
+    keep[i] = allAnswered;
+    if (allAnswered) for (const j of resultIndexById.values()) keep[j] = true;
   }
-  // Ids on assistant turns we decide to KEEP — only their results survive.
-  const keptCallIds = new Set<string>();
-  const keep: boolean[] = messages.map((message) => {
-    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      const ids = message.tool_calls.map((call) => call.id);
-      const allAnswered = ids.every((id) => resultIds.has(id));
-      if (allAnswered) for (const id of ids) keptCallIds.add(id);
-      return allAnswered;
-    }
-    return true;
-  });
-  return messages.filter((message, index) => {
-    if (!keep[index]) return false;
-    // Orphan tool result: its originating assistant turn was dropped (or never
-    // existed). Drop it so no tool_result leads without a tool_use.
-    if (message.role === "tool") {
-      return typeof message.tool_call_id === "string" && keptCallIds.has(message.tool_call_id);
-    }
-    return true;
-  });
+  return messages.filter((_, index) => keep[index]);
 }
 
 export interface ToolCallingResult {
