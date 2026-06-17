@@ -1,0 +1,165 @@
+// Per-agent Chrome launcher. The agent's default browser is launched by
+// driving a real branded Chrome ourselves — `--headless=new` plus the shared
+// stealth args, a clean (non-"HeadlessChrome") User-Agent, a dedicated
+// `--user-data-dir` profile, and a free-picked `--remote-debugging-port`.
+//
+// Transport: chromium.launchPersistentContext, NOT spawn + connectOverCDP.
+// Playwright drives a persistent context over its PIPE transport
+// (`--remote-debugging-pipe`), which works under Bun; attaching to a
+// TCP CDP endpoint via connectOverCDP hangs on the WebSocket handshake under
+// playwright-core 1.60 + Bun (the same flakiness documented for the `cdp`
+// provider). We still inject a free `--remote-debugging-port` into the launch
+// args so each agent's Chrome ALSO exposes a unique debug endpoint (distinct
+// per agent so they never collide), without routing the agent's automation
+// through that endpoint.
+//
+// Why this over the per-instance launchPersistentChrome helper: each agent
+// gets its OWN profile dir and its OWN free debug port, so multiple agents
+// browse concurrently with isolated cookies/logins. The user's own Chrome on
+// the conventional :9222 is never launched onto, attached to, or killed — we
+// pick a port strictly above it.
+//
+// Everything above this seam (the @eN snapshot walker, secret redaction,
+// SSRF/domain-policy gating, approvals, traces) runs in-process against the
+// Playwright client exactly as before. See ADR browser-automation-engine.md.
+import { createServer } from "node:net";
+import { mkdirSync } from "node:fs";
+import type { BrowserContext } from "playwright-core";
+import {
+  CHROME_LAUNCH_ARGS,
+  cleanChromeUserAgent,
+  resolveBrowserLaunchTarget
+} from "./chrome-discovery";
+
+// First port we probe for the per-agent debug endpoint. Deliberately well
+// above 9222 so we never probe (let alone bind) the port a user's personal
+// debugging Chrome conventionally uses. The free-port walk rolls forward.
+export const DEFAULT_CDP_PORT_BASE = 9333;
+// How far the free-port walk searches before giving up. Mirrors the runtime's
+// existing port walker window (src/cli/process.ts) so the behavior is familiar.
+const PORT_SEARCH_WINDOW = 1000;
+
+type LaunchPersistentContextFn = (
+  dataDir: string,
+  options: Record<string, unknown>
+) => Promise<BrowserContext>;
+
+// Injection seam. Every external effect (the Playwright launch, the free-port
+// probe, binary resolution, UA derivation) is overridable so the launch
+// orchestration can be unit-tested without a real Chrome.
+export interface ChromeLaunchDeps {
+  launchPersistentContext: LaunchPersistentContextFn;
+  findFreePort: (base: number) => Promise<number>;
+  resolveLaunchTarget: typeof resolveBrowserLaunchTarget;
+  cleanUserAgent: typeof cleanChromeUserAgent;
+}
+
+async function loadLaunchPersistentContext(): Promise<LaunchPersistentContextFn> {
+  const mod = (await import("playwright-core")) as typeof import("playwright-core");
+  return (dataDir, options) =>
+    mod.chromium.launchPersistentContext(dataDir, options) as unknown as Promise<BrowserContext>;
+}
+
+export function defaultDeps(): ChromeLaunchDeps {
+  return {
+    // Resolved lazily through the dynamic import so callers that never launch
+    // don't eagerly pull in playwright-core.
+    launchPersistentContext: async (dataDir, options) =>
+      (await loadLaunchPersistentContext())(dataDir, options),
+    findFreePort,
+    resolveLaunchTarget: resolveBrowserLaunchTarget,
+    cleanUserAgent: cleanChromeUserAgent
+  };
+}
+
+// Probe a single TCP port for bindability on loopback. Resolves true when the
+// port is free, false when something already holds it OR the port number is
+// invalid (out of range), so the free-port walk treats unbindable numbers as
+// "not free" and keeps moving rather than rejecting.
+function probePort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const server = createServer()
+        .once("error", () => resolve(false))
+        .once("listening", () => server.close(() => resolve(true)))
+        .listen(port, "127.0.0.1");
+    } catch {
+      // .listen() throws synchronously for an out-of-range port number.
+      resolve(false);
+    }
+  });
+}
+
+// Walk forward from `base` and return the first bindable port. Used to pick a
+// fresh debug port per agent Chrome so multiple per-agent instances never
+// collide on the debug endpoint. There is an inherent TOCTOU gap between
+// probing free and Chrome binding it; a collision just means that agent's
+// debug endpoint is unavailable — the automation itself runs over the pipe and
+// is unaffected.
+export async function findFreePort(base: number = DEFAULT_CDP_PORT_BASE): Promise<number> {
+  for (let port = base; port < base + PORT_SEARCH_WINDOW; port += 1) {
+    if (await probePort(port)) return port;
+  }
+  throw new Error(`No free CDP port found from ${base} to ${base + PORT_SEARCH_WINDOW - 1}.`);
+}
+
+// A launched per-agent Chrome: the persistent BrowserContext the agent drives,
+// the binary that backed it, and the debug port it bound.
+export interface SpawnedChrome {
+  // Persistent BrowserContext backed by the per-agent profile dir on disk.
+  // Closing it (context.close()) terminates the Chrome Playwright launched.
+  context: BrowserContext;
+  // The free debug port injected into the launch args.
+  port: number;
+  // Absolute path of the Chrome binary that backed the launch (UI display).
+  chromePath: string | null;
+  // The per-agent profile dir the launch used (for profile-dir-scoped reaping).
+  profileDir: string;
+}
+
+export interface LaunchSpawnedChromeOptions {
+  // Per-agent profile dir. Created if absent. Cookies, localStorage, and any
+  // cf_clearance token persist here across launches.
+  profileDir: string;
+  // Always true in the agent's default path; the param exists so a future
+  // visible-launch caller can reuse this module. Headless launches get the
+  // clean UA rewrite; a headed launch keeps Chrome's native UA.
+  headless?: boolean;
+  // Explicit debug port. Omit to free-pick one above DEFAULT_CDP_PORT_BASE.
+  port?: number;
+  // Extra Playwright context options (e.g. acceptDownloads, downloadsPath).
+  extraOptions?: Record<string, unknown>;
+  // Test/seam overrides; production callers pass nothing.
+  deps?: Partial<ChromeLaunchDeps>;
+}
+
+// Launch a branded Chrome with the stealth identity against a per-agent profile
+// dir, over Playwright's pipe transport. Resolves the binary, applies the
+// shared stealth args plus a free `--remote-debugging-port`, normalizes the
+// headless UA, and returns the live persistent context.
+export async function launchSpawnedChrome(options: LaunchSpawnedChromeOptions): Promise<SpawnedChrome> {
+  const deps: ChromeLaunchDeps = { ...defaultDeps(), ...options.deps };
+  const headless = options.headless !== false;
+
+  mkdirSync(options.profileDir, { recursive: true });
+
+  const target = await deps.resolveLaunchTarget();
+  if (!target.executablePath) {
+    throw new Error(
+      "No Chrome binary found to launch. Install Google Chrome, set GINI_CHROME_PATH, " +
+        "or run `bunx playwright install chromium`."
+    );
+  }
+  const userAgent = headless ? await deps.cleanUserAgent(target.executablePath) : undefined;
+  const port = options.port ?? (await deps.findFreePort(DEFAULT_CDP_PORT_BASE));
+
+  const context = await deps.launchPersistentContext(options.profileDir, {
+    headless,
+    executablePath: target.executablePath,
+    args: [...CHROME_LAUNCH_ARGS, `--remote-debugging-port=${port}`],
+    ...(userAgent ? { userAgent } : {}),
+    ...(options.extraOptions ?? {})
+  });
+
+  return { context, port, chromePath: target.executablePath, profileDir: options.profileDir };
+}
