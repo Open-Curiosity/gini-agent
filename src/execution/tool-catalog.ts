@@ -238,6 +238,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // review reflects on it. Sync, low-risk: it only appends a SkillOutcome row.
     toolset: "skills",
     displayLabel: "Record skill feedback",
+    // Deferred: it's reachable on any turn (a Skill review question can land in
+    // any session) but is only needed when the user is answering one, so it
+    // surfaces by name + summary in the on-demand index and the model loads its
+    // schema via load_tools when it actually needs it. Keeping it out of the
+    // live tools array avoids adding a schema slot to every turn.
+    deferred: true,
+    indexSummary: "Record the user's verdict (right / wrong) on a recent action they were asked about in a Skill review.",
     type: "function",
     function: {
       name: "record_skill_feedback",
