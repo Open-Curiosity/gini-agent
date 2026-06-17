@@ -17,7 +17,8 @@ import type { RuntimeConfig, SkillEditOp, SkillOutcome, SkillRecord } from "../t
 import {
   createLearningFinding,
   mutateState,
-  readState
+  readState,
+  readTrace
 } from "../state";
 import { generateStructured, type StructuredValidator } from "../provider";
 import { providerOverrideForRuntime } from "../execution/effective-context";
@@ -162,6 +163,9 @@ export async function reflectOnSkillOutcomes(
     bySkill.set(f.skillId!, list);
   }
 
+  // Provider resolved from the ACTIVE agent, not each outcome's agentId — a
+  // multi-agent batch can therefore reflect under a different agent's provider
+  // than the one that produced the failure (acceptable in v1; left as-is).
   const providerOverride = providerOverrideForRuntime(config);
   let proposalsCreated = 0;
   let findingsCreated = 0;
@@ -196,36 +200,53 @@ export async function reflectOnSkillOutcomes(
       continue;
     }
 
-    // All outcomes in a successfully-reflected batch are marked reviewed.
-    reviewedIds.push(...batch.map((b) => b.id));
     const sourceTaskIds = [...new Set(batch.map((b) => b.taskId))];
     const source = skill.source ?? "user";
 
+    // A user-skill defect with edits that actually apply to the current body is
+    // a real, actionable proposal candidate.
+    const isUserSkill = source === "user" && Boolean(skill.manifestPath);
+    const candidate =
+      verdict.defectClass === "skill_defect" && isUserSkill && verdict.edits.length > 0
+        ? applySkillEdits(skill.body, verdict.edits)
+        : undefined;
+    const actionableUserEdit = candidate !== undefined && candidate.applied > 0;
+
+    if (actionableUserEdit && proposalsCreated >= maxProposals) {
+      // Clipped by the edit budget. Do NOT fall through to a finding (this is
+      // not a bundled/non-editable skill) and do NOT mark the batch reviewed —
+      // leave it for a later pass so the real defect isn't lost to the clip.
+      continue;
+    }
+
+    // The batch is being processed (proposed, routed to a finding, or dropped)
+    // — mark it reviewed so a later pass doesn't re-reflect it.
+    reviewedIds.push(...batch.map((b) => b.id));
+
     if (verdict.defectClass === "skill_defect") {
-      const isUserSkill = source === "user" && Boolean(skill.manifestPath);
-      if (isUserSkill && verdict.edits.length > 0 && proposalsCreated < maxProposals) {
-        const candidate = applySkillEdits(skill.body, verdict.edits);
-        // Only propose when at least one edit actually applies to the current
-        // body — a batch of all-skipped edits is not actionable.
-        if (candidate.applied > 0) {
-          await proposeImprovement(config, {
-            kind: "skill",
-            title: `Improve skill: ${skill.name}`,
-            rationale: verdict.rationale || `Recurring failures running ${skill.name}.`,
-            sourceTaskId: sourceTaskIds[0],
-            sourceTraceIds: sourceTaskIds,
-            payload: {
-              mode: "edit",
-              targetSkillId: skill.id,
-              baseVersion: skill.version,
-              baseBody: skill.body,
-              edits: verdict.edits,
-              candidateBody: candidate.body
-            }
-          });
-          proposalsCreated += 1;
-          continue;
-        }
+      if (actionableUserEdit) {
+        // Trace ids are the evidence pointer (sourceTaskId stays the primary
+        // pointer); use the source task's last-few trace ids, or [] if none.
+        const sourceTraceIds = readTrace(config.instance, sourceTaskIds[0]!)
+          .slice(-5)
+          .map((t) => t.id);
+        await proposeImprovement(config, {
+          kind: "skill",
+          title: `Improve skill: ${skill.name}`,
+          rationale: verdict.rationale || `Recurring failures running ${skill.name}.`,
+          sourceTaskId: sourceTaskIds[0],
+          sourceTraceIds,
+          payload: {
+            mode: "edit",
+            targetSkillId: skill.id,
+            baseVersion: skill.version,
+            baseBody: skill.body,
+            edits: verdict.edits,
+            candidateBody: candidate!.body
+          }
+        });
+        proposalsCreated += 1;
+        continue;
       }
       // A skill_defect on a bundled (or otherwise non-editable) skill, or one
       // with no actionable edits, becomes a finding pointing at the source.

@@ -126,6 +126,12 @@ describe("reflectOnSkillOutcomes", () => {
     expect(proposal!.payload.targetSkillId).toBe(skill.id);
     expect(String(proposal!.payload.candidateBody)).toContain("Confirm the payee");
     expect(String(proposal!.payload.baseBody)).toBe(skill.body);
+    // sourceTraceIds are real trace ids (or [] when the task has no trace), never
+    // the task ids themselves — sourceTaskId stays the primary evidence pointer.
+    expect(["task_0", "task_1"]).toContain(proposal!.sourceTaskId);
+    expect(proposal!.sourceTraceIds).not.toContain("task_0");
+    expect(proposal!.sourceTraceIds).not.toContain("task_1");
+    expect(proposal!.sourceTraceIds).toEqual([]);
     // All processed failure outcomes are marked reviewed.
     expect(state.skillOutcomes.every((o) => o.reviewed)).toBe(true);
   });
@@ -261,5 +267,41 @@ describe("reflectOnSkillOutcomes", () => {
     const result = await reflectOnSkillOutcomes(config, { maxProposals: 2 });
     expect(result.proposalsCreated).toBe(2);
     expect(readState(instance).improvements.filter((p) => p.payload.mode === "edit")).toHaveLength(2);
+  });
+
+  test("a clipped user-skill defect creates no finding and leaves its batch unreviewed", async () => {
+    const instance = "clip-defect";
+    const config = makeConfig(instance);
+    const ids: string[] = [];
+    for (const name of ["a-skill", "b-skill", "c-skill"]) {
+      readState(instance);
+      writeUserSkill(instance, name, USER_SKILL_BODY.replace("name: payer", `name: ${name}`));
+      await reloadSkills(config);
+      const skill = readState(instance).skills.find((s) => s.name === name)!;
+      ids.push(skill.id);
+      await seedFailures(instance, skill.id, 2);
+      setEchoStructuredResponse(`skill-reflect:${skill.id}`, {
+        defectClass: "skill_defect",
+        attributable: true,
+        edits: [{ op: "append", content: "3. Confirm." }],
+        rationale: "x"
+      });
+    }
+
+    // Three user-skill defects with applicable edits, budget of 1: one proposal,
+    // and the two clipped defects must NOT become spurious bundled_skill
+    // findings, and their outcomes must stay unreviewed for a later pass.
+    const result = await reflectOnSkillOutcomes(config, { maxProposals: 1 });
+    expect(result.proposalsCreated).toBe(1);
+    expect(result.findingsCreated).toBe(0);
+
+    const state = readState(instance);
+    expect(state.learningFindings).toHaveLength(0);
+    // Exactly one skill's batch was reviewed (the proposed one); the two clipped
+    // skills' outcomes remain unreviewed so they're retried next pass.
+    const unreviewed = state.skillOutcomes.filter((o) => !o.reviewed);
+    expect(unreviewed).toHaveLength(4);
+    const reviewed = state.skillOutcomes.filter((o) => o.reviewed);
+    expect(reviewed).toHaveLength(2);
   });
 });
