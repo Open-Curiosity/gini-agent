@@ -277,7 +277,23 @@ function ChatSurface({
     return map;
   }, [mainBlocks]);
 
-  const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
+  // Terminal runs whose "Completed" phase is filtered out before grouping.
+  // groupExchanges folds these even when they ended on a tool call with no
+  // closing answer. Scope to "Completed" only so failures still surface inline.
+  const terminalTaskIds = useMemo(
+    () =>
+      new Set(
+        mainBlocks
+          .filter((b) => b.kind === "phase" && b.label === "Completed" && b.taskId)
+          .map((b) => b.taskId!)
+      ),
+    [mainBlocks]
+  );
+
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visibleBlocks, terminalTaskIds),
+    [visibleBlocks, terminalTaskIds]
+  );
   const hasBlocks = visibleBlocks.length > 0;
 
   // Map a job run's runId → its job name so messages delivered by a scheduled
