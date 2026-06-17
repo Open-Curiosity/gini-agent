@@ -2058,6 +2058,9 @@ export interface ImprovementProposal {
   sourceTraceIds: string[];
   payload: Record<string, unknown>;
   appliedTargetId?: string;
+  // Set when this proposal has been surfaced in a skill-review digest, so it is
+  // never re-posted. A per-item flag (not a timestamp watermark) is collision-free.
+  digestedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -2126,6 +2129,9 @@ export interface LearningFinding {
   summary: string;
   sourceTaskIds: string[];
   status: "open" | "dismissed";
+  // Set when this finding has been surfaced in a skill-review digest, so it is
+  // never re-posted (collision-free per-item flag, not a timestamp watermark).
+  digestedAt?: string;
   createdAt: string;
 }
 

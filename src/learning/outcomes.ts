@@ -104,14 +104,10 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
         }
       }
 
-      // Track whether a consequential SUCCESS row was already produced for this
-      // completion so the side-effect-only fallback below doesn't double-count.
-      let recordedConsequentialSuccess = false;
       for (const [skillId, agg] of bySkill) {
         const skill = state.skills.find((s) => s.id === skillId);
         const signal = agg.failed ? "failure" : "success";
         const consequential = isConsequential(skill, sideEffect);
-        if (signal === "success" && consequential) recordedConsequentialSuccess = true;
         createSkillOutcome(state, {
           taskId: task.id,
           agentId: task.agentId,
@@ -123,8 +119,10 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
           exitCode: agg.exitCode,
           // A failure's detail is the scrubbed reason persisted on the script
           // audit row (so the classifier can tell environment from skill defect),
-          // falling back to the task error when the task itself failed.
-          errorDetail: signal === "failure" ? (agg.detail ?? scrubError(task.error)) : undefined,
+          // falling back to the task error when the task itself failed. Re-scrub
+          // here so the capture layer is self-protecting (defense in depth) and
+          // never depends solely on the producer having redacted the snippet.
+          errorDetail: signal === "failure" ? scrubError(agg.detail ?? task.error) : undefined,
           consequential,
           // A failure's terminal/exit status is an objective signal, but a
           // consequential success only proves the action EXECUTED, not that it
@@ -137,22 +135,17 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
       }
 
       // A non-failed completion that carried a side effect (an approval /
-      // messaging send) is a consequential action with NO objective
-      // correctness check — exactly the tier-2 population the daily review
-      // samples for human feedback. Record ONE consequential success so it can
-      // be sampled, unless a consequential success row was already produced
-      // above (avoid double-counting). Attribute it to the single consequential
-      // skill when exactly one script ran, else leave it unattributed.
-      if (task.status !== "failed" && sideEffect && !recordedConsequentialSuccess) {
-        const attributedSkillId = invocations.length === 1 ? invocations[0]!.target : undefined;
-        const attributedSkill = attributedSkillId
-          ? state.skills.find((s) => s.id === attributedSkillId)
-          : undefined;
+      // messaging send) but ran NO attributed skill script is a consequential
+      // action with no objective correctness check — the tier-2 population the
+      // daily review samples for human feedback. When a script DID run (success
+      // OR failure), the per-skill loop above already recorded its outcome, so a
+      // fallback row here would double-count — and on a FAILED script it would
+      // contradict the recorded failure with a phantom success. A non-script side
+      // effect can't be attributed to any one skill, so the sample is unattributed.
+      if (task.status !== "failed" && sideEffect && invocations.length === 0) {
         createSkillOutcome(state, {
           taskId: task.id,
           agentId: task.agentId,
-          skillId: attributedSkillId,
-          skillName: attributedSkill?.name,
           signal: "success",
           source: "objective",
           consequential: true,

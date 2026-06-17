@@ -245,7 +245,22 @@ export async function revertImprovement(config: RuntimeConfig, proposalId: strin
   }
   const baseBody = typeof proposal.payload.baseBody === "string" ? proposal.payload.baseBody : "";
   if (!baseBody.trim()) throw new Error("Proposal has no baseBody to revert to.");
-  const installed = await installSkillFromBody(config, { body: baseBody });
+  const targetSkillId =
+    typeof proposal.payload.targetSkillId === "string" ? proposal.payload.targetSkillId : undefined;
+  const skill = targetSkillId
+    ? readState(config.instance).skills.find((s) => s.id === targetSkillId)
+    : undefined;
+  if (!skill || (skill.source ?? "user") !== "user" || !skill.manifestPath) {
+    throw new Error("Revert target is not an editable user skill.");
+  }
+  // `baseBody` is the frontmatter-STRIPPED SkillRecord.body (what the apply path
+  // snapshots). installSkillFromBody requires a FULL SKILL.md, so reassemble the
+  // base body under the skill's current frontmatter — exactly the shape the apply
+  // path writes — before re-installing. Without this, revert throws on the
+  // missing `name` frontmatter and the "one revert away" promise is dead.
+  const { header } = splitSkillFile(readFileSync(skill.manifestPath, "utf8"));
+  const rebuilt = `${header}${baseBody.endsWith("\n") ? baseBody : `${baseBody}\n`}`;
+  const installed = await installSkillFromBody(config, { body: rebuilt });
   return mutateState(config.instance, (state) => {
     const live = state.improvements.find((p) => p.id === proposalId);
     if (!live) throw new Error(`Improvement proposal not found: ${proposalId}`);

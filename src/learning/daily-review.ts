@@ -93,17 +93,17 @@ async function runDailyReviewInner(config: RuntimeConfig): Promise<DailyReviewRe
 
   const sessionId = await ensureSkillReviewSession(config);
 
-  // Assemble the digest from the now-current state, but only re-surface
-  // proposals/findings created AFTER the last digest so a standing
-  // (still-unactioned) proposal isn't re-posted every run (decision #2 — the
-  // digest doesn't spam). Feedback questions are intrinsically new (they
-  // advance feedbackPrompted), so they're always included.
+  // Assemble the digest from the now-current state, surfacing only items NOT yet
+  // shown in a digest so a standing (still-unactioned) proposal isn't re-posted
+  // every run (decision #2 — the digest doesn't spam). A per-item `digestedAt`
+  // flag is collision-free: a millisecond-resolution `createdAt > watermark`
+  // would permanently drop any item created in the same ms as the watermark
+  // stamp (now() collides freely back-to-back). Feedback questions are
+  // intrinsically new (they advance feedbackPrompted), so they're always included.
   const state = readState(config.instance);
-  const since = state.lastSkillReviewDigestAt;
-  const isNew = (createdAt: string) => since === undefined || createdAt > since;
-  const openFindings = state.learningFindings.filter((f) => f.status === "open" && isNew(f.createdAt));
+  const openFindings = state.learningFindings.filter((f) => f.status === "open" && !f.digestedAt);
   const pendingProposals = state.improvements.filter(
-    (p) => p.status === "proposed" && p.kind === "skill" && p.payload.mode === "edit" && isNew(p.createdAt)
+    (p) => p.status === "proposed" && p.kind === "skill" && p.payload.mode === "edit" && !p.digestedAt
   );
 
   // Nothing new to say -> don't post (keeps the channel quiet, no re-spam).
@@ -117,15 +117,22 @@ async function runDailyReviewInner(config: RuntimeConfig): Promise<DailyReviewRe
     };
   }
 
+  const proposalIds = new Set(pendingProposals.map((p) => p.id));
+  const findingIds = new Set(openFindings.map((f) => f.id));
   const digest = buildDigest(pendingProposals, openFindings, feedback);
+  const at = now();
   await mutateState(config.instance, (s) => {
     createChatMessage(s, {
       sessionId,
       role: "assistant",
       content: digest
     });
-    // Advance the digest watermark so the next run won't re-post these.
-    s.lastSkillReviewDigestAt = now();
+    // Mark exactly the items included in THIS digest as digested so they are
+    // never re-posted; a later run surfaces only items still lacking digestedAt.
+    for (const p of s.improvements) if (proposalIds.has(p.id)) p.digestedAt = at;
+    for (const f of s.learningFindings) if (findingIds.has(f.id)) f.digestedAt = at;
+    // Keep the last-digest timestamp for display/telemetry (no longer the dedup key).
+    s.lastSkillReviewDigestAt = at;
   });
   // The chat UI renders BLOCKS (the /blocks stream web + mobile read), not the
   // durable chatMessages transcript — so emit a renderable assistant_text block
