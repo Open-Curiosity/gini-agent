@@ -113,6 +113,12 @@ export class ScreencastBridge {
   // stream (and the modal's EventSource reconnects / re-evaluates the gate)
   // instead of dangling on a stale frame behind keepalives.
   private readonly closeSubscribers = new Set<() => void>();
+  // The URL of the page currently being screencast, surfaced to viewers so the
+  // operator can see the origin they're signing into (the modal has no address
+  // bar). Tracked at attach and refreshed each watch tick (same-tab redirects
+  // and popup switches change it). onUrl subscribers get the latest immediately.
+  private currentUrl: string | undefined;
+  private readonly urlSubscribers = new Set<(url: string) => void>();
   private readonly deps: ScreencastDeps;
   private closed = false;
   // How long stop() waits for Page.stopScreencast before forcing the socket
@@ -177,6 +183,7 @@ export class ScreencastBridge {
     // Seed the sign-in target family with the watched page so the watcher only
     // follows popups THIS page opens — never a sibling task's tab in the shared
     // context. Record its id ↔ wsUrl so we can match targetCreated events.
+    this.setUrl(pageTarget.url);
     if (typeof pageTarget.id === "string") {
       this.currentTargetId = pageTarget.id;
       this.signInFamily.add(pageTarget.id);
@@ -335,6 +342,7 @@ export class ScreencastBridge {
         if (fresh?.webSocketDebuggerUrl && typeof fresh.id === "string") {
           this.currentTargetId = fresh.id;
           this.visitedTargetIds.add(fresh.id);
+          this.setUrl(fresh.url);
           await this.switchTo(fresh.webSocketDebuggerUrl);
           return;
         }
@@ -349,9 +357,15 @@ export class ScreencastBridge {
           if (survivor?.webSocketDebuggerUrl && typeof survivor.id === "string") {
             this.currentTargetId = survivor.id;
             this.visitedTargetIds.add(survivor.id);
+            this.setUrl(survivor.url);
             await this.switchTo(survivor.webSocketDebuggerUrl);
           }
+          return;
         }
+        // No switch this tick — refresh the URL so a same-tab redirect (the page
+        // navigating itself, e.g. OAuth bouncing through an identity provider)
+        // is reflected to the operator.
+        this.setUrl(currentAlive.url);
       })();
     }, this.targetWatchMs);
     if (typeof this.targetWatch.unref === "function") this.targetWatch.unref();
@@ -449,6 +463,7 @@ export class ScreencastBridge {
     }
     this.closeSubscribers.clear();
     this.subscribers.clear();
+    this.urlSubscribers.clear();
     for (const resolve of this.pending.values()) resolve(undefined);
     this.pending.clear();
   }
@@ -463,14 +478,43 @@ export class ScreencastBridge {
     return promise;
   }
 
+  // Update the URL being screencast and notify URL subscribers on change, so
+  // the modal can show the operator which origin they're signing into.
+  private setUrl(url: string | undefined): void {
+    if (!url || url === this.currentUrl) return;
+    this.currentUrl = url;
+    for (const fn of this.urlSubscribers) {
+      try {
+        fn(url);
+      } catch {
+        // a broken url subscriber must not break the others
+      }
+    }
+  }
+
   // Subscribe to frames. Immediately replays the latest frame (if any) so a
   // newly-connected viewer paints without waiting for the next page change,
-  // then streams subsequent frames. The optional onClose fires once if the
-  // bridge closes while subscribed, so the caller can tear down its stream.
-  // Returns an unsubscribe fn that drops both callbacks.
-  subscribe(onFrame: (frame: ScreencastFrame) => void, onClose?: () => void): () => void {
+  // then streams subsequent frames. onClose fires once if the bridge closes
+  // while subscribed (so the caller can tear down its stream); onUrl fires with
+  // the current page URL immediately and on each change (the trusted origin the
+  // operator is signing into). Returns an unsubscribe fn that drops all three.
+  subscribe(
+    onFrame: (frame: ScreencastFrame) => void,
+    onClose?: () => void,
+    onUrl?: (url: string) => void
+  ): () => void {
     this.subscribers.add(onFrame);
     if (onClose) this.closeSubscribers.add(onClose);
+    if (onUrl) {
+      this.urlSubscribers.add(onUrl);
+      if (this.currentUrl) {
+        try {
+          onUrl(this.currentUrl);
+        } catch {
+          // ignore
+        }
+      }
+    }
     if (this.latest) {
       try {
         onFrame(this.latest);
@@ -481,6 +525,7 @@ export class ScreencastBridge {
     return () => {
       this.subscribers.delete(onFrame);
       if (onClose) this.closeSubscribers.delete(onClose);
+      if (onUrl) this.urlSubscribers.delete(onUrl);
     };
   }
 

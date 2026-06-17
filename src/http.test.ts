@@ -2769,7 +2769,12 @@ describe("runtime api", () => {
     const dispatched: unknown[] = [];
     const fakeBridge = {
       isClosed: () => false,
-      subscribe(onFrame: (f: { data: string; meta: Record<string, unknown> }) => void) {
+      subscribe(
+        onFrame: (f: { data: string; meta: Record<string, unknown> }) => void,
+        _onClose?: () => void,
+        onUrl?: (url: string) => void
+      ) {
+        onUrl?.("https://signin.example.com/login");
         onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
         return () => undefined;
       },
@@ -2787,8 +2792,15 @@ describe("runtime api", () => {
       expect(framesRes.status).toBe(200);
       expect(framesRes.headers.get("content-type")).toContain("text/event-stream");
       const reader = framesRes.body!.getReader();
-      const chunk = await reader.read();
-      const text = new TextDecoder().decode(chunk.value);
+      // onUrl and onFrame enqueue separate chunks; read both.
+      const decoder = new TextDecoder();
+      const first = decoder.decode((await reader.read()).value);
+      const second = decoder.decode((await reader.read()).value);
+      const text = first + second;
+      // The gateway-sourced origin is streamed as an `event: url` so the modal
+      // can show the operator which site they're signing into.
+      expect(text).toContain("event: url");
+      expect(text).toContain("https://signin.example.com/login");
       expect(text).toContain("event: frame");
       expect(text).toContain("QUJD");
       await reader.cancel();

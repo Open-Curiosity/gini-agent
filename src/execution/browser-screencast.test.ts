@@ -464,6 +464,37 @@ function followHarness(initial: CdpVersionTarget[]) {
 describe("ScreencastBridge target-follow (popup / new-tab)", () => {
   const page = mkPage;
 
+  test("reports the signed-in URL on subscribe and tracks it across a popup switch", async () => {
+    const opener = page("opener", "https://signin.example/login");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/login");
+    const urls: string[] = [];
+    bridge.subscribe(() => undefined, undefined, (u) => urls.push(u));
+    // Initial URL is delivered immediately on subscribe.
+    expect(urls).toEqual(["https://signin.example/login"]);
+    // A family popup at a different origin → the URL updates to it.
+    const popup = page("popup", "https://idp.example/authorize");
+    h.openPopup("opener", popup);
+    await waitUntil(() => urls.includes("https://idp.example/authorize"));
+    expect(urls.at(-1)).toBe("https://idp.example/authorize");
+    await bridge.stop();
+  });
+
+  test("reflects a same-tab redirect (URL changes without a target switch)", async () => {
+    const opener = page("opener", "https://signin.example/login");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/login");
+    const urls: string[] = [];
+    bridge.subscribe(() => undefined, undefined, (u) => urls.push(u));
+    // The SAME target navigates itself (OAuth bounce) — id unchanged, url changes.
+    h.setTargets([{ ...opener, url: "https://idp.example/sso" }]);
+    await waitUntil(() => urls.includes("https://idp.example/sso"));
+    expect(urls.at(-1)).toBe("https://idp.example/sso");
+    await bridge.stop();
+  });
+
   test("switches the screencast to a popup the watched page opened", async () => {
     const opener = page("opener", "https://signin.example/");
     const h = followHarness([opener]);

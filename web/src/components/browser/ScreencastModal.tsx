@@ -58,6 +58,10 @@ export function ScreencastModal({
   // used to rescale pointer coordinates from the displayed <img> to the page.
   const pageSize = useRef({ w: 1280, h: 800 });
   const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
+  // The origin (scheme + host) of the page being screencast, streamed from the
+  // gateway. The modal has no address bar, so this is the operator's only
+  // trusted signal for which site they're typing credentials into.
+  const [origin, setOrigin] = useState<string | null>(null);
   const dragStart = useRef<{ x: number; y: number; clientX: number; clientY: number; mods: number } | null>(null);
   // Move-coalescing: pointer move fires far faster than a round-trip, so cap it
   // to one in-flight POST and remember only the latest position, flushed when
@@ -79,6 +83,14 @@ export function ScreencastModal({
         setStatus("live");
       } catch {
         // drop a malformed frame
+      }
+    });
+    source.addEventListener("url", (ev) => {
+      try {
+        const { url } = JSON.parse((ev as MessageEvent).data) as { url?: string };
+        if (url) setOrigin(new URL(url).origin);
+      } catch {
+        // drop a malformed/unparseable url event
       }
     });
     source.onopen = () => setStatus((s) => (s === "error" ? "connecting" : s));
@@ -181,6 +193,14 @@ export function ScreencastModal({
             {status === "connecting" ? " Connecting…" : status === "error" ? " Reconnecting…" : null}
           </DialogDescription>
         </DialogHeader>
+        {/* Read-only trust anchor: the origin the agent's browser is on, sourced
+            from the gateway. NOT an input — there is no navigation from here. */}
+        <div className="flex items-center gap-2 rounded border border-border bg-muted/40 px-2 py-1 text-xs text-muted-foreground">
+          <span className="shrink-0">Signing in to</span>
+          <span className="truncate font-mono text-foreground" title={origin ?? undefined}>
+            {origin ?? "…"}
+          </span>
+        </div>
         <div className="relative flex justify-center">
           {/* Hidden field that holds keyboard focus so key events land here. */}
           <textarea
