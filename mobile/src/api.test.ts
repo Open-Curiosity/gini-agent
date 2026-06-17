@@ -74,8 +74,15 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  globalThis.fetch = realFetch;
+  // Drop any device token a test left set BEFORE clearing credentials, and
+  // clear credentials while the stub fetch is still installed. Otherwise
+  // clearCredentials() → tryDeregisterCachedDevice() would issue a real
+  // DELETE /api/push/devices/<token> against the live test origin once the
+  // real fetch is restored — a network call in teardown that depends on a
+  // running gateway and leaks across tests.
+  deviceToken = null;
   await clearCredentials();
+  globalThis.fetch = realFetch;
 });
 
 describe("api() request timeout (issue #396)", () => {
@@ -98,6 +105,34 @@ describe("api() request timeout (issue #396)", () => {
           });
         })
     );
+
+    const err = await api("/agents", { timeoutMs: 50 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(0);
+    expect((err as Error).message).toContain("timed out");
+  });
+
+  test("a response whose body stalls after headers is still aborted by the timeout", async () => {
+    // Expo's winter fetch resolves the Response as soon as headers arrive
+    // and streams the body lazily, so a gateway that flushes headers then
+    // stalls the body would hang on response.text() forever if the timeout
+    // were cleared right after fetch(). Model that: fetch() resolves a
+    // Response whose text() only settles when the abort signal fires.
+    setFetch((_url, init) => {
+      const body = new Promise<string>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const e = new Error("Aborted");
+          e.name = "AbortError";
+          reject(e);
+        });
+      });
+      const response = {
+        ok: true,
+        status: 200,
+        text: () => body
+      } as unknown as Response;
+      return Promise.resolve(response);
+    });
 
     const err = await api("/agents", { timeoutMs: 50 }).catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);

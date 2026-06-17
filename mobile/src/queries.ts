@@ -769,7 +769,12 @@ export function useReplyToThread(sessionId: string | null, threadId: string | nu
       if (parentBlockId) payload.parentBlockId = parentBlockId;
       return api(`/chat/${sessionId}/threads/${threadId}/messages`, {
         method: "POST",
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        // Threaded voice replies hit the same blocking server-side
+        // transcription (and first-run whisper download) as the main chat,
+        // so they need the same generous ceiling — otherwise the default
+        // write timeout would abort a legitimate first-run transcription.
+        ...(audio ? { timeoutMs: 120_000 } : {})
       });
     },
     onSuccess: () => {

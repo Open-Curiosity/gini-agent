@@ -108,13 +108,20 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  // Arm a timeout that aborts the fetch if the gateway never responds.
+  // Arm a timeout that aborts the request if the gateway never responds.
   // RN polyfills AbortController (abort-controller@3) but NOT the static
   // AbortSignal.timeout()/any() helpers, so wire it manually: one
   // controller fires on our timer, and a caller-supplied signal (React
   // Query passes one on every queryFn it owns) chains in so an upstream
-  // cancel still aborts the request. The timer is always cleared in
-  // finally so a fast response doesn't leave a dangling abort armed.
+  // cancel still aborts the request.
+  //
+  // The timer must stay armed across BOTH the fetch AND the body read.
+  // Expo's winter fetch resolves the Response as soon as headers arrive
+  // and streams the body lazily, so a gateway that flushes headers then
+  // stalls the body would slip past a timer cleared right after fetch()
+  // and hang forever on response.text() — the exact infinite-spinner
+  // (issue #396) the timeout exists to prevent. So clear the timer only
+  // in the finally that wraps the whole request, after the body is read.
   const controller = new AbortController();
   // Default by method: a missing/"GET" method is an idempotent read and
   // gets the short ceiling; anything else is a write and gets the longer
@@ -130,9 +137,21 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   }
 
   const url = `${parsed.origin}/api${path}`;
-  let response: Response;
   try {
-    response = await fetch(url, { ...rest, headers, signal: controller.signal });
+    const response = await fetch(url, { ...rest, headers, signal: controller.signal });
+    // Read the body under the same armed timeout — a stalled body aborts
+    // here too. 204 No Content (or any empty body) → null cast as T so
+    // callers that don't care about the body don't choke on JSON.parse.
+    const text = await response.text();
+    const value = text ? safeParse(text) : null;
+    if (!response.ok) {
+      const message =
+        (value && typeof value === "object" && "error" in value && typeof value.error === "string")
+          ? value.error
+          : `HTTP ${response.status}`;
+      throw new ApiError(response.status, message);
+    }
+    return value as T;
   } catch (err) {
     // A timeout-driven abort (our timer fired while the caller's own
     // signal, if any, is still live) becomes a tagged transport error so
@@ -147,19 +166,6 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     clearTimeout(timer);
     if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
   }
-
-  // 204 No Content (or any empty body) — return null cast as T so callers
-  // that don't care about the body don't choke on JSON.parse.
-  const text = await response.text();
-  const value = text ? safeParse(text) : null;
-  if (!response.ok) {
-    const message =
-      (value && typeof value === "object" && "error" in value && typeof value.error === "string")
-        ? value.error
-        : `HTTP ${response.status}`;
-    throw new ApiError(response.status, message);
-  }
-  return value as T;
 }
 
 // The RN fetch polyfill rejects an aborted request with
