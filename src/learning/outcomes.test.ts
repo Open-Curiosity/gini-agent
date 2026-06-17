@@ -62,9 +62,10 @@ describe("recordObjectiveOutcomes", () => {
   test("non-zero exit yields an attributed failure; ok yields a success", async () => {
     const instance = "attr";
     const config = makeConfig(instance);
-    let skillId = "";
+    let payerId = "";
+    let notifierId = "";
     await mutateState(instance, (state) => {
-      const skill = createSkill(state, {
+      const payer = createSkill(state, {
         name: "payer",
         description: "",
         trigger: "",
@@ -73,13 +74,25 @@ describe("recordObjectiveOutcomes", () => {
         requiredPermissions: ["messaging.send"],
         status: "enabled"
       });
-      skillId = skill.id;
+      payerId = payer.id;
+      // A SECOND distinct skill for the success row — outcomes collapse per
+      // (skill, task), so the failure and the success must be different skills.
+      const notifier = createSkill(state, {
+        name: "notifier",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: ["messaging.send"],
+        status: "enabled"
+      });
+      notifierId = notifier.id;
       addAudit(
         state,
         {
           actor: "agent",
           action: "skill.script.invoked",
-          target: skill.id,
+          target: payer.id,
           risk: "medium",
           taskId: "task_1",
           evidence: { skill: "payer", script: "pay.sh", ok: false, exitCode: 7, stdoutBytes: 0, stderrBytes: 12 }
@@ -91,10 +104,10 @@ describe("recordObjectiveOutcomes", () => {
         {
           actor: "agent",
           action: "skill.script.invoked",
-          target: skill.id,
+          target: notifier.id,
           risk: "medium",
           taskId: "task_1",
-          evidence: { skill: "payer", script: "status.sh", ok: true, exitCode: 0, stdoutBytes: 4, stderrBytes: 0 }
+          evidence: { skill: "notifier", script: "status.sh", ok: true, exitCode: 0, stdoutBytes: 4, stderrBytes: 0 }
         },
         { taskId: "task_1" }
       );
@@ -106,7 +119,7 @@ describe("recordObjectiveOutcomes", () => {
     const failure = outcomes.find((o) => o.signal === "failure");
     const success = outcomes.find((o) => o.signal === "success");
     expect(failure).toBeDefined();
-    expect(failure!.skillId).toBe(skillId);
+    expect(failure!.skillId).toBe(payerId);
     expect(failure!.exitCode).toBe(7);
     expect(failure!.scriptName).toBe("pay.sh");
     // requiredPermissions on the skill makes it consequential.
@@ -114,11 +127,49 @@ describe("recordObjectiveOutcomes", () => {
     // A failure's terminal/exit status is an objective signal.
     expect(failure!.selfVerifiable).toBe(true);
     expect(success).toBeDefined();
-    expect(success!.skillId).toBe(skillId);
+    expect(success!.skillId).toBe(notifierId);
     // The success ran a consequential skill (messaging.send permission), so the
     // ok exit proves it EXECUTED, not that it was correct -> not self-verifiable.
     expect(success!.consequential).toBe(true);
     expect(success!.selfVerifiable).toBe(false);
+  });
+
+  test("retried invocations of one skill collapse to a single outcome per task", async () => {
+    const instance = "dedup";
+    const config = makeConfig(instance);
+    await mutateState(instance, (state) => {
+      const skill = createSkill(state, {
+        name: "flaky",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "enabled"
+      });
+      // Three retries of the same script in ONE task.
+      for (let i = 0; i < 3; i += 1) {
+        addAudit(
+          state,
+          {
+            actor: "agent",
+            action: "skill.script.invoked",
+            target: skill.id,
+            risk: "medium",
+            taskId: "task_d",
+            evidence: { skill: "flaky", script: "run.sh", ok: false, exitCode: 1, stdoutBytes: 0, stderrBytes: 5 }
+          },
+          { taskId: "task_d" }
+        );
+      }
+    });
+    await recordObjectiveOutcomes(config, makeTask(instance, "task_d", "completed"));
+    const outcomes = readState(instance).skillOutcomes.filter((o) => o.taskId === "task_d");
+    // One task is one trajectory: retries must NOT inflate the per-skill failure
+    // count that gates reflection's >=2-distinct-trajectory floor.
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.signal).toBe("failure");
+    expect(outcomes[0]!.exitCode).toBe(1);
   });
 
   test("script-less failed task yields one unattributed failure row", async () => {

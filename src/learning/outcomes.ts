@@ -66,29 +66,57 @@ export async function recordObjectiveOutcomes(config: RuntimeConfig, task: Task)
         return;
       }
 
-      // Track whether a consequential SUCCESS row was already produced for this
-      // completion so the side-effect-only fallback below doesn't double-count.
-      let recordedConsequentialSuccess = false;
+      // Collapse multiple invocations of the SAME skill within ONE task into a
+      // single outcome. A task is one trajectory, so a retry loop must not
+      // inflate the per-skill failure count that gates reflection's
+      // ≥2-distinct-trajectory floor (ADR skill-learning-from-outcomes.md): the
+      // skill's outcome for this task is a failure if ANY of its invocations
+      // failed, and the representative exit/script comes from the first failure.
+      const bySkill = new Map<
+        string,
+        { failed: boolean; exitCode?: number; skillName?: string; scriptName?: string }
+      >();
       for (const row of invocations) {
         const evidence = (row.evidence ?? {}) as Record<string, unknown>;
         const ok = evidence.ok === true;
         const exitCode = typeof evidence.exitCode === "number" ? evidence.exitCode : undefined;
+        const failed = !(ok && (exitCode === undefined || exitCode === 0));
         const skillName = typeof evidence.skill === "string" ? evidence.skill : undefined;
         const scriptName = typeof evidence.script === "string" ? evidence.script : undefined;
         // `target` on the row is the skill id (see skill-scripts.ts).
-        const skill = state.skills.find((s) => s.id === row.target);
-        const signal = ok && (exitCode === undefined || exitCode === 0) ? "success" : "failure";
+        const prior = bySkill.get(row.target);
+        if (!prior) {
+          bySkill.set(row.target, {
+            failed,
+            exitCode: failed ? exitCode : undefined,
+            skillName,
+            scriptName
+          });
+        } else if (failed && !prior.failed) {
+          // First failure for this skill wins the representative detail.
+          prior.failed = true;
+          prior.exitCode = exitCode;
+          prior.scriptName = scriptName ?? prior.scriptName;
+        }
+      }
+
+      // Track whether a consequential SUCCESS row was already produced for this
+      // completion so the side-effect-only fallback below doesn't double-count.
+      let recordedConsequentialSuccess = false;
+      for (const [skillId, agg] of bySkill) {
+        const skill = state.skills.find((s) => s.id === skillId);
+        const signal = agg.failed ? "failure" : "success";
         const consequential = isConsequential(skill, sideEffect);
         if (signal === "success" && consequential) recordedConsequentialSuccess = true;
         createSkillOutcome(state, {
           taskId: task.id,
           agentId: task.agentId,
-          skillId: row.target,
-          skillName: skillName ?? skill?.name,
-          scriptName,
+          skillId,
+          skillName: agg.skillName ?? skill?.name,
+          scriptName: agg.scriptName,
           signal,
           source: "objective",
-          exitCode,
+          exitCode: agg.exitCode,
           // Only failures carry detail. The audit row doesn't store stderr text
           // (only byte counts), so a script failure's detail comes from the
           // task error when the task itself failed; otherwise it's left unset

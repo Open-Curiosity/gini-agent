@@ -133,10 +133,15 @@ safety boundary edits must preserve).
   to `[]` so older state files load.
 
 - **Objective extraction** (`src/learning/outcomes.ts`): `recordObjectiveOutcomes(config, task)`
-  is called fire-and-forget at task terminal alongside `scheduleAutoRetain` (`src/agent.ts`).
-  It reads the task's already-persisted `skill.script.invoked` audit rows + `task.status` and
-  writes one `SkillOutcome` per script invocation (`failure` when `ok:false`/non-zero exit,
-  else `success`), attributed by `target`/evidence. A `failed` task with no script invocation
+  is called fire-and-forget at **every** task-terminal site alongside `scheduleAutoRetain` —
+  the agent.ts helpers (`completeTask`/`finishTaskTransition`/`failTask`) AND the chat-turn
+  completion paths in `src/execution/chat-task.ts` (the real chat surface completes there, not
+  through the agent.ts helpers). It reads the task's already-persisted `skill.script.invoked`
+  audit rows + `task.status` and writes one `SkillOutcome` **per attributed skill, collapsed
+  across that task's invocations** (a task is one trajectory, so retries of the same skill do
+  not inflate the per-skill failure count that gates the ≥2-distinct-trajectory floor): the
+  skill's outcome is a `failure` when any of its invocations failed (`ok:false`/non-zero exit),
+  else `success`, attributed by `target`/evidence. A `failed` task with no script invocation
   yields one unattributed (`skillId` unset) failure row for the digest only. A **non-failed**
   completion that carried a side effect (an approval/messaging audit row) but produced no
   consequential success row above records ONE consequential `success` (`selfVerifiable:false`,
