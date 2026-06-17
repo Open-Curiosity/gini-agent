@@ -5,9 +5,10 @@ import type { DayTokens } from "../tasks/_components/observability";
 
 // Daily token-usage chart for the home page. Renders a stacked bar per day
 // (input on the bottom, output on top) over the supplied window, plus a
-// headline for today's total and a legend with window totals. Hand-built to
-// match the in-house viz style (StatusDonut / Sparkline / TokenBar) — the web
-// app ships no charting library.
+// headline for today's total and a legend with window totals. The bars are
+// SVG — like the StatusDonut / Sparkline on the tasks page — so heights are
+// driven by the viewBox rather than fragile percentage-height flexbox; the
+// web app ships no charting library.
 
 // Match TokenBar in TaskDetail.tsx: input = blue-500/70, output = emerald-500/70.
 const INPUT_COLOR = "#3b82f6";
@@ -19,7 +20,7 @@ const SERIES_OPACITY = 0.7;
 const AXIS_LABEL_EVERY = 3;
 
 export function TokenUsageChart({ buckets }: { buckets: DayTokens[] }) {
-  const today = buckets[buckets.length - 1] ?? { input: 0, output: 0, dayStart: Date.now() };
+  const today = buckets[buckets.length - 1] ?? { input: 0, output: 0, dayStart: 0 };
   const todayTotal = today.input + today.output;
   const windowInput = buckets.reduce((sum, b) => sum + b.input, 0);
   const windowOutput = buckets.reduce((sum, b) => sum + b.output, 0);
@@ -63,33 +64,65 @@ export function TokenUsageChart({ buckets }: { buckets: DayTokens[] }) {
 }
 
 function DailyBars({ buckets, maxTotal }: { buckets: DayTokens[]; maxTotal: number }) {
+  // Square viewBox stretched to the box (preserveAspectRatio="none"); only
+  // axis-free rects live in it, so the horizontal stretch is harmless. Each
+  // day owns a band; the bar fills 70% of the band, stacked input-on-bottom.
+  const H = 100;
+  const W = 100;
+  const band = W / buckets.length;
+  const barW = band * 0.7;
+  const inset = (band - barW) / 2;
   const lastIndex = buckets.length - 1;
   return (
-    <div className="flex h-32 items-end gap-1" role="img" aria-label="Daily token usage, input and output">
-      {buckets.map((bucket, i) => {
-        const total = bucket.input + bucket.output;
-        const totalPct = (total / maxTotal) * 100;
-        // Within the bar, split the rendered height between input (bottom) and
-        // output (top). Guard total===0 so an empty day stays flat, not NaN.
-        const inputPct = total > 0 ? (bucket.input / total) * 100 : 0;
-        const outputPct = total > 0 ? 100 - inputPct : 0;
-        const isToday = i === lastIndex;
-        return (
-          <div key={bucket.dayStart} className="flex min-w-0 flex-1 flex-col items-center gap-1">
-            <div
-              className="flex w-full flex-col-reverse overflow-hidden rounded-sm bg-muted/40"
-              style={{ height: `${Math.max(totalPct, total > 0 ? 2 : 0)}%` }}
-              title={`${formatDay(bucket.dayStart)} — ${bucket.input.toLocaleString()} in · ${bucket.output.toLocaleString()} out (${total.toLocaleString()} total)`}
+    <div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        className="h-32 w-full"
+        role="img"
+        aria-label="Daily token usage, input and output tokens per day"
+      >
+        {buckets.map((bucket, i) => {
+          const total = bucket.input + bucket.output;
+          // A nonzero day always shows at least a 2-unit sliver so it never
+          // visually reads as empty; a true-zero day stays flat.
+          const totalH = total > 0 ? Math.max((total / maxTotal) * H, 2) : 0;
+          const inputH = total > 0 ? (bucket.input / total) * totalH : 0;
+          const outputH = totalH - inputH;
+          const x = i * band + inset;
+          return (
+            <g key={bucket.dayStart}>
+              {/* Full-band transparent hit target so every day — including
+                  empty ones — surfaces a hover tooltip. */}
+              <rect x={i * band} y={0} width={band} height={H} fill="transparent">
+                <title>
+                  {`${formatDay(bucket.dayStart)} — ${bucket.input.toLocaleString()} in · ${bucket.output.toLocaleString()} out (${total.toLocaleString()} total)`}
+                </title>
+              </rect>
+              {total > 0 ? (
+                <>
+                  <rect x={x} y={H - inputH} width={barW} height={inputH} fill={INPUT_COLOR} opacity={SERIES_OPACITY} />
+                  <rect x={x} y={H - totalH} width={barW} height={outputH} fill={OUTPUT_COLOR} opacity={SERIES_OPACITY} />
+                </>
+              ) : null}
+            </g>
+          );
+        })}
+      </svg>
+      <div className="mt-1 flex">
+        {buckets.map((bucket, i) => {
+          const showLabel = i === lastIndex || i === 0 || i % AXIS_LABEL_EVERY === 0;
+          const isToday = i === lastIndex;
+          return (
+            <span
+              key={bucket.dayStart}
+              className={`min-w-0 flex-1 text-center text-[9px] tabular-nums ${isToday ? "font-medium text-foreground" : "text-muted-foreground"}`}
             >
-              <span className="block w-full" style={{ height: `${inputPct}%`, backgroundColor: INPUT_COLOR, opacity: SERIES_OPACITY }} />
-              <span className="block w-full" style={{ height: `${outputPct}%`, backgroundColor: OUTPUT_COLOR, opacity: SERIES_OPACITY }} />
-            </div>
-            <span className={`text-[9px] tabular-nums ${isToday ? "font-medium text-foreground" : "text-muted-foreground"}`}>
-              {i === lastIndex || i === 0 || i % AXIS_LABEL_EVERY === 0 ? formatAxis(bucket.dayStart) : " "}
+              {showLabel ? formatAxis(bucket.dayStart) : ""}
             </span>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
 }
