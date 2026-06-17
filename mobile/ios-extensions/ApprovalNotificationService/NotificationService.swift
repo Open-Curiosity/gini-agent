@@ -93,7 +93,7 @@ class NotificationService: UNNotificationServiceExtension {
                 approvalId: routing?["approvalId"] as? String
             )
         else {
-            contentHandler(bestAttempt)
+            deliver(bestAttempt)
             return
         }
 
@@ -106,9 +106,7 @@ class NotificationService: UNNotificationServiceExtension {
         }
 
         fetchTask = URLSession.shared.dataTask(with: urlRequest) { [weak self] data, response, _ in
-            guard let self = self,
-                  let bestAttempt = self.bestAttemptContent,
-                  let handler = self.contentHandler else { return }
+            guard let self = self, let bestAttempt = self.bestAttemptContent else { return }
 
             if let http = response as? HTTPURLResponse,
                http.statusCode == 200,
@@ -120,9 +118,10 @@ class NotificationService: UNNotificationServiceExtension {
                 bestAttempt.title = title
                 bestAttempt.body = body
             }
-            // On any non-200 / parse failure we leave the generic content
-            // in place — the user still gets the banner.
-            handler(bestAttempt)
+            // On any non-200 / parse failure (including a cancellation
+            // error from serviceExtensionTimeWillExpire) we leave the
+            // generic content in place — the user still gets the banner.
+            self.deliver(bestAttempt)
         }
         fetchTask?.resume()
     }
@@ -130,11 +129,24 @@ class NotificationService: UNNotificationServiceExtension {
     override func serviceExtensionTimeWillExpire() {
         // iOS calls this if the 30s window expires before we returned.
         // Cancel the in-flight fetch and hand back whatever we have — the
-        // generic banner beats no banner.
+        // generic banner beats no banner. cancel() still fires the task's
+        // completion handler (with NSURLErrorCancelled), so deliver() must
+        // be idempotent to avoid a double content-handler call.
         fetchTask?.cancel()
-        if let contentHandler = contentHandler, let bestAttempt = bestAttemptContent {
-            contentHandler(bestAttempt)
+        if let bestAttempt = bestAttemptContent {
+            deliver(bestAttempt)
         }
+    }
+
+    // Invoke the content handler exactly once. Apple requires a NSE to
+    // call its content handler precisely one time; both the fetch
+    // completion and the timeout path can race to call it (a cancelled
+    // URLSession task still delivers its completion with an error), so we
+    // nil the stored handler after the first call and no-op thereafter.
+    private func deliver(_ content: UNNotificationContent) {
+        guard let handler = contentHandler else { return }
+        contentHandler = nil
+        handler(content)
     }
 
     // Credentials the main app wrote into the shared App Group container.

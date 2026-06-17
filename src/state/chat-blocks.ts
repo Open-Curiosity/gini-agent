@@ -541,8 +541,9 @@ export function taskProducedAssistantText(
 // notification collapsed onto a single session entry always reflects the
 // newest message even across multiple agent turns. Thread replies are
 // excluded so the preview tracks the main chat the notification deep-links
-// to. Ordering by ordinal DESC + LIMIT 1 keeps the read O(1) on the
-// session index.
+// to. Rows are scanned newest-first (ordinal DESC) and the loop stops at
+// the first non-empty text, so it skips trailing whitespace-only blocks —
+// in the common case (newest block is a real reply) that's a single row.
 export function latestAssistantTextForSession(
   instance: Instance,
   sessionId: string

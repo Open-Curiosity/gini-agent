@@ -121,6 +121,44 @@ describe("apns dispatcher", () => {
     dispatcher.stop();
   });
 
+  test("setup_requested fans out WITHOUT the approve/deny category", async () => {
+    // A setup request is a user-action flow (open browser, fill form),
+    // not an approve/deny gate. Attaching APPROVAL_REQUEST would render
+    // Approve/Deny buttons whose handler POSTs to /authorizations/:id —
+    // a route that can't resolve a setup id. So the payload must omit the
+    // category; the user taps in to complete the step.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_setup",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 5,
+      createdAt: new Date().toISOString(),
+      kind: "setup_requested",
+      setupRequestId: "setup_1",
+      action: "browser.connect",
+      summary: "Sign in to your email"
+    });
+
+    expect(calls.length).toBe(1);
+    const aps = calls[0]!.payload.aps as Record<string, unknown>;
+    // Still mutable (the NSE enriches the preview) and an alert, but no
+    // approve/deny category.
+    expect(aps["mutable-content"]).toBe(1);
+    expect((aps.alert as Record<string, unknown>).title).toBe("Gini needs you to finish a step");
+    expect(aps.category).toBeUndefined();
+    const body = calls[0]!.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("setup_requested");
+    expect(body.approvalId).toBe("setup_1");
+    dispatcher.stop();
+  });
+
   test("ignores non-approval blocks", async () => {
     const { client, calls } = buildFakeClient();
     const dispatcher = createApnsDispatcher("test-inst" as Instance, {

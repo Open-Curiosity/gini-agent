@@ -41,36 +41,83 @@ export interface SharedCredentials {
   deviceToken?: string;
 }
 
-// Resolve the shared-container File handle, or null when unavailable
-// (non-iOS, the App Group key not present because entitlements haven't
-// been signed in, or the native modules not loadable in a test/web
-// bundle). Both react-native and expo-file-system are lazy-required so
-// importing this module never pulls the native surface at load time —
-// non-RN test/web bundles that touch auth.ts stay clean.
-function resolveSharedFile(): { write: (s: string) => void; delete: () => void } | null {
+// Minimal handle onto the shared-container file. Just the write + delete
+// surface the bridge needs.
+export interface SharedFile {
+  write: (contents: string) => void;
+  delete: () => void;
+}
+
+// Resolves the shared-container file, or null when unavailable. Injected
+// so tests can substitute a stub WITHOUT globally mocking `react-native`
+// (a process-wide `mock.module("react-native")` leaks into sibling test
+// files that need the real module and breaks them). The production
+// default lazy-requires the native modules so importing this module never
+// pulls the native surface at load time — non-RN test/web bundles that
+// touch auth.ts stay clean.
+export type SharedFileResolver = () => SharedFile | null;
+
+// The native surface the resolver depends on, factored out so the
+// resolver's branching logic is unit-testable without loading the real
+// react-native / expo-file-system modules. Production injects the lazy
+// requires below; tests pass fakes.
+export interface NativeBridge {
+  platformOS: string;
+  // The expo-file-system File constructor and the appleSharedContainers
+  // record (keyed by app group id). Pulling them through this seam means
+  // the resolver never statically imports the native modules.
+  File: new (dir: unknown, name: string) => SharedFile;
+  appleSharedContainers: Record<string, unknown>;
+}
+
+// Lazy-require the native modules and shape them into a NativeBridge.
+// Throws in non-RN bundles (caught by the resolver). `req` is injectable
+// so the assembly logic is testable without loading the real native
+// modules; production uses the module's own require.
+export function loadNativeBridge(req: (id: string) => unknown = require): NativeBridge {
+  const { Platform } = req("react-native") as { Platform: { OS: string } };
+  const { File, Paths } = req("expo-file-system") as {
+    File: new (dir: unknown, name: string) => SharedFile;
+    Paths: { appleSharedContainers: Record<string, unknown> };
+  };
+  return { platformOS: Platform.OS, File, appleSharedContainers: Paths.appleSharedContainers };
+}
+
+// Resolves the App Group container file from a native bridge: returns the
+// file on iOS with the group entitlement present, else null. Pure given
+// the bridge, so tests exercise every branch with a fake. `loadBridge`
+// defaults to the lazy require; tests pass a fake (or a thrower).
+export function defaultResolveSharedFile(loadBridge: () => NativeBridge = loadNativeBridge): SharedFile | null {
+  let bridge: NativeBridge;
   try {
-    const { Platform } = require("react-native") as { Platform: { OS: string } };
-    if (Platform.OS !== "ios") return null;
-    const { File, Paths } = require("expo-file-system") as {
-      File: new (dir: unknown, name: string) => { write: (s: string) => void; delete: () => void };
-      Paths: { appleSharedContainers: Record<string, unknown> };
-    };
-    const dir = Paths.appleSharedContainers[APP_GROUP_ID];
-    // The group key only appears when the app's signed entitlements
-    // include it. Absent ⇒ entitlements not in this build; skip silently.
-    if (!dir) return null;
-    return new File(dir, SHARED_CREDS_FILENAME);
+    bridge = loadBridge();
   } catch {
+    // Native modules not loadable (non-RN test/web bundle) — no-op.
     return null;
   }
+  if (bridge.platformOS !== "ios") return null;
+  const dir = bridge.appleSharedContainers[APP_GROUP_ID];
+  // The group key only appears when the app's signed entitlements
+  // include it. Absent ⇒ entitlements not in this build; skip silently.
+  if (!dir) return null;
+  return new bridge.File(dir, SHARED_CREDS_FILENAME);
 }
+
+// The active resolver. Swapped by tests via __setSharedFileResolverForTests
+// and restored afterward; production code never touches it.
+let resolveSharedFile: SharedFileResolver = defaultResolveSharedFile;
 
 // Write the credentials the NSE needs into the shared container. Called
 // on credential save and after push registration so the file always
 // reflects the live gateway + token. Best-effort: any failure is
 // swallowed so it can never block the auth/registration flow.
 export function writeSharedCredentials(creds: SharedCredentials): void {
-  const file = resolveSharedFile();
+  let file: SharedFile | null;
+  try {
+    file = resolveSharedFile();
+  } catch {
+    return;
+  }
   if (!file) return;
   try {
     // write() creates the file if absent and overwrites otherwise (v56
@@ -86,7 +133,12 @@ export function writeSharedCredentials(creds: SharedCredentials): void {
 // keep fetching with a stale bearer after the user logs out. Best-effort
 // like the write — a missing file or delete failure is harmless.
 export function clearSharedCredentials(): void {
-  const file = resolveSharedFile();
+  let file: SharedFile | null;
+  try {
+    file = resolveSharedFile();
+  } catch {
+    return;
+  }
   if (!file) return;
   try {
     file.delete();
@@ -94,4 +146,14 @@ export function clearSharedCredentials(): void {
     // Already gone or undeletable — nothing to do; the next sign-in
     // overwrites it anyway.
   }
+}
+
+// Test seam: swap the resolver (and restore it) so the bridge can be
+// exercised without a global react-native / expo-file-system mock.
+export function __setSharedFileResolverForTests(resolver: SharedFileResolver): void {
+  resolveSharedFile = resolver;
+}
+
+export function __resetSharedFileResolverForTests(): void {
+  resolveSharedFile = defaultResolveSharedFile;
 }

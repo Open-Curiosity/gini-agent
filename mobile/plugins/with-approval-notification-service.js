@@ -78,6 +78,16 @@ function readCanonicalSwiftSource() {
 // `com.apple.usernotifications.service` for an NSE) and
 // NSExtensionPrincipalClass (the Swift class name, prefixed with the
 // target name so Objective-C can resolve it).
+//
+// App Transport Security: an app extension is a separate bundle and does
+// NOT inherit the host app's ATS exception, so we must repeat it here.
+// The host app sets NSAllowsArbitraryLoads (mobile/app.json) so it can
+// reach local http:// gateways (loopback / RFC1918 / CGNAT / *.local —
+// see mobile/src/auth.ts isLocalGatewayHost). Without the same exception
+// on the NSE, the on-device preview fetch (NotificationService.swift)
+// would be blocked by ATS for those gateways and silently fall back to
+// the generic banner. Mirror the host app's posture so the rich preview
+// works for the same gateway set the app already talks to.
 function buildExtensionInfoPlist(opts) {
   return {
     CFBundleDevelopmentRegion: "$(DEVELOPMENT_LANGUAGE)",
@@ -89,6 +99,9 @@ function buildExtensionInfoPlist(opts) {
     CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)",
     CFBundleShortVersionString: "1.0",
     CFBundleVersion: "1",
+    NSAppTransportSecurity: {
+      NSAllowsArbitraryLoads: true
+    },
     NSExtension: {
       NSExtensionPointIdentifier: "com.apple.usernotifications.service",
       // The principal class is `<TargetName>.NotificationService` —

@@ -169,27 +169,32 @@ function promptIdOf(block: PendingPromptBlock): string {
 
 export function buildApprovalPayload(block: PendingPromptBlock): APNsPayload {
   const isSetup = block.kind === "setup_requested";
-  return {
-    aps: {
-      alert: {
-        title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
-        body: "Tap to review"
-      },
-      sound: "default",
-      // `thread-id` groups multiple notifications under a single
-      // stack in iOS's notification center. Using sessionId means a
-      // chat with several approvals collapses to one stack instead
-      // of flooding the lock screen.
-      "thread-id": block.sessionId,
-      // `mutable-content: 1` lets the Notification Service Extension
-      // (Step 4) modify the payload before display — required for
-      // the inline Approve/Deny actions to be wired up later.
-      "mutable-content": 1,
-      // `category` ties the notification to the iOS-side
-      // UNNotificationCategory that defines the Approve/Deny
-      // actions. The mobile app registers the category on launch.
-      category: "APPROVAL_REQUEST"
+  const aps: Record<string, unknown> = {
+    alert: {
+      title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
+      body: "Tap to review"
     },
+    sound: "default",
+    // `thread-id` groups multiple notifications under a single
+    // stack in iOS's notification center. Using sessionId means a
+    // chat with several approvals collapses to one stack instead
+    // of flooding the lock screen.
+    "thread-id": block.sessionId,
+    // `mutable-content: 1` lets the Notification Service Extension
+    // modify the payload before display — required both for the
+    // inline Approve/Deny actions and for the on-device preview fetch.
+    "mutable-content": 1
+  };
+  // `category` ties the notification to the iOS-side
+  // UNNotificationCategory that defines the Approve/Deny actions —
+  // attach it ONLY for authorization_requested. A setup_requested is a
+  // user-action flow (open a browser, fill a form) with no approve/deny
+  // semantics, and its id is a setup id that the Approve/Deny handler's
+  // POST /api/authorizations/:id route can't resolve. Setup pushes
+  // deep-link into the app on tap instead.
+  if (!isSetup) aps.category = "APPROVAL_REQUEST";
+  return {
+    aps,
     // expo-notifications reads remote-push custom data from
     // userInfo["body"], not top-level userInfo keys — top-level fields
     // are dropped on the client. Wrapping our routing payload in a

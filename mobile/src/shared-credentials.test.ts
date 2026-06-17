@@ -1,75 +1,60 @@
 // Unit tests for the App Group credential bridge. Pins:
-//   - iOS-only: non-iOS platforms no-op (never touch the native module)
-//   - write/clear resolve the shared-container File via
-//     Paths.appleSharedContainers[APP_GROUP_ID]
-//   - a missing App Group key (unsigned entitlements) no-ops silently
-//   - native errors are swallowed so the auth/registration flow is safe
+//   - write/clear route through the injected resolver
+//   - a null resolver (non-iOS, missing entitlement) no-ops silently
+//   - native errors (write/delete throw, or the resolver throws) are
+//     swallowed so the auth/registration flow is safe
+//
+// The resolver is injected via __setSharedFileResolverForTests rather than
+// a global mock.module("react-native"). A process-wide react-native mock
+// leaks into sibling test files (they lose StyleSheet etc.), so the
+// dependency-injection seam keeps this test fully isolated.
 
-import { describe, expect, test, mock, beforeEach } from "bun:test";
-
-// react-native's Platform is the only RN surface this module reads. Stub
-// it so the OS branch is controllable from each test via a mutable holder.
-const platform = { OS: "ios" as string };
-mock.module("react-native", () => ({ Platform: platform }));
-
-// Controllable expo-file-system stub. `containers` is the
-// appleSharedContainers record; `fileOps` records write/delete calls and
-// can be told to throw. A fresh File instance is handed back per
-// construction so we can assert what was written.
-interface FileSpy {
-  written: string[];
-  deleted: number;
-  throwOnWrite: boolean;
-  throwOnDelete: boolean;
-}
-let fileSpy: FileSpy;
-let containers: Record<string, unknown>;
-// When set, the appleSharedContainers getter throws — exercising the
-// outer try/catch that guards the whole native-resolution path.
-let throwOnContainers = false;
-
-class FakeFile {
-  constructor(public dir: unknown, public name: string) {}
-  write(s: string): void {
-    if (fileSpy.throwOnWrite) throw new Error("disk full");
-    fileSpy.written.push(s);
-  }
-  delete(): void {
-    if (fileSpy.throwOnDelete) throw new Error("no such file");
-    fileSpy.deleted += 1;
-  }
-}
-
-mock.module("expo-file-system", () => ({
-  File: FakeFile,
-  Paths: {
-    get appleSharedContainers() {
-      if (throwOnContainers) throw new Error("native module unavailable");
-      return containers;
-    }
-  }
-}));
-
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import {
   APP_GROUP_ID,
   SHARED_CREDS_FILENAME,
   writeSharedCredentials,
-  clearSharedCredentials
+  clearSharedCredentials,
+  defaultResolveSharedFile,
+  loadNativeBridge,
+  __setSharedFileResolverForTests,
+  __resetSharedFileResolverForTests,
+  type SharedFile,
+  type NativeBridge
 } from "./shared-credentials";
 
-beforeEach(() => {
-  platform.OS = "ios";
-  throwOnContainers = false;
-  fileSpy = { written: [], deleted: 0, throwOnWrite: false, throwOnDelete: false };
-  // Default: the App Group container resolves to a directory handle.
-  containers = { [APP_GROUP_ID]: { uri: "file:///shared/" } };
+interface FileSpy extends SharedFile {
+  written: string[];
+  deleted: number;
+}
+
+function makeFileSpy(opts?: { throwOnWrite?: boolean; throwOnDelete?: boolean }): FileSpy {
+  const spy: FileSpy = {
+    written: [],
+    deleted: 0,
+    write(contents: string) {
+      if (opts?.throwOnWrite) throw new Error("disk full");
+      spy.written.push(contents);
+    },
+    delete() {
+      if (opts?.throwOnDelete) throw new Error("no such file");
+      spy.deleted += 1;
+    }
+  };
+  return spy;
+}
+
+afterEach(() => {
+  __resetSharedFileResolverForTests();
 });
 
 describe("writeSharedCredentials", () => {
   test("writes the credentials JSON into the shared-container file", () => {
+    const file = makeFileSpy();
+    __setSharedFileResolverForTests(() => file);
     writeSharedCredentials({ baseUrl: "https://gw.example", token: "bearer123", deviceToken: "dev456" });
-    expect(fileSpy.written).toHaveLength(1);
-    expect(JSON.parse(fileSpy.written[0]!)).toEqual({
+    expect(file.written).toHaveLength(1);
+    expect(JSON.parse(file.written[0]!)).toEqual({
       baseUrl: "https://gw.example",
       token: "bearer123",
       deviceToken: "dev456"
@@ -77,58 +62,116 @@ describe("writeSharedCredentials", () => {
   });
 
   test("writes without a device token when none is supplied", () => {
+    const file = makeFileSpy();
+    __setSharedFileResolverForTests(() => file);
     writeSharedCredentials({ baseUrl: "https://gw.example", token: "bearer123" });
-    expect(JSON.parse(fileSpy.written[0]!)).toEqual({
+    expect(JSON.parse(file.written[0]!)).toEqual({
       baseUrl: "https://gw.example",
       token: "bearer123"
     });
   });
 
-  test("no-ops on non-iOS platforms", () => {
-    platform.OS = "android";
-    writeSharedCredentials({ baseUrl: "https://gw.example", token: "t" });
-    expect(fileSpy.written).toHaveLength(0);
-  });
-
-  test("no-ops when the App Group key is absent (entitlements not signed in)", () => {
-    containers = {};
-    writeSharedCredentials({ baseUrl: "https://gw.example", token: "t" });
-    expect(fileSpy.written).toHaveLength(0);
+  test("no-ops when the resolver returns null (non-iOS / missing entitlement)", () => {
+    __setSharedFileResolverForTests(() => null);
+    expect(() => writeSharedCredentials({ baseUrl: "https://gw.example", token: "t" })).not.toThrow();
   });
 
   test("swallows a native write error so the auth flow never breaks", () => {
-    fileSpy.throwOnWrite = true;
+    const file = makeFileSpy({ throwOnWrite: true });
+    __setSharedFileResolverForTests(() => file);
     expect(() => writeSharedCredentials({ baseUrl: "https://gw.example", token: "t" })).not.toThrow();
   });
 
-  test("swallows a native-resolution failure (module getter throws)", () => {
-    throwOnContainers = true;
+  test("swallows a resolver failure (native module unavailable)", () => {
+    __setSharedFileResolverForTests(() => {
+      throw new Error("native module unavailable");
+    });
     expect(() => writeSharedCredentials({ baseUrl: "https://gw.example", token: "t" })).not.toThrow();
-    expect(fileSpy.written).toHaveLength(0);
   });
 });
 
 describe("clearSharedCredentials", () => {
   test("deletes the shared-container file", () => {
+    const file = makeFileSpy();
+    __setSharedFileResolverForTests(() => file);
     clearSharedCredentials();
-    expect(fileSpy.deleted).toBe(1);
+    expect(file.deleted).toBe(1);
   });
 
-  test("no-ops on non-iOS platforms", () => {
-    platform.OS = "web";
-    clearSharedCredentials();
-    expect(fileSpy.deleted).toBe(0);
-  });
-
-  test("no-ops when the App Group key is absent", () => {
-    containers = {};
-    clearSharedCredentials();
-    expect(fileSpy.deleted).toBe(0);
+  test("no-ops when the resolver returns null", () => {
+    __setSharedFileResolverForTests(() => null);
+    expect(() => clearSharedCredentials()).not.toThrow();
   });
 
   test("swallows a delete error (file already gone)", () => {
-    fileSpy.throwOnDelete = true;
+    const file = makeFileSpy({ throwOnDelete: true });
+    __setSharedFileResolverForTests(() => file);
     expect(() => clearSharedCredentials()).not.toThrow();
+  });
+
+  test("swallows a resolver failure", () => {
+    __setSharedFileResolverForTests(() => {
+      throw new Error("native module unavailable");
+    });
+    expect(() => clearSharedCredentials()).not.toThrow();
+  });
+});
+
+describe("defaultResolveSharedFile", () => {
+  class FakeFile implements SharedFile {
+    constructor(public dir: unknown, public name: string) {}
+    write(): void {}
+    delete(): void {}
+  }
+
+  function bridge(overrides?: Partial<NativeBridge>): NativeBridge {
+    return {
+      platformOS: "ios",
+      File: FakeFile,
+      appleSharedContainers: { [APP_GROUP_ID]: { uri: "file:///shared/" } },
+      ...overrides
+    };
+  }
+
+  test("returns a File in the App Group container on iOS with the group present", () => {
+    const file = defaultResolveSharedFile(() => bridge()) as FakeFile;
+    expect(file).toBeInstanceOf(FakeFile);
+    expect(file.name).toBe(SHARED_CREDS_FILENAME);
+  });
+
+  test("returns null on non-iOS", () => {
+    expect(defaultResolveSharedFile(() => bridge({ platformOS: "android" }))).toBeNull();
+  });
+
+  test("returns null when the App Group key is absent (entitlement not signed in)", () => {
+    expect(defaultResolveSharedFile(() => bridge({ appleSharedContainers: {} }))).toBeNull();
+  });
+
+  test("returns null when the native bridge fails to load", () => {
+    expect(
+      defaultResolveSharedFile(() => {
+        throw new Error("native module unavailable");
+      })
+    ).toBeNull();
+  });
+});
+
+describe("loadNativeBridge", () => {
+  test("shapes the injected native modules into a NativeBridge", () => {
+    class FakeFile implements SharedFile {
+      write(): void {}
+      delete(): void {}
+    }
+    const containers = { [APP_GROUP_ID]: { uri: "file:///shared/" } };
+    const req = (id: string): unknown => {
+      if (id === "react-native") return { Platform: { OS: "ios" } };
+      if (id === "expo-file-system") return { File: FakeFile, Paths: { appleSharedContainers: containers } };
+      throw new Error(`unexpected require: ${id}`);
+    };
+    const bridge = loadNativeBridge(req);
+    expect(bridge.platformOS).toBe("ios");
+    expect(bridge.File).toBe(FakeFile);
+    expect(bridge.appleSharedContainers).toBe(containers);
   });
 });
 

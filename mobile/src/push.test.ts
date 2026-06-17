@@ -57,26 +57,29 @@ function buildSpyDeps(opts?: {
 }
 
 describe("dispatchNotificationResponse", () => {
-  test("APPROVE action posts to /approvals/:id/approve and returns approve outcome", async () => {
+  test("APPROVE action posts to /authorizations/:id/approve and returns approve outcome", async () => {
     const deps = buildSpyDeps();
     const outcome = await dispatchNotificationResponse(
-      buildResponse(APPROVE_ACTION, { approvalId: "appr_1", sessionId: "chat_1" }),
+      buildResponse(APPROVE_ACTION, { approvalId: "authz_1", sessionId: "chat_1" }),
       deps
     );
-    expect(outcome).toEqual({ kind: "approve", approvalId: "appr_1" });
-    expect(deps.calls.api).toEqual([{ path: "/approvals/appr_1/approve", method: "POST" }]);
+    expect(outcome).toEqual({ kind: "approve", approvalId: "authz_1" });
+    // Posts to the canonical /authorizations/:id route (renamed away from
+    // the old /approvals/:id) — the approvalId on an authorization push is
+    // the authorization id.
+    expect(deps.calls.api).toEqual([{ path: "/authorizations/authz_1/approve", method: "POST" }]);
     expect(deps.calls.navigate).toEqual([]);
     expect(deps.calls.notifyFailure).toEqual([]);
   });
 
-  test("DENY action posts to /approvals/:id/deny", async () => {
+  test("DENY action posts to /authorizations/:id/deny", async () => {
     const deps = buildSpyDeps();
     const outcome = await dispatchNotificationResponse(
-      buildResponse(DENY_ACTION, { approvalId: "appr_2" }),
+      buildResponse(DENY_ACTION, { approvalId: "authz_2" }),
       deps
     );
-    expect(outcome).toEqual({ kind: "deny", approvalId: "appr_2" });
-    expect(deps.calls.api).toEqual([{ path: "/approvals/appr_2/deny", method: "POST" }]);
+    expect(outcome).toEqual({ kind: "deny", approvalId: "authz_2" });
+    expect(deps.calls.api).toEqual([{ path: "/authorizations/authz_2/deny", method: "POST" }]);
   });
 
   test("APPROVE failure schedules a follow-up local notification", async () => {
