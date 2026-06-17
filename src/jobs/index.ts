@@ -475,6 +475,16 @@ function findRunningRun(state: RuntimeState, jobId: string): JobRunRecord | unde
   return state.jobRuns.find((run) => run.jobId === jobId && run.status === "running");
 }
 
+// A "live turn" is a non-terminal task bound to this session that was NOT
+// spawned by a job (job-spawned tasks carry `jobId`). Used to defer a
+// scheduled chat-bound job while the user's own conversation turn is in
+// flight, so the job's messages never interleave with the active turn.
+function sessionHasActiveLiveTurn(state: RuntimeState, sessionId: string): boolean {
+  return state.tasks.some(
+    (t) => t.chatSessionId === sessionId && t.jobId === undefined && !isTerminalTaskStatus(t.status)
+  );
+}
+
 // Drift-free advance: starting from the previous nextRunAt, advance forward
 // by intervalSeconds until the next scheduled time is in the future. The
 // first advance consumes the run we just claimed; each subsequent advance is
@@ -826,6 +836,13 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // for the same job is still in-flight. Leave nextRunAt alone — the
       // next tick will retry once the in-flight run completes.
       if (findRunningRun(state, job.id)) continue;
+
+      // Defer a chat-bound job while its session has a live (user-initiated)
+      // turn in flight, so the job's messages never interleave with the active
+      // conversation. Leave nextRunAt untouched — the ~1s-tick scheduler
+      // retries once the live turn finishes. Mirrors the overlap-protection
+      // skip above.
+      if (job.chatSessionId && sessionHasActiveLiveTurn(state, job.chatSessionId)) continue;
 
       // Drift-free nextRunAt + missedRuns. The first advance consumes the
       // tick we're claiming now; each additional advance is a missed run.
