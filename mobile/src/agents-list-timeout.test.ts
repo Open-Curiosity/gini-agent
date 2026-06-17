@@ -132,11 +132,17 @@ function waitForSettleOrTimeout(
     error: unknown;
   }>();
   let done = false;
+  // Declared before subscribe so finish() can reference them even if
+  // subscribe() were to notify synchronously (the bindings are assigned
+  // below; using `let` avoids a temporal-dead-zone reference if check()
+  // fires during subscribe()).
+  let unsubscribe: (() => void) | undefined;
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
   const finish = (settled: boolean) => {
     if (done) return;
     done = true;
-    unsubscribe();
-    clearTimeout(budgetTimer);
+    unsubscribe?.();
+    if (budgetTimer) clearTimeout(budgetTimer);
     const r = observer.getCurrentResult();
     resolve({ settled, status: r.status, error: r.error });
   };
@@ -146,8 +152,8 @@ function waitForSettleOrTimeout(
     // it has either succeeded or errored — the spinner condition clears.
     if (!r.isLoading) finish(true);
   };
-  const unsubscribe = observer.subscribe(check);
-  const budgetTimer = setTimeout(() => finish(false), budgetMs);
+  unsubscribe = observer.subscribe(check);
+  budgetTimer = setTimeout(() => finish(false), budgetMs);
   // Evaluate the initial state too in case it's already settled.
   check();
   return promise;
@@ -171,15 +177,17 @@ describe("issue #396 — agents-list infinite spinner on a never-answering gatew
     "useAgents query settles into ERROR (does not latch on loading) when /agents never responds",
     async () => {
       const client = makeAppQueryClient();
-      // This mirrors useAgents() exactly: queryKey ["agents"], queryFn
-      // () => api("/agents"). The only difference from production is the
-      // short timeoutMs — the production GET path uses GET_TIMEOUT_MS
-      // (10_000) via the identical AbortController code path. We pass it
-      // explicitly so the test settles in 1300ms (150 + 1000 retry backoff
-      // + 150) not 10s.
+      // Mirror useAgents() exactly: queryKey ["agents"], queryFn
+      // () => api("/agents") with NO forwarded signal (production doesn't
+      // forward React Query's signal, and the fix doesn't depend on it —
+      // the internal timeout is what settles the query). The only
+      // difference from production is the short timeoutMs: the production
+      // GET path uses GET_TIMEOUT_MS (10_000) via the identical
+      // AbortController code path; we pass 150 so the test settles in
+      // 1300ms (150 + 1000 retry backoff + 150) not 10s.
       const observer = new QueryObserver(client, {
         queryKey: ["agents"],
-        queryFn: ({ signal }) => api("/agents", { timeoutMs: 150, signal })
+        queryFn: () => api("/agents", { timeoutMs: 150 })
       });
 
       // Budget = 6000ms: comfortably longer than the 150ms timeout + the
@@ -231,6 +239,6 @@ describe("issue #396 — agents-list infinite spinner on a never-answering gatew
 // default timeout (no per-call timeoutMs). This documents that the same
 // abort machine the tests above drive with timeoutMs:150 is what fires at
 // GET_TIMEOUT_MS (10s) for the real /agents GET in prod.
-afterAll(() => {
-  void clearCredentials();
+afterAll(async () => {
+  await clearCredentials();
 });
