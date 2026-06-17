@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   bedrockSupportsStreamingWithTools,
   bedrockSupportsToolUse,
+  estimateUsd,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
   resolveImageByteLimit,
+  resolveModelPricing,
   resolveProviderContextWindowTokens,
   resolveProviderModality
 } from "./provider-capabilities";
@@ -13,6 +15,46 @@ import type { ProviderConfig } from "./types";
 function provider(name: ProviderConfig["name"], model: string): ProviderConfig {
   return { name, model };
 }
+
+describe("resolveModelPricing", () => {
+  test("routes representative model ids to the right per-million rates", () => {
+    expect(resolveModelPricing(provider("anthropic", "claude-opus-4-8"))).toEqual({ inputPerMillion: 5, outputPerMillion: 25 });
+    expect(resolveModelPricing(provider("anthropic", "claude-fable-5"))).toEqual({ inputPerMillion: 10, outputPerMillion: 50 });
+    // Bedrock-prefixed ids resolve to the same first-party row.
+    expect(resolveModelPricing(provider("bedrock", "us.anthropic.claude-sonnet-4-6"))).toEqual({ inputPerMillion: 3, outputPerMillion: 15 });
+    expect(resolveModelPricing(provider("anthropic", "claude-haiku-4-5"))).toEqual({ inputPerMillion: 1, outputPerMillion: 5 });
+  });
+
+  test("orders specific patterns before broad ones", () => {
+    // gpt-5 mini/nano must win over the broad gpt-5 row.
+    expect(resolveModelPricing(provider("openai", "gpt-5.4-mini"))).toEqual({ inputPerMillion: 0.25, outputPerMillion: 2 });
+    expect(resolveModelPricing(provider("codex", "gpt-5.5"))).toEqual({ inputPerMillion: 1.25, outputPerMillion: 10 });
+    // deepseek-reasoner must win over the broad deepseek row.
+    expect(resolveModelPricing(provider("openrouter", "deepseek-reasoner"))).toEqual({ inputPerMillion: 0.55, outputPerMillion: 2.19 });
+    expect(resolveModelPricing(provider("openrouter", "deepseek-v4-flash"))).toEqual({ inputPerMillion: 0.27, outputPerMillion: 1.1 });
+  });
+
+  test("returns undefined for an unpriced or empty model", () => {
+    expect(resolveModelPricing(provider("local", "some-unknown-model"))).toBeUndefined();
+    expect(resolveModelPricing(provider("echo", ""))).toBeUndefined();
+  });
+});
+
+describe("estimateUsd", () => {
+  test("computes USD from input/output token counts at the model's rates", () => {
+    // opus 4.8 = $5/$25 per MTok → 100 in + 20 out = $0.0005 + $0.0005 = $0.001.
+    expect(estimateUsd(provider("anthropic", "claude-opus-4-8"), 100, 20)).toBeCloseTo(0.001, 9);
+  });
+
+  test("returns undefined (not 0) for an unpriced model so the figure stays absent", () => {
+    expect(estimateUsd(provider("local", "unknown"), 1000, 1000)).toBeUndefined();
+  });
+
+  test("treats missing or non-finite token counts as zero", () => {
+    expect(estimateUsd(provider("anthropic", "claude-opus-4-8"), undefined, undefined)).toBe(0);
+    expect(estimateUsd(provider("anthropic", "claude-opus-4-8"), Number.NaN, 20)).toBeCloseTo(0.0005, 9);
+  });
+});
 
 describe("resolveProviderModality", () => {
   test("known openai families support vision and native docs", () => {

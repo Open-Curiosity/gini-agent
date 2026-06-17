@@ -165,7 +165,7 @@ function tooltip(day: UsageDay): string {
   const total = day.input + day.output;
   const header = `${formatDay(day.dayStart)} — ${day.input.toLocaleString()} in · ${day.output.toLocaleString()} out (${total.toLocaleString()} tokens · ${formatUsd(day.estimatedUsd)})`;
   const sources = Object.entries(day.bySource)
-    .map(([source, s]) => ({ source, tokens: s.input + s.output }))
+    .map(([source, s]) => ({ source, tokens: (s?.input ?? 0) + (s?.output ?? 0) }))
     .filter((s) => s.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens)
     .map((s) => `${s.source}: ${s.tokens.toLocaleString()}`);
