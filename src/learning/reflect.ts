@@ -169,15 +169,23 @@ export async function reflectOnSkillOutcomes(
   const providerOverride = providerOverrideForRuntime(config);
   let proposalsCreated = 0;
   let findingsCreated = 0;
-  const reviewedIds: string[] = [];
+  // Each reviewed row carries the batch's classification so it is persisted on
+  // the outcome (not discarded) — a defectClass-aware reliability score and the
+  // over-time view depend on knowing which failures the skill actually owns.
+  const reviewedRows: Array<{
+    id: string;
+    defectClass?: ReflectionVerdict["defectClass"];
+    attributable?: boolean;
+  }> = [];
 
   for (const [skillId, batch] of bySkill) {
     // Anti-overfit floor: a skill needs >= 2 attributed failures.
     if (batch.length < MIN_FAILURES_TO_OPTIMIZE) continue;
     const skill = state.skills.find((s) => s.id === skillId);
     if (!skill) {
-      // The skill is gone — mark the outcomes reviewed so they don't linger.
-      reviewedIds.push(...batch.map((b) => b.id));
+      // The skill is gone — mark the outcomes reviewed so they don't linger
+      // (no verdict was computed, so no classification to stamp).
+      reviewedRows.push(...batch.map((b) => ({ id: b.id })));
       continue;
     }
 
@@ -220,8 +228,15 @@ export async function reflectOnSkillOutcomes(
     }
 
     // The batch is being processed (proposed, routed to a finding, or dropped)
-    // — mark it reviewed so a later pass doesn't re-reflect it.
-    reviewedIds.push(...batch.map((b) => b.id));
+    // — mark it reviewed so a later pass doesn't re-reflect it, and persist the
+    // verdict's classification onto each row.
+    reviewedRows.push(
+      ...batch.map((b) => ({
+        id: b.id,
+        defectClass: verdict.defectClass,
+        attributable: verdict.attributable
+      }))
+    );
 
     if (verdict.defectClass === "skill_defect") {
       if (actionableUserEdit) {
@@ -289,18 +304,27 @@ export async function reflectOnSkillOutcomes(
     // transient / unknown -> dropped (outcomes already marked reviewed).
   }
 
-  if (reviewedIds.length > 0) {
-    await markReviewed(config, reviewedIds);
+  if (reviewedRows.length > 0) {
+    await markReviewed(config, reviewedRows);
   }
 
-  return { proposalsCreated, findingsCreated, outcomesReviewed: reviewedIds.length };
+  return { proposalsCreated, findingsCreated, outcomesReviewed: reviewedRows.length };
 }
 
-async function markReviewed(config: RuntimeConfig, ids: string[]): Promise<void> {
-  const set = new Set(ids);
+async function markReviewed(
+  config: RuntimeConfig,
+  rows: Array<{ id: string; defectClass?: ReflectionVerdict["defectClass"]; attributable?: boolean }>
+): Promise<void> {
+  const byId = new Map(rows.map((r) => [r.id, r]));
   await mutateState(config.instance, (state) => {
     for (const outcome of state.skillOutcomes) {
-      if (set.has(outcome.id)) outcome.reviewed = true;
+      const row = byId.get(outcome.id);
+      if (!row) continue;
+      outcome.reviewed = true;
+      // Persist the classification we already paid an LLM to compute, so the
+      // score can exclude non-skill failures instead of discarding the verdict.
+      if (row.defectClass !== undefined) outcome.defectClass = row.defectClass;
+      if (row.attributable !== undefined) outcome.attributable = row.attributable;
     }
   });
 }

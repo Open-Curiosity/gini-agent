@@ -83,6 +83,42 @@ describe("skill-learning CRUD", () => {
     expect(a.id.startsWith("skillout_")).toBe(true);
   });
 
+  test("retention is per-skill — a chatty skill can't evict a quiet skill's rows", () => {
+    const state = createEmptyState("inst");
+    // A quiet skill logs one outcome first.
+    const quiet = createSkillOutcome(state, {
+      taskId: "task_quiet",
+      skillId: "skill_quiet",
+      signal: "success",
+      source: "objective",
+      consequential: false,
+      selfVerifiable: true,
+      reviewed: false,
+      feedbackPrompted: false
+    });
+    // A chatty skill then logs far more than the per-skill cap (100).
+    for (let i = 0; i < 250; i += 1) {
+      createSkillOutcome(state, {
+        taskId: `task_chatty_${i}`,
+        skillId: "skill_chatty",
+        signal: "failure",
+        source: "objective",
+        consequential: false,
+        selfVerifiable: true,
+        reviewed: false,
+        feedbackPrompted: false
+      });
+    }
+    const chattyRows = state.skillOutcomes.filter((o) => o.skillId === "skill_chatty");
+    const quietRows = state.skillOutcomes.filter((o) => o.skillId === "skill_quiet");
+    // The chatty skill is capped at its per-skill limit...
+    expect(chattyRows.length).toBe(100);
+    // ...and the quiet skill's single row survives — a global ring would have
+    // evicted it long ago.
+    expect(quietRows).toHaveLength(1);
+    expect(quietRows[0]!.id).toBe(quiet.id);
+  });
+
   test("createLearningFinding defaults status open", () => {
     const state = createEmptyState("inst");
     const finding = createLearningFinding(state, {

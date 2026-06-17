@@ -2103,6 +2103,10 @@ export interface SkillOutcome {
   // status) so the outcome could be judged without asking the human.
   selfVerifiable: boolean;
   defectClass?: DefectClass;
+  // Whether the reflection judged the failure attributable to the skill itself
+  // (vs an environment/credential/model cause). Stamped alongside defectClass
+  // when the batch is reviewed; absent until a reflection pass has classified it.
+  attributable?: boolean;
   // Set once the reflection pass has consumed this row into a proposal/finding.
   reviewed: boolean;
   // Set once the daily review has asked the user about this (success) outcome.

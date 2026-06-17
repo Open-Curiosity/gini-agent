@@ -207,6 +207,12 @@ describe("reflectOnSkillOutcomes", () => {
     const finding = readState(instance).learningFindings[0]!;
     expect(finding.kind).toBe("credential");
     expect(finding.summary).toContain("reconnect");
+    // The verdict's classification is PERSISTED onto the consumed outcomes (not
+    // discarded), so a defectClass-aware score can exclude this non-skill cause.
+    const reviewed = readState(instance).skillOutcomes.filter((o) => o.reviewed);
+    expect(reviewed.length).toBeGreaterThan(0);
+    expect(reviewed.every((o) => o.defectClass === "credential")).toBe(true);
+    expect(reviewed.every((o) => o.attributable === false)).toBe(true);
   });
 
   test("the >= 2 floor holds — a single failure is not optimized", async () => {

@@ -585,8 +585,12 @@ export function createImprovementProposal(
 
 // Newest-first ring caps for the skill-learning rows. Bounded so the harvest
 // loop can never grow durable state without limit (same posture as the
-// pairing/audit rings).
-const MAX_SKILL_OUTCOMES = 500;
+// pairing/audit rings). skillOutcomes is capped PER SKILL, not globally — a
+// global ring lets a high-volume skill evict a quiet skill's history, which
+// would corrupt any per-skill reliability metric (one skill's N depending on
+// another's activity). A generous global ceiling backstops total memory.
+const MAX_SKILL_OUTCOMES_PER_SKILL = 100;
+const MAX_SKILL_OUTCOMES = 5000;
 const MAX_LEARNING_FINDINGS = 500;
 
 // Record one skill-learning outcome (ADR skill-learning-from-outcomes.md).
@@ -602,6 +606,18 @@ export function createSkillOutcome(
     ...outcome
   };
   state.skillOutcomes.unshift(item);
+  // Trim only the inserted row's skill bucket to its per-skill cap (newest-first
+  // order keeps the most recent). Other skills' rows are untouched, so a chatty
+  // skill never crowds out a quiet one. The unattributed bucket (no skillId)
+  // shares one key.
+  const key = item.skillId ?? "";
+  let kept = 0;
+  state.skillOutcomes = state.skillOutcomes.filter((o) => {
+    if ((o.skillId ?? "") !== key) return true;
+    kept += 1;
+    return kept <= MAX_SKILL_OUTCOMES_PER_SKILL;
+  });
+  // Global backstop across all skills.
   if (state.skillOutcomes.length > MAX_SKILL_OUTCOMES) {
     state.skillOutcomes = state.skillOutcomes.slice(0, MAX_SKILL_OUTCOMES);
   }
