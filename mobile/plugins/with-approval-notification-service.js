@@ -88,6 +88,14 @@ function readCanonicalSwiftSource() {
 // would be blocked by ATS for those gateways and silently fall back to
 // the generic banner. Mirror the host app's posture so the rich preview
 // works for the same gateway set the app already talks to.
+//
+// Version strings track the host app via the shared build settings
+// $(MARKETING_VERSION) / $(CURRENT_PROJECT_VERSION). Apple requires an
+// extension's CFBundleShortVersionString + CFBundleVersion to match its
+// containing app, so hardcoding (e.g. "1.0"/"1") fails archive validation
+// when the app version differs. The expo-build-properties / prebuild
+// pipeline stamps these build settings on every target from app.json's
+// version, so referencing them keeps the NSE in lockstep automatically.
 function buildExtensionInfoPlist(opts) {
   return {
     CFBundleDevelopmentRegion: "$(DEVELOPMENT_LANGUAGE)",
@@ -97,8 +105,8 @@ function buildExtensionInfoPlist(opts) {
     CFBundleInfoDictionaryVersion: "6.0",
     CFBundleName: "$(PRODUCT_NAME)",
     CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)",
-    CFBundleShortVersionString: "1.0",
-    CFBundleVersion: "1",
+    CFBundleShortVersionString: "$(MARKETING_VERSION)",
+    CFBundleVersion: "$(CURRENT_PROJECT_VERSION)",
     NSAppTransportSecurity: {
       NSAllowsArbitraryLoads: true
     },
@@ -273,6 +281,13 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
         // extension is signed with access to the shared container.
         buildSettings.CODE_SIGN_ENTITLEMENTS = `"${targetName}/${targetName}.entitlements"`;
         buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${productBundleId}"`;
+        // Version build settings the NSE Info.plist references via
+        // $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION). Apple requires
+        // an extension's version to match its containing app, so stamp the
+        // host app's marketing version here. CURRENT_PROJECT_VERSION mirrors
+        // the RN template default of "1" the main app ships with.
+        buildSettings.MARKETING_VERSION = opts.marketingVersion;
+        buildSettings.CURRENT_PROJECT_VERSION = "1";
         buildSettings.IPHONEOS_DEPLOYMENT_TARGET = opts.iosDeployment;
         buildSettings.SWIFT_VERSION = "5.0";
         buildSettings.SKIP_INSTALL = "NO";
@@ -297,8 +312,11 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
 // Resolves the plugin's options against a partial input. Exported so
 // the unit test can verify defaults without invoking the full plugin
 // chain. `hostBundleId` lets the App Group default derive from the app's
-// bundle id when the caller didn't pin one explicitly.
-function resolveOptions(rawOpts, hostBundleId) {
+// bundle id when the caller didn't pin one explicitly; `hostVersion` is
+// the app's marketing version (app.json `version`) so the NSE can be
+// stamped to match — Apple requires an extension's version to equal its
+// containing app's, or archive validation fails.
+function resolveOptions(rawOpts, hostBundleId, hostVersion) {
   const opts = rawOpts || {};
   const bundleId = hostBundleId || "ai.lilaclabs.gini.mobile";
   return {
@@ -306,7 +324,11 @@ function resolveOptions(rawOpts, hostBundleId) {
     bundleSuffix: opts.bundleSuffix || DEFAULT_BUNDLE_SUFFIX,
     iosDeployment: opts.iosDeployment || DEFAULT_IOS_DEPLOYMENT,
     appleTeamId: opts.appleTeamId,
-    appGroup: opts.appGroup || `group.${bundleId}`
+    appGroup: opts.appGroup || `group.${bundleId}`,
+    // Default 1.0 only when no app version is resolvable (keeps the
+    // standalone unit test deterministic); the entry point passes the
+    // real app.json version in the prebuild path.
+    marketingVersion: opts.marketingVersion || hostVersion || "1.0"
   };
 }
 
@@ -335,7 +357,11 @@ const withApprovalNotificationService = (config, rawOpts) => {
     config.ios && config.ios.bundleIdentifier
       ? config.ios.bundleIdentifier
       : "ai.lilaclabs.gini.mobile";
-  const opts = resolveOptions(rawOpts, hostBundleId);
+  // app.json `version` is the marketing version prebuild stamps onto the
+  // main app; pass it through so the NSE is stamped to match (Apple
+  // requires the versions to be equal).
+  const hostVersion = config.version;
+  const opts = resolveOptions(rawOpts, hostBundleId, hostVersion);
 
   // Mod 1: add the App Group entitlement to the MAIN app target. This is
   // the half withEntitlementsPlist can reach; the NSE target's entitlements

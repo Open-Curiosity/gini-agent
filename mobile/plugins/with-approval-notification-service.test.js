@@ -69,6 +69,25 @@ describe("with-approval-notification-service", () => {
     );
   });
 
+  test("buildExtensionInfoPlist tracks the host app version via build settings", () => {
+    // Hardcoding the version (e.g. "1.0") fails archive validation when the
+    // app's version differs; the Info.plist must reference the build
+    // settings the plugin stamps from the app version.
+    const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}));
+    expect(info.CFBundleShortVersionString).toBe("$(MARKETING_VERSION)");
+    expect(info.CFBundleVersion).toBe("$(CURRENT_PROJECT_VERSION)");
+  });
+
+  test("resolveOptions takes the host app version for the NSE marketing version", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile", "0.0.6");
+    expect(opts.marketingVersion).toBe("0.0.6");
+  });
+
+  test("resolveOptions falls back to 1.0 when no host version is resolvable", () => {
+    const opts = plugin.resolveOptions({});
+    expect(opts.marketingVersion).toBe("1.0");
+  });
+
   test("readCanonicalSwiftSource returns the on-disk NSE source", () => {
     const source = plugin.readCanonicalSwiftSource();
     // Sanity-check the class + override the OS calls into. If a

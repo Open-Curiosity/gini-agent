@@ -18,10 +18,10 @@
 //      (rare, but happens on restore-from-backup) re-registers.
 //   6. Subscribe to `addNotificationResponseReceivedListener` for tap +
 //      action handling. The category registered below pairs with the
-//      NSE attached on the server-side `approval_requested` payload —
+//      NSE attached on the server-side `authorization_requested` payload —
 //      the OS shows Approve / Deny buttons on the lock screen, and
-//      this listener routes each action to the right /api/approvals
-//      endpoint without forcing the app to foreground.
+//      this listener routes each action to the right
+//      /api/authorizations endpoint without forcing the app to foreground.
 //
 // Action handling caveat: `opensAppToForeground: false` means the OS
 // only invokes the response listener if the app is backgrounded
@@ -411,13 +411,12 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       // Response listener: handles three cases via dispatchNotificationResponse.
       //   - Default tap (no actionIdentifier set, or
       //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
-      //   - APPROVE action → POST /api/approvals/:id/approve.
-      //   - DENY action → POST /api/approvals/:id/deny.
-      // Both action endpoints are existing routes (src/http.ts:201-202)
-      // — they pre-date the push surface and already enforce auth +
-      // ownership. The action handler runs in the background while the
-      // app is suspended; iOS gives ~30s of JS time which is plenty for
-      // a single POST round-trip.
+      //   - APPROVE action → POST /api/authorizations/:id/approve.
+      //   - DENY action → POST /api/authorizations/:id/deny.
+      // Both action endpoints are existing routes — they pre-date the push
+      // surface and already enforce auth + ownership. The action handler
+      // runs in the background while the app is suspended; iOS gives up to
+      // 30s of JS time, plenty for a single POST round-trip.
       if (!responseSub) {
         responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
           void dispatchNotificationResponse(response, {

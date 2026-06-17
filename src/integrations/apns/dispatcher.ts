@@ -137,10 +137,9 @@ export function buildMessageCompletedPayload(
       // Group multiple message notifications for the same chat under
       // one stack on the lock screen (same convention as approvals).
       "thread-id": block.sessionId,
-      // `mutable-content: 1` keeps the door open for a future NSE that
-      // wants to enrich the payload (e.g. attach a preview snippet from
-      // a privileged on-device fetch). The current NSE is approval-only
-      // and treats this as a no-op.
+      // `mutable-content: 1` makes iOS invoke the NSE before display, which
+      // fetches the real message text from /api/push/preview on-device and
+      // rewrites this banner — the text never rides the wire payload.
       "mutable-content": 1
     },
     // Routing fields under `body` so expo-notifications surfaces them
