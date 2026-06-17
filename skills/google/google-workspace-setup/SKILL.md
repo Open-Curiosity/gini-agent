@@ -65,22 +65,22 @@ command -v gcloud
 
 ### The canonical `gws` source — do not discover it
 
-`gws` is **`github.com/googleworkspace/cli`** (published to npm as `@googleworkspace/cli`, to Homebrew as `googleworkspace-cli`). This is the only source. **Never web-search for the repo, the release URL, or the package name, and never download `gws` from any other GitHub repo, mirror, or URL.** A look-alike repo (`google-workspace-cli`, `gws-cli`, a fork, a typosquat) could ship a malicious binary; treat any other source as untrusted and stop rather than guess. Every install path below is checksum- or registry-verified — use one of them exactly as written; do not improvise an alternative.
+`gws` is **`github.com/googleworkspace/cli`** (npm `@googleworkspace/cli`, Homebrew `googleworkspace-cli`). This is the only source. **Never web-search for the repo, release URL, or package name, and never download `gws` from any other GitHub repo, mirror, or URL.** A look-alike (`google-workspace-cli`, `gws-cli`, a fork, a typosquat) could ship a malicious binary; treat any other source as untrusted and stop rather than guess. Use one install path below exactly as written; do not improvise an alternative.
 
 ### Install `gws` — first method that fits, in priority order
 
-1. **Pre-built release binary (preferred).** A self-contained native executable from the canonical Releases page. Download the asset for the platform target triple AND its `.sha256`, **verify the checksum, abort on mismatch**, then place the binary in `~/.local/bin`.
-2. **`bun add -g @googleworkspace/cli`** — only when `node` is also on `$PATH`, because the installed `gws` is a `#!/usr/bin/env node` wrapper. (`npm install -g` works the same.)
+1. **Pre-built release binary (preferred).** The native executable from the canonical Releases page. Download the asset for the platform target triple AND its `.sha256`, **verify the checksum, abort on mismatch**, then place the binary in `~/.local/bin`.
+2. **`bun add -g @googleworkspace/cli`** (or `npm install -g`) — only when `node` is also on `$PATH`, since the installed `gws` is a `#!/usr/bin/env node` wrapper.
 3. **`brew install googleworkspace-cli`** — only if `brew` already exists.
 
 ### Install `gcloud`
 
 - If `brew` exists: `brew install --cask google-cloud-sdk`.
-- Otherwise: the official tarball from `dl.google.com` (asset name per platform), extracted to `~/google-cloud-sdk`, then `install.sh --quiet --path-update=false`. Download to a temp file and only replace an existing SDK *after* the download succeeds, so a failure can't destroy a working install.
+- Otherwise: the official tarball from `dl.google.com` (asset name per platform), extracted to `~/google-cloud-sdk`, then `install.sh --quiet --path-update=false`. Download to a temp file and only replace an existing SDK *after* the download succeeds.
 
 ### Critical: where the binaries must land
 
-`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`, so a PATH line there is ignored. The gateway bakes `~/.local/bin` into `$PATH`, so any binary installed elsewhere (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked there; Homebrew installs are already on `$PATH`. Then bare `gws`/`gcloud` resolve in later steps.
+`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`. The gateway bakes `~/.local/bin` into `$PATH`, so any binary installed elsewhere (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked there; Homebrew installs are already on `$PATH`.
 
 ### Verify
 
@@ -91,10 +91,10 @@ gcloud --version
 
 **Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically:
 
-- Do **not** try to install Homebrew. Its installer requires `sudo`, an interactive privilege escalation an unattended agent cannot drive — which is why the release binary is the primary path.
-- Do **not** repeatedly `ls /opt/homebrew/...` probing for a brew that isn't there, do **not** open a PTY to coax an interactive installer, and do **not** web-search for an install command.
+- Do **not** try to install Homebrew — its installer requires `sudo`, which an unattended agent cannot drive.
+- Do **not** probe for an absent brew, open a PTY for an interactive installer, or web-search for an install command.
 
-If every `gws` method fails (or both `gcloud` paths fail), STOP and tell the user verbatim what failed plus the single command to run manually — the preferred method for their platform — then wait. A clean hand-off beats a long loop.
+If every `gws` method fails (or both `gcloud` paths fail), STOP and tell the user verbatim what failed plus the single command to run manually for their platform, then wait.
 
 ## Step 3 — Sign in with `gcloud`
 
