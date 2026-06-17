@@ -1,5 +1,8 @@
-import type { RuntimeConfig } from "../types";
+import { readFileSync } from "node:fs";
+import type { ImprovementProposal, RuntimeConfig, SkillEditOp } from "../types";
 import { addAudit, createImprovementProposal, createJob, createSkill, mutateState, now, readState, readTrace } from "../state";
+import { installSkillFromBody } from "../capabilities/skills";
+import { applySkillEdits } from "../learning/edits";
 
 export async function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
@@ -25,6 +28,19 @@ export async function proposeImprovement(config: RuntimeConfig, input: Record<st
 }
 
 export async function reviewImprovement(config: RuntimeConfig, proposalId: string, decision: "approve" | "reject") {
+  // Approving a skill-EDIT proposal must rewrite the on-disk SKILL.md via the
+  // async installSkillFromBody path (which runs its own mutateState + reload).
+  // applyImprovement runs SYNCHRONOUSLY inside mutateState, so it can't await
+  // that. We resolve this by handling the edit-apply OUTSIDE the state
+  // transaction in this function: the async skill write happens first, then a
+  // single mutateState flips the proposal proposed -> approved -> applied and
+  // writes the improvement.applied audit. This keeps approve->applied coherent
+  // (the status flips only after the write succeeds — a failed install leaves
+  // the proposal un-applied) and keeps the legacy create/job paths unchanged
+  // (they stay sync inside mutateState via applyImprovement).
+  const editApply = await maybeApplySkillEditOutsideTransaction(config, proposalId, decision);
+  if (editApply) return editApply;
+
   return mutateState(config.instance, (state) => {
     const proposal = state.improvements.find((candidate) => candidate.id === proposalId);
     if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
@@ -71,6 +87,127 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
   });
 }
 
+// When the proposal is an APPROVE of a skill-edit (mode:"edit") proposal,
+// perform the async on-disk rewrite here and flip status in a follow-up
+// transaction. Returns the updated proposal, or undefined when this isn't an
+// approved skill-edit (so the caller falls through to the sync path — including
+// REJECT of an edit proposal, which needs no disk write).
+async function maybeApplySkillEditOutsideTransaction(
+  config: RuntimeConfig,
+  proposalId: string,
+  decision: "approve" | "reject"
+): Promise<ImprovementProposal | undefined> {
+  if (decision !== "approve") return undefined;
+  const proposal = readState(config.instance).improvements.find((p) => p.id === proposalId);
+  if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
+  if (proposal.kind !== "skill" || proposal.payload.mode !== "edit") return undefined;
+  if (proposal.status !== "proposed" && proposal.status !== "approved") {
+    throw new Error(`Improvement proposal is already ${proposal.status}`);
+  }
+
+  const targetSkillId = String(proposal.payload.targetSkillId ?? "");
+  const skill = readState(config.instance).skills.find((s) => s.id === targetSkillId);
+  if (!skill) throw new Error(`Skill edit target not found: ${targetSkillId}`);
+  // Bundled / legacy skills are never rewritten on disk (decision #6): a
+  // recurring failure there is a finding, not an auto-edit. Refuse loudly so
+  // the reviewer sees why.
+  if ((skill.source ?? "user") !== "user" || !skill.manifestPath) {
+    throw new Error(
+      `Cannot edit skill ${skill.name}: only user skills with an on-disk SKILL.md are editable (bundled/legacy skills are propose-only).`
+    );
+  }
+
+  const edits = Array.isArray(proposal.payload.edits) ? (proposal.payload.edits as SkillEditOp[]) : [];
+  // Rebuild from the CURRENT file on disk (not the proposal's snapshot) so the
+  // edit applies to live content; split off the frontmatter, edit the body,
+  // reassemble with the original frontmatter header intact.
+  const fileText = readFileSync(skill.manifestPath, "utf8");
+  const { header, body } = splitSkillFile(fileText);
+  const result = applySkillEdits(body, edits);
+  const rebuilt = `${header}${result.body.endsWith("\n") ? result.body : `${result.body}\n`}`;
+  const installed = await installSkillFromBody(config, { body: rebuilt });
+
+  return mutateState(config.instance, (state) => {
+    const live = state.improvements.find((p) => p.id === proposalId);
+    if (!live) throw new Error(`Improvement proposal not found: ${proposalId}`);
+    live.status = "applied";
+    live.appliedTargetId = installed.skill.id;
+    live.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "improvement.applied",
+        target: live.id,
+        risk: "medium",
+        taskId: live.sourceTaskId,
+        evidence: { kind: live.kind, appliedTargetId: installed.skill.id, mode: "edit", applied: result.applied, skipped: result.skipped.length }
+      },
+      live.sourceTaskId ? { taskId: live.sourceTaskId } : { system: true }
+    );
+    return live;
+  });
+}
+
+// Split a SKILL.md into (header, body) where `header` is the original
+// frontmatter region INCLUDING the surrounding `---` delimiters and the blank
+// line that follows, so the body can be edited and reassembled byte-faithfully
+// to the original frontmatter. Falls back to an empty header (whole file is
+// body) when there's no frontmatter.
+function splitSkillFile(text: string): { header: string; body: string } {
+  const normalized = text.replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---")) return { header: "", body: normalized };
+  const after = normalized.slice(3);
+  const closeMatch = after.match(/^([\s\S]*?)\n---[ \t]*\n?/);
+  if (!closeMatch) return { header: "", body: normalized };
+  const headerLen = 3 + closeMatch[0].length;
+  let header = normalized.slice(0, headerLen);
+  let body = normalized.slice(headerLen);
+  // Preserve a single blank line between frontmatter and body if the original
+  // had one; otherwise leave the body as-is.
+  if (body.startsWith("\n")) {
+    header += "\n";
+    body = body.slice(1);
+  }
+  return { header, body };
+}
+
+// Revert an applied skill-edit proposal by re-installing its stored baseBody
+// (decision #6: approval stores the prior SKILL.md body so a regret is one
+// revert away). Only valid for an applied mode:"edit" skill proposal whose
+// target is still a user skill with a manifest. Audited as improvement.reverted.
+export async function revertImprovement(config: RuntimeConfig, proposalId: string): Promise<ImprovementProposal> {
+  const proposal = readState(config.instance).improvements.find((p) => p.id === proposalId);
+  if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
+  if (proposal.kind !== "skill" || proposal.payload.mode !== "edit") {
+    throw new Error("Only skill-edit proposals can be reverted via this path.");
+  }
+  if (proposal.status !== "applied") {
+    throw new Error(`Improvement proposal is not applied (status: ${proposal.status}).`);
+  }
+  const baseBody = typeof proposal.payload.baseBody === "string" ? proposal.payload.baseBody : "";
+  if (!baseBody.trim()) throw new Error("Proposal has no baseBody to revert to.");
+  const installed = await installSkillFromBody(config, { body: baseBody });
+  return mutateState(config.instance, (state) => {
+    const live = state.improvements.find((p) => p.id === proposalId);
+    if (!live) throw new Error(`Improvement proposal not found: ${proposalId}`);
+    live.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "improvement.reverted",
+        target: live.id,
+        risk: "medium",
+        taskId: live.sourceTaskId,
+        evidence: { appliedTargetId: installed.skill.id }
+      },
+      live.sourceTaskId ? { taskId: live.sourceTaskId } : { system: true }
+    );
+    return live;
+  });
+}
+
 function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited<ReturnType<typeof proposeImprovement>>): string {
   if (proposal.kind === "skill") {
     const skill = createSkill(state, {
@@ -106,6 +243,11 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
 
 function normalizeImprovementPayload(kind: "skill" | "job", payload: unknown): Record<string, unknown> {
   const value = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  // A skill-EDIT payload (mode:"edit") carries its own fields (targetSkillId,
+  // baseVersion, baseBody, edits, candidateBody); the create-only defaults
+  // (name/steps) don't apply, so pass it through untouched. The spread already
+  // preserves the edit fields, but skipping the defaults keeps the payload clean.
+  if (kind === "skill" && value.mode === "edit") return { ...value };
   if (kind === "skill") return { name: String(value.name ?? "Draft skill"), steps: Array.isArray(value.steps) ? value.steps : [], ...value };
   return { name: String(value.name ?? "Suggested job"), prompt: String(value.prompt ?? ""), ...value };
 }
