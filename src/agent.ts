@@ -1516,6 +1516,7 @@ const SETUP_COMPLETE_EMITS_WORKING_PHASE: Record<SetupRequestAction, boolean> = 
   "messaging.approve_pairing": true,
   "messaging.remove_bridge": true,
   "chat.choice": true,
+  "confirmation.request": true,
   "browser.connect": false,
   "skill.grant_connector": false
 };
@@ -1557,15 +1558,18 @@ export async function resolveSetupRequest(
     // chat loop so the agent can either find another path or explain that it
     // needs the connector. chat.choice cancel (the card's Skip affordance)
     // resumes the same way with a skip fallback — skipping a question must
-    // never kill the turn. Other setup cancellations still fail the owning
-    // task: those flows are user-supplied secret/login actions where there is
-    // no safe generic continuation contract yet.
+    // never kill the turn. confirmation.request cancel (the card's Cancel
+    // button) likewise resumes, with tool result {confirmed:false} so the
+    // agent holds off on the irreversible action and asks what to change.
+    // Other setup cancellations still fail the owning task: those flows are
+    // user-supplied secret/login actions where there is no safe generic
+    // continuation contract yet.
     let taskRow: Task | undefined;
     let resumeCancelledConnector = false;
     if (decision === "cancel" && item.taskId) {
       const toolCallId = approvalToolCallId(item.payload);
       const task = state.tasks.find((t) => t.id === item.taskId);
-      if ((item.action === "connector.request" || item.action === "chat.choice") && toolCallId && task && !isTerminalTaskStatus(task.status)) {
+      if ((item.action === "connector.request" || item.action === "chat.choice" || item.action === "confirmation.request") && toolCallId && task && !isTerminalTaskStatus(task.status)) {
         task.updatedAt = item.updatedAt;
         resumeCancelledConnector = true;
         return { item, task: taskRow, resumeCancelledConnector };
@@ -1618,10 +1622,16 @@ export async function resolveSetupRequest(
   if (decision === "cancel" && result.resumeCancelledConnector && result.item.taskId) {
     const toolCallId = approvalToolCallId(result.item.payload);
     if (resume && toolCallId) {
-      const toolResult = result.item.action === "chat.choice"
-        ? "User skipped the question. Continue with your best judgment, or explain what you need if you cannot proceed without an answer."
-        : `User canceled connector setup for ${result.item.target}. ` +
-          `Continue without that connector if possible. If the original request requires it, tell the user what input or connector is needed.`;
+      // confirmation.request Cancel resumes with the same unambiguous boolean
+      // the Confirm path uses ({confirmed:false}) so the model never has to
+      // parse prose to learn the user declined; chat.choice Skip resumes with
+      // a skip fallback; connector.request gets the connector-specific text.
+      const toolResult = result.item.action === "confirmation.request"
+        ? JSON.stringify({ confirmed: false })
+        : result.item.action === "chat.choice"
+          ? "User skipped the question. Continue with your best judgment, or explain what you need if you cannot proceed without an answer."
+          : `User canceled connector setup for ${result.item.target}. ` +
+            `Continue without that connector if possible. If the original request requires it, tell the user what input or connector is needed.`;
       if (opts.awaitResume === false) {
         void resumeChatTask(config, result.item.taskId, toolCallId, toolResult).catch((error) =>
           failTask(config, result.item.taskId!, error)

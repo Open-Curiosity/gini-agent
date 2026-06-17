@@ -20,6 +20,8 @@ export type {
   PhaseBlock,
   AuthorizationRequestedBlock,
   SetupRequestedBlock,
+  SetupRequest,
+  SetupRequestStatus,
   SystemNoteBlock,
   ThreadSummary,
   JobRecord,

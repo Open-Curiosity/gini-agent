@@ -19,6 +19,7 @@ import type {
   JobRecord,
   RunRecord,
   RuntimeStatus,
+  SetupRequest,
   Task,
   ThreadSummary
 } from "./types";
@@ -224,6 +225,21 @@ export function useJobs(agentId: string | null | "all") {
         agentId === "all" ? "/jobs" : `/jobs?agentId=${encodeURIComponent(agentId ?? "")}`
       ),
     enabled: agentId !== null,
+    refetchInterval: 30_000
+  });
+}
+
+// Pending and resolved SetupRequests for the instance. The mobile
+// confirmation card (BlockSetupRequested, action "confirmation.request")
+// reads this to know whether its request is still pending and to pull the
+// trusted payload (details, confirmLabel) — the setup_requested block only
+// carries {setupRequestId, action, summary}. Mirrors web useSetupRequests.
+// A slow poll picks up a resolution made from the web client; the card's
+// own Confirm/Cancel mutations invalidate this key for the immediate flip.
+export function useSetupRequests() {
+  return useQuery<SetupRequest[]>({
+    queryKey: ["setup-requests"],
+    queryFn: () => api<SetupRequest[]>("/setup-requests"),
     refetchInterval: 30_000
   });
 }

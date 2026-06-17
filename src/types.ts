@@ -515,6 +515,10 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //     Submit POSTs `{ choice: { label } }` or `{ choice: { other } }` to
 //     /complete; Skip POSTs to /cancel, which resumes the loop with a skip
 //     fallback instead of failing the task.
+//   - `confirmation.request` → inline Confirm/Cancel card (request_confirmation
+//     tool). The payload carries { summary, details?, confirmLabel, toolCallId }.
+//     Confirm POSTs `{}` to /complete → resume with tool result
+//     {confirmed:true}; Cancel POSTs to /cancel → resume with {confirmed:false}.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -1617,7 +1621,18 @@ export type SetupRequestAction =
   // option, {choice:{other}} for the freeform answer) and /cancel is the Skip
   // affordance, which resumes the loop with a skip fallback rather than
   // failing the task. See docs/adr/user-choice-prompt.md.
-  | "chat.choice";
+  | "chat.choice"
+  // confirmation.request — the request_confirmation tool's inline
+  // Confirm/Cancel card. The agent calls it before an irreversible action
+  // that goes to another person (send/reply a message, post a reply in a web
+  // app, submit/purchase on the user's behalf). The payload carries
+  // { summary, details?, confirmLabel, toolCallId }; /complete resumes the
+  // loop with tool result {confirmed:true} and /cancel resumes with
+  // {confirmed:false} — never a "skip" string, so the model gets an
+  // unambiguous boolean. Like chat.choice it is a SetupRequest, so it pauses
+  // the task even under approvalMode "yolo". See
+  // docs/adr/user-confirmation-primitive.md.
+  | "confirmation.request";
 
 export interface SetupRequest {
   id: string;
