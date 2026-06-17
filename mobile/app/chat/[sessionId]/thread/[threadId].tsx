@@ -153,9 +153,22 @@ export default function ThreadViewScreen() {
     return map;
   }, [list]);
 
+  // Terminal runs whose "Completed" phase is filtered out before grouping.
+  // groupExchanges folds these even when they ended on a tool call with no
+  // closing answer. Scope to "Completed" only so failures still surface inline.
+  const terminalTaskIds = useMemo(
+    () =>
+      new Set(
+        list
+          .filter((b) => b.kind === "phase" && b.label === "Completed" && b.taskId)
+          .map((b) => b.taskId!)
+      ),
+    [list]
+  );
+
   const renderItems = useMemo<ChatRenderItem[]>(
-    () => groupExchanges(visible),
-    [visible]
+    () => groupExchanges(visible, terminalTaskIds),
+    [visible, terminalTaskIds]
   );
 
   const replyCount = summary?.replyCount ?? visible.length;

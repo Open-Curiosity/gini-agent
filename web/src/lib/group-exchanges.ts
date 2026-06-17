@@ -19,7 +19,10 @@ export type ChatRenderItem =
   | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[] }
   | { kind: "file_artifact"; id: string; files: { path: string; toolName: string }[] };
 
-export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
+export function groupExchanges(
+  blocks: ChatBlock[],
+  terminalTaskIds: ReadonlySet<string> = new Set()
+): ChatRenderItem[] {
   const items: ChatRenderItem[] = [];
   // Partition blocks into exchanges, then collapse each. An exchange is the
   // set of blocks sharing one taskId — a single agent turn or job cycle. A
@@ -53,12 +56,12 @@ export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
       exchanges[existing]!.push(b);
     }
   }
-  for (const exchange of exchanges) appendExchange(items, exchange);
+  for (const exchange of exchanges) appendExchange(items, exchange, terminalTaskIds);
   return items;
 }
 
-function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
-  if (!isExchangeComplete(exchange)) {
+function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminalTaskIds: ReadonlySet<string>) {
+  if (!isExchangeComplete(exchange, terminalTaskIds)) {
     for (const b of exchange) items.push({ kind: "block", block: b });
     return;
   }
@@ -70,15 +73,23 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
     for (const b of exchange) items.push({ kind: "block", block: b });
     return;
   }
-  // The final answer is the LAST assistant_text in a completed exchange;
-  // every earlier assistant_text is pre-tool narration. Fold that
-  // narration into the same collapsed process as the tool calls so the
-  // user sees only the final answer plus a collapsed "N tool calls" row,
-  // not a stack of "thinking out loud" bubbles.
+  // The final answer is the LAST assistant_text in a completed exchange,
+  // but only when it comes AFTER the last tool call; every earlier
+  // assistant_text is pre-tool narration. A terminal run that stopped on a
+  // tool call (no closing answer) has its last assistant_text before that
+  // call, so finalAnswerIdx stays -1 and every narration folds into the
+  // collapsed group rather than rendering as a standalone bubble.
+  let lastToolCallIdx = -1;
+  for (let i = exchange.length - 1; i >= 0; i--) {
+    if (exchange[i]!.kind === "tool_call") {
+      lastToolCallIdx = i;
+      break;
+    }
+  }
   let finalAnswerIdx = -1;
   for (let i = exchange.length - 1; i >= 0; i--) {
     if (exchange[i]!.kind === "assistant_text") {
-      finalAnswerIdx = i;
+      if (i > lastToolCallIdx) finalAnswerIdx = i;
       break;
     }
   }
@@ -128,7 +139,12 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
   }
 }
 
-function isExchangeComplete(exchange: ChatBlock[]): boolean {
+function isExchangeComplete(exchange: ChatBlock[], terminalTaskIds: ReadonlySet<string>): boolean {
+  // A terminal run (carries a "Completed" phase, dropped before grouping) is
+  // complete even when it stopped on a tool call with no closing answer, so
+  // fold it instead of dumping every block inline as if it were in-flight.
+  const taskId = exchange.find((b) => b.taskId !== undefined)?.taskId;
+  if (taskId !== undefined && terminalTaskIds.has(taskId)) return true;
   for (let i = exchange.length - 1; i >= 0; i--) {
     const b = exchange[i]!;
     if (b.kind === "phase" || b.kind === "tool_result" || b.kind === "system_note") continue;
