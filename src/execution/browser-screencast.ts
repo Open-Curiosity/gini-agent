@@ -134,6 +134,10 @@ export class ScreencastBridge {
   private readonly signInFamily = new Set<string>();
   private readonly targetWsUrls = new Map<string, string>();
   private currentTargetId: string | undefined;
+  // Family targets the screencast has already shown. The watcher follows a
+  // family member only ONCE (when it first appears) — otherwise, with the
+  // opener and its popup both alive, it would ping-pong between them every tick.
+  private readonly visitedTargetIds = new Set<string>();
 
   constructor(
     deps: Partial<ScreencastDeps> = {},
@@ -173,6 +177,7 @@ export class ScreencastBridge {
     if (typeof pageTarget.id === "string") {
       this.currentTargetId = pageTarget.id;
       this.signInFamily.add(pageTarget.id);
+      this.visitedTargetIds.add(pageTarget.id);
       this.targetWsUrls.set(pageTarget.id, pageTarget.webSocketDebuggerUrl);
     }
     await this.attachTo(pageTarget.webSocketDebuggerUrl);
@@ -320,13 +325,18 @@ export class ScreencastBridge {
         }
         const live = (id: string): CdpVersionTarget | undefined =>
           pages.find((p) => p.id === id && p.webSocketDebuggerUrl);
-        // A family page that ISN'T the one we're showing is a popup the sign-in
-        // opened (or a re-surfaced opener) — switch to it.
+        // A family page we haven't shown yet is a popup the sign-in just opened
+        // — switch to it ONCE. Filtering on visited (not merely "!= current")
+        // stops the opener↔popup ping-pong when both stay alive.
         const fresh = [...this.signInFamily]
           .map(live)
-          .find((p): p is CdpVersionTarget => !!p && p.id !== this.currentTargetId && !!p.webSocketDebuggerUrl);
+          .find(
+            (p): p is CdpVersionTarget =>
+              !!p && typeof p.id === "string" && !this.visitedTargetIds.has(p.id) && !!p.webSocketDebuggerUrl
+          );
         if (fresh?.webSocketDebuggerUrl && typeof fresh.id === "string") {
           this.currentTargetId = fresh.id;
+          this.visitedTargetIds.add(fresh.id);
           await this.switchTo(fresh.webSocketDebuggerUrl);
           return;
         }
@@ -340,6 +350,7 @@ export class ScreencastBridge {
             .find((p): p is CdpVersionTarget => !!p && !!p.webSocketDebuggerUrl);
           if (survivor?.webSocketDebuggerUrl && typeof survivor.id === "string") {
             this.currentTargetId = survivor.id;
+            this.visitedTargetIds.add(survivor.id);
             await this.switchTo(survivor.webSocketDebuggerUrl);
           }
         }

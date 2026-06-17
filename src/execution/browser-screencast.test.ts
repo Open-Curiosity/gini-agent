@@ -456,6 +456,24 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     await bridge.stop();
   });
 
+  test("follows a popup exactly once and does not oscillate while both stay alive", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/");
+    const popup = page("popup", "https://idp.example/authorize");
+    h.openPopup("opener", popup);
+    await waitUntil(() => h.dialed.includes(popup.webSocketDebuggerUrl));
+    // Both opener and popup stay alive across many watch ticks. The bridge must
+    // NOT ping-pong back to the opener — it follows the popup once and stays.
+    const dialsAfterPopup = h.dialed.length;
+    await new Promise((r) => setTimeout(r, 60)); // 12 watch ticks at the 5ms interval
+    expect(h.dialed.length).toBe(dialsAfterPopup); // no further switches
+    expect(h.dialed.at(-1)).toBe(popup.webSocketDebuggerUrl);
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
+
   test("does NOT switch to an unrelated task's tab (no opener in the family)", async () => {
     const opener = page("opener", "https://signin.example/");
     const h = followHarness([opener]);
