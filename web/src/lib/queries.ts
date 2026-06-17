@@ -21,7 +21,8 @@ import type {
   SubagentRecord,
   Task,
   TraceRecord,
-  AuditEvent
+  AuditEvent,
+  UsageSource
 } from "@runtime/types";
 import type {
   ChatMessage,
@@ -73,7 +74,7 @@ export interface UsageDay {
   output: number;
   total: number;
   estimatedUsd: number;
-  bySource: Record<string, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>;
+  bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
 }
 
 export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
