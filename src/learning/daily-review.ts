@@ -8,11 +8,16 @@
 // (idempotent). Hosted by a slow abortable loop in src/server.ts.
 
 import type { ChatSessionRecord, RuntimeConfig, SkillOutcome } from "../types";
-import { createChatMessage, createChatSession, mutateState, readState } from "../state";
+import { createChatMessage, createChatSession, mutateState, now, readState } from "../state";
 import { reflectOnSkillOutcomes } from "./reflect";
 
 const SKILL_REVIEW_TITLE = "Skill review";
 const MAX_FEEDBACK_QUESTIONS = 3;
+
+// In-process single-flight guard: the 24h loop and the manual
+// POST /api/learning/review must not race into duplicate proposals/findings.
+// Keyed by instance so distinct instances run independently.
+const inFlight = new Set<string>();
 
 export interface DailyReviewResult {
   proposalsCreated: number;
@@ -43,6 +48,26 @@ function findSkillReviewSession(sessions: ChatSessionRecord[]): ChatSessionRecor
 }
 
 export async function runDailyReview(config: RuntimeConfig): Promise<DailyReviewResult> {
+  // Single-flight per instance: a concurrent run (the loop racing a manual
+  // POST /api/learning/review) returns early rather than duplicating proposals.
+  if (inFlight.has(config.instance)) {
+    return {
+      proposalsCreated: 0,
+      findingsCreated: 0,
+      feedbackAsked: 0,
+      posted: false,
+      sessionId: ""
+    };
+  }
+  inFlight.add(config.instance);
+  try {
+    return await runDailyReviewInner(config);
+  } finally {
+    inFlight.delete(config.instance);
+  }
+}
+
+async function runDailyReviewInner(config: RuntimeConfig): Promise<DailyReviewResult> {
   const reflect = await reflectOnSkillOutcomes(config);
 
   // Select up to 3 feedback candidates: recent consequential successes the
@@ -68,14 +93,20 @@ export async function runDailyReview(config: RuntimeConfig): Promise<DailyReview
 
   const sessionId = await ensureSkillReviewSession(config);
 
-  // Assemble the digest from the now-current state.
+  // Assemble the digest from the now-current state, but only re-surface
+  // proposals/findings created AFTER the last digest so a standing
+  // (still-unactioned) proposal isn't re-posted every run (decision #2 — the
+  // digest doesn't spam). Feedback questions are intrinsically new (they
+  // advance feedbackPrompted), so they're always included.
   const state = readState(config.instance);
-  const openFindings = state.learningFindings.filter((f) => f.status === "open");
+  const since = state.lastSkillReviewDigestAt;
+  const isNew = (createdAt: string) => since === undefined || createdAt > since;
+  const openFindings = state.learningFindings.filter((f) => f.status === "open" && isNew(f.createdAt));
   const pendingProposals = state.improvements.filter(
-    (p) => p.status === "proposed" && p.kind === "skill" && p.payload.mode === "edit"
+    (p) => p.status === "proposed" && p.kind === "skill" && p.payload.mode === "edit" && isNew(p.createdAt)
   );
 
-  // Nothing to say -> don't post (keeps the channel quiet on idle days).
+  // Nothing new to say -> don't post (keeps the channel quiet, no re-spam).
   if (pendingProposals.length === 0 && openFindings.length === 0 && feedback.length === 0) {
     return {
       proposalsCreated: reflect.proposalsCreated,
@@ -93,6 +124,8 @@ export async function runDailyReview(config: RuntimeConfig): Promise<DailyReview
       role: "assistant",
       content: digest
     });
+    // Advance the digest watermark so the next run won't re-post these.
+    s.lastSkillReviewDigestAt = now();
   });
 
   return {

@@ -667,6 +667,11 @@ export interface RuntimeState {
   // (environment / credential / model-ignored / bundled-skill). Bounded,
   // newest-first. Defaulted to [] by normalizeState.
   learningFindings: LearningFinding[];
+  // ISO timestamp of the last posted "Skill review" digest. The next digest
+  // only re-surfaces proposals/findings created AFTER this, so a standing
+  // (still-unactioned) proposal isn't re-posted every run. Absent until the
+  // first digest posts; normalizeState leaves it as-is (passthrough).
+  lastSkillReviewDigestAt?: string;
   pairingCodes: PairingCode[];
   pairingRequests: PairingRequest[];
   devices: PairedDevice[];

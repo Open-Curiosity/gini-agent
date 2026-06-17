@@ -6,6 +6,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { addAudit, mutateState, readState } from "../state";
+import { proposeImprovement } from "../governance/improvements";
 import { recordObjectiveOutcomes } from "./outcomes";
 import { ensureSkillReviewSession, runDailyReview } from "./daily-review";
 import type { RuntimeConfig, Task } from "../types";
@@ -132,5 +133,50 @@ describe("runDailyReview", () => {
     expect(session.messageIds.length).toBe(1);
     const message = state.chatMessages.find((m) => m.id === session.messageIds[0]);
     expect(message!.content).toContain("Quick questions about recent actions");
+  });
+
+  test("a standing proposal is not re-posted on the next run", async () => {
+    const instance = "no-respam";
+    const config = makeConfig(instance);
+    readState(instance);
+    // A pending skill-edit proposal that stays unactioned across two runs.
+    await proposeImprovement(config, {
+      kind: "skill",
+      title: "Improve skill: payer",
+      rationale: "Recurring failures.",
+      payload: {
+        mode: "edit",
+        targetSkillId: "skill_x",
+        baseBody: "# Payer\n",
+        edits: [{ op: "append", content: "Confirm." }]
+      }
+    });
+
+    const first = await runDailyReview(config);
+    expect(first.posted).toBe(true);
+    let session = readState(instance).chatSessions.find((s) => s.feature === "skill-review")!;
+    expect(session.messageIds).toHaveLength(1);
+    // The watermark advanced.
+    expect(readState(instance).lastSkillReviewDigestAt).toBeDefined();
+
+    // Second run: the same proposal is still standing, nothing new -> no post.
+    const second = await runDailyReview(config);
+    expect(second.posted).toBe(false);
+    session = readState(instance).chatSessions.find((s) => s.feature === "skill-review")!;
+    expect(session.messageIds).toHaveLength(1);
+  });
+
+  test("concurrent runs are single-flighted (only one posts)", async () => {
+    const instance = "single-flight";
+    const config = makeConfig(instance);
+    readState(instance);
+    await recordConsequentialCompletion(config, instance, "task_sf");
+
+    const [a, b] = await Promise.all([runDailyReview(config), runDailyReview(config)]);
+    // Exactly one run did the work; the other returned early.
+    const posted = [a, b].filter((r) => r.posted);
+    expect(posted).toHaveLength(1);
+    const session = readState(instance).chatSessions.find((s) => s.feature === "skill-review")!;
+    expect(session.messageIds).toHaveLength(1);
   });
 });
