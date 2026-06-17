@@ -5229,6 +5229,12 @@ describe("anthropic provider", () => {
       expect(next.role).toBe("user");
       expect(next.content[0]!.toolResult).toBeDefined();
       expect(String((next.content[0]!.toolResult as Record<string, unknown>).toolUseId)).toBe("tu_x");
+      // Hoisting the result over the interleaved row must RE-EMIT that row, not
+      // drop it — the model's narration must survive.
+      const survived = body.messages.some(
+        (m) => m.role === "assistant" && m.content.some((b) => b.text === "thinking out loud")
+      );
+      expect(survived).toBe(true);
     } finally {
       fetchStub.restore();
       restoreSk();
