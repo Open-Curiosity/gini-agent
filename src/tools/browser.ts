@@ -374,16 +374,17 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
 // browser-automation-engine.md, "Remote session provider seam") and it
 // must hold for any future provider.
 //
-// Today's providers are the two modes that always existed: a persistent
-// local launch and a CDP attach to an external Chrome. The one capability
-// the local engine cannot fake is IP reputation (datacenter-IP blocks,
-// geo walls); a future remote/cloud-browser provider slots in as a third
-// entry that resolves its remote endpoint (provision a cloud session,
-// then attach over CDP/WebSocket) and returns a cdp-shaped SharedHandle —
-// or adds its own SharedHandle variant when its teardown needs extra
-// release work (e.g. an API call ending the cloud session). The
-// disconnect-generation choreography stays in ensureShared / teardown
-// call sites; it is transport-agnostic.
+// Today's providers are three: `spawned` (the DEFAULT — a per-instance branded
+// Chrome the runtime launches itself over the pipe transport), `persistent`
+// (the visible managed Connect window via launchPersistentContext), and `cdp`
+// (attach to the user's own external Chrome). The one capability the local
+// engine cannot fake is IP reputation (datacenter-IP blocks, geo walls); a
+// future remote/cloud-browser provider would slot in as a fourth entry that
+// resolves its remote endpoint (provision a cloud session, then attach over
+// CDP/WebSocket) and returns a cdp-shaped SharedHandle — or adds its own
+// SharedHandle variant when its teardown needs extra release work (e.g. an API
+// call ending the cloud session). The disconnect-generation choreography stays
+// in ensureShared / teardown call sites; it is transport-agnostic.
 interface BrowserSessionProvider {
   kind: Mode;
   // Establish the transport and return the live handle. Called by

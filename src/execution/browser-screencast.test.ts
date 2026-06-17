@@ -373,6 +373,59 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     expect(true).toBe(true);
   });
 
+  test("a stopActiveBridge during an in-flight start tears down the started bridge (no orphan)", async () => {
+    // Hold start() pending at its fetchJson await via a deferred the test
+    // controls, fire stopActiveBridge in that window (the "I've signed in"
+    // racing the still-connecting frames request), then release the launch.
+    const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
+    const socket = new FakeSocket();
+    const origAdd = socket.addEventListener.bind(socket);
+    socket.addEventListener = (event, listener) => {
+      origAdd(event, listener);
+      if (event === "open") queueMicrotask(() => socket.open());
+    };
+    const built: ScreencastBridge[] = [];
+    const factory = () => {
+      const b = new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => {
+          await gate; // hold start() pending until the test releases it
+          return [{ type: "page", webSocketDebuggerUrl: "ws://x" }];
+        },
+        resolvePort: () => 9333
+      });
+      built.push(b);
+      return b;
+    };
+    const startP = getOrStartBridge(undefined, factory);
+    await Promise.resolve(); // getOrStartBridge builds the bridge + calls start()
+    // Teardown fires while start() is parked at the fetchJson await.
+    await stopActiveBridge();
+    // Release the launch; start() proceeds, opens the socket, and resolves.
+    openGate();
+    await startP;
+    // The bridge that finished starting must have been stopped, not installed.
+    expect(built.length).toBe(1);
+    expect(built[0].isClosed()).toBe(true);
+    // Nothing is left installed: the next get builds a fresh bridge.
+    const probe = new FakeSocket();
+    const next = await getOrStartBridge(undefined, () => {
+      const b = new ScreencastBridge({
+        openSocket: () => probe,
+        fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://y" }],
+        resolvePort: () => 9333
+      });
+      const padd = probe.addEventListener.bind(probe);
+      probe.addEventListener = (event, listener) => {
+        padd(event, listener);
+        if (event === "open") queueMicrotask(() => probe.open());
+      };
+      return b;
+    });
+    expect(next).not.toBe(built[0]); // a fresh bridge, not the orphaned one
+    await stopActiveBridge();
+  });
+
   test("the default factory builds a real bridge (throws with no spawned browser)", async () => {
     // No factory arg → exercises the default `() => new ScreencastBridge()`
     // arrow. With no spawned Chrome the real start() throws and nothing is

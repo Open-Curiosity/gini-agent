@@ -1239,8 +1239,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/browser\/screencast\/([^/]+)\/frames$/, async (_request, params) => {
       const setupId = params[0];
       const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
-      if (!setup || setup.action !== "browser.connect") {
-        return json({ error: "Screencast setup request not found" }, 404);
+      // Gate on the live approval window, not just existence: a completed /
+      // cancelled / not-yet-started setup must not (re)open a screencast. This
+      // also closes the stale-EventSource-reconnect path — after /complete
+      // stops the bridge, a lingering reconnect can't rebuild a live drive
+      // channel because the setup is no longer pending.
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
       }
       // Attach to the page the requesting task is actually on, not whatever
       // tab happens to be first, so the operator signs in on the right page.
@@ -1298,8 +1309,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/browser\/screencast\/([^/]+)\/input$/, async (request, params) => {
       const setupId = params[0];
       const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
-      if (!setup || setup.action !== "browser.connect") {
-        return json({ error: "Screencast setup request not found" }, 404);
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
       }
       let body: ScreencastInput;
       try {

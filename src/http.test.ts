@@ -2711,6 +2711,99 @@ describe("runtime api", () => {
     expect(input.status).toBe(409);
   });
 
+  test("screencast endpoints reject a setup that isn't an active sign-in (lifecycle gate)", async () => {
+    // A browser.connect setup that is NOT pending, OR not stamped screencast +
+    // signInStarted, must be refused so a stale EventSource reconnect after
+    // complete/cancel can't rebuild a live drive channel.
+    const config = testConfig("screencast-lifecycle");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    // Pending, but never went through open-browser (no screencast/signInStarted).
+    const notStarted = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ls" }
+      })
+    );
+    const r1 = await rawCall(handler, config, `/api/browser/screencast/${notStarted.id}/frames`, {}, config.token);
+    expect(r1.status).toBe(404);
+    // Stamped screencast but cancelled — no longer pending.
+    const cancelled = await mutateState(config.instance, (state) => {
+      const s = createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ls2", signInStarted: true, screencast: true }
+      });
+      const row = state.setupRequests.find((x) => x.id === s.id);
+      if (row) row.status = "cancelled";
+      return s;
+    });
+    const r2 = await rawCall(handler, config, `/api/browser/screencast/${cancelled.id}/input`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(r2.status).toBe(404);
+  });
+
+  test("screencast frames stream a frame and input dispatches with a live bridge", async () => {
+    // HTTP success path: install a fake bridge (no real Chrome) so the SSE
+    // envelope + input dispatch wiring is exercised end to end at the gateway.
+    const config = testConfig("screencast-success");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ok", signInStarted: true, screencast: true }
+      })
+    );
+    // A minimal fake bridge: replays one frame to each subscriber and records
+    // dispatched input. Installed as the live activeBridge so the no-factory
+    // getOrStartBridge inside http.ts reuses it.
+    const dispatched: unknown[] = [];
+    const fakeBridge = {
+      isClosed: () => false,
+      subscribe(onFrame: (f: { data: string; meta: Record<string, unknown> }) => void) {
+        onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
+        return () => undefined;
+      },
+      dispatchInput: async (m: unknown) => { dispatched.push(m); },
+      start: async () => undefined,
+      stop: async () => undefined
+    };
+    sc.__setActiveBridgeForTest(fakeBridge as never);
+    try {
+      const framesRes = await handler(
+        new Request(`http://127.0.0.1:${config.port}/api/browser/screencast/${setup.id}/frames`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        })
+      );
+      expect(framesRes.status).toBe(200);
+      expect(framesRes.headers.get("content-type")).toContain("text/event-stream");
+      const reader = framesRes.body!.getReader();
+      const chunk = await reader.read();
+      const text = new TextDecoder().decode(chunk.value);
+      expect(text).toContain("event: frame");
+      expect(text).toContain("QUJD");
+      await reader.cancel();
+
+      const inputRes = await call(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "click", x: 10, y: 20, clickCount: 1 })
+      });
+      expect(inputRes.ok).toBe(true);
+      expect(dispatched).toEqual([{ kind: "click", x: 10, y: 20, clickCount: 1 }]);
+    } finally {
+      sc.__resetActiveBridgeForTest();
+    }
+  });
+
   test("completing a screencast browser.connect resolves the setup without a managed relaunch", async () => {
     // The screencast path keeps the agent on its headless Chrome the whole
     // time, so /complete just stops the bridge (a no-op here, no live bridge)

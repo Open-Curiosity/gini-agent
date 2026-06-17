@@ -286,6 +286,14 @@ let activeBridge: ScreencastBridge | undefined;
 // instead of each launching a CDP socket and leaking the loser's. Cleared once
 // the start settles.
 let startingBridge: Promise<ScreencastBridge> | undefined;
+// Monotonic teardown counter. Bumped by stopActiveBridge so a start() that is
+// in flight when teardown fires doesn't install (and orphan) a now-unwanted
+// bridge: the start captures the generation up front and, if it changed by the
+// time start() resolves, stops the freshly-built bridge instead of installing
+// it. Without this, "I've signed in" (which calls stopActiveBridge) racing the
+// modal's still-connecting frames request would leave a live CDP socket that
+// nothing ever closes.
+let bridgeGeneration = 0;
 
 // Get the live bridge, creating + starting one if none is active (or the
 // previous one closed). `preferUrl` is forwarded to start() so the bridge
@@ -298,9 +306,16 @@ export async function getOrStartBridge(
   if (activeBridge && !activeBridge.isClosed()) return activeBridge;
   if (startingBridge) return startingBridge;
   const bridge = factory();
+  const startedAtGeneration = bridgeGeneration;
   startingBridge = bridge
     .start(preferUrl)
     .then(() => {
+      // A teardown landed while we were starting — don't install this bridge;
+      // stop it so its CDP socket isn't orphaned.
+      if (bridgeGeneration !== startedAtGeneration) {
+        void bridge.stop();
+        return bridge;
+      }
       activeBridge = bridge;
       return bridge;
     })
@@ -310,12 +325,22 @@ export async function getOrStartBridge(
   return startingBridge;
 }
 
-// Tear down the active bridge (sign-in completed / cancelled / shutdown).
+// Tear down the active bridge (sign-in completed / cancelled / shutdown). Bumps
+// the generation so any start() still in flight tears its own bridge down
+// instead of installing it after this returns.
 export async function stopActiveBridge(): Promise<void> {
+  bridgeGeneration += 1;
   const bridge = activeBridge;
   activeBridge = undefined;
   startingBridge = undefined;
   if (bridge) await bridge.stop();
+}
+
+// Test-only: install a ready bridge as the active one so the HTTP endpoints
+// reuse it (exercises the success-path wiring without launching Chrome).
+export function __setActiveBridgeForTest(bridge: ScreencastBridge): void {
+  activeBridge = bridge;
+  startingBridge = undefined;
 }
 
 // Test-only reset so a suite doesn't leak the module-level bridge.
