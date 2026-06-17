@@ -4,14 +4,14 @@
 
 `browser_connect` has two sanctioned uses, distinguished by an optional `mode` argument on the tool call:
 
-1. **Sign-in unblock** (`mode: "sign-in"`, the default) — the existing contract, unchanged: a navigation the agent already made hit a sign-in / OAuth / auth wall; the user signs in once in a visible managed Chrome window and the agent continues with the persisted session.
-2. **Sensitive-step handoff** (`mode: "handoff"`) — the task has reached a step the USER must perform themselves in the agent's browser: entering payment details, a final purchase confirmation, or because they chose via `ask_user` to finish manually. The agent hands off the visible window at the exact page it drove the flow to; the user completes the step, clicks done, the browser returns to headless, and the agent continues — re-snapshots, confirms the outcome from the page, and reports.
+1. **Sign-in unblock** (`mode: "sign-in"`, the default) — the existing contract: a navigation the agent already made hit a sign-in / OAuth / auth wall; the user signs in once through a live in-chat view of the agent's browser and the agent continues with the persisted session.
+2. **Sensitive-step handoff** (`mode: "handoff"`) — the task has reached a step the USER must perform themselves in the agent's browser: entering payment details, a final purchase confirmation, or because they chose via `ask_user` to finish manually. The agent hands off the live browser view at the exact page it drove the flow to; the user completes the step, clicks done, and the agent continues — re-snapshots, confirms the outcome from the page, and reports.
 
 Same tool, same SetupRequest action (`browser.connect`), same two-stage `/open-browser` → `/complete` flow, same loop guard and navigate-first precondition. The only mode-keyed difference is the completion card's wording.
 
 ## Context
 
-The managed visible-Chrome mechanism was always mechanically general: the visible window opens on the SAME per-instance profile, so cart, session, and half-filled form state the agent built up headlessly are all preserved. But the tool contract and the card UI were sign-in-locked — the description forbade any non-auth use and the completion button read "I've signed in" unconditionally. That left the agent with no sanctioned way to hand the user the final step of a purchase or booking, so it refused such tasks outright instead.
+The handoff mechanism was always mechanically general: the user acts on the SAME per-instance browser/profile the agent drove, so cart, session, and half-filled form state the agent built up headlessly are all preserved. (Whether the user acts through the in-chat screencast of the headless browser — the default — or, as a fallback, a visible managed Chrome window when no spawned browser is live, the profile is the same; see [browser-stealth-identity.md](browser-stealth-identity.md).) But the tool contract and the card UI were sign-in-locked — the description forbade any non-auth use and the completion button read "I've signed in" unconditionally. That left the agent with no sanctioned way to hand the user the final step of a purchase or booking, so it refused such tasks outright instead.
 
 Handing the user a URL for their OWN browser is not a substitute: the agent's progress lives in the gateway Chrome profile, not in the user's browser.
 
@@ -20,8 +20,8 @@ The handoff is one of three completion paths at the sensitive boundary (payment 
 ## Mechanics
 
 - **Tool args**: `mode?: "sign-in" | "handoff"`, default `"sign-in"`. The dispatcher (`requestBrowserConnect` in `src/execution/tool-dispatch.ts`) stamps `mode: "handoff"` onto the SetupRequest payload only when the literal `"handoff"` was passed; any other value (including unset) produces a payload byte-identical to the pre-handoff sign-in contract, so every existing flow — including the setup skill's `headless: true` reconnect — is unchanged.
-- **Card wording**: the web card (`BlockSetupRequested.tsx`, label logic in `web/src/components/chat/browser-connect-card.ts`) renders "Connect" in stage 1 for both modes; the stage-2 completion button reads "I've signed in" by default and "I'm done" when `payload.mode === "handoff"`. The agent-supplied `reason` remains the user-facing explanation of what to do in the window.
-- **Completion**: mode-independent. `/open-browser` marks `payload.signInStarted` (the stage-1 "user is acting" marker for both modes); `completeBrowserConnectSetup` relaunches headless on the same profile either way — the user finished acting, so the window closes and the agent resumes.
+- **Card wording**: the web card (`BlockSetupRequested.tsx`, label logic in `web/src/components/chat/browser-connect-card.ts`) renders "Connect" in stage 1 for both modes; the stage-2 completion button reads "I've signed in" by default and "I'm done" when `payload.mode === "handoff"`. The agent-supplied `reason` remains the user-facing explanation of what to do in the browser view.
+- **Completion**: mode-independent. `/open-browser` marks `payload.signInStarted` (the stage-1 "user is acting" marker for both modes). In the default screencast path it also stamps `payload.screencast`, and `/complete` simply stops the screencast bridge and resumes the already-headless agent (no relaunch). In the visible-window fallback, `completeBrowserConnectSetup` relaunches headless on the same profile — the user finished acting, so the window closes and the agent resumes.
 - **Guards**: the navigate-first precondition and the per-host card cap apply to both modes — a handoff acts on a page the agent already reached, never a cold open.
 
 ## Acceptance Checks

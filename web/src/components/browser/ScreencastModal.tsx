@@ -31,17 +31,27 @@ interface ScreencastFrameMsg {
 
 export function ScreencastModal({
   setupRequestId,
-  onSignedIn,
+  handoff = false,
+  onComplete,
   onCancel,
-  signingIn,
+  completing,
   cancelling
 }: {
   setupRequestId: string;
-  onSignedIn: () => void;
+  // True for a handoff-mode browser.connect (the user finishes a sensitive
+  // step themselves) — drives the title/button copy. False = sign-in.
+  handoff?: boolean;
+  onComplete: () => void;
   onCancel: () => void;
-  signingIn: boolean;
+  completing: boolean;
   cancelling: boolean;
 }) {
+  // Mode-keyed copy mirrors browserConnectButtonLabel (sign-in vs handoff).
+  const title = handoff ? "Finish in the browser" : "Sign in to continue";
+  const description = handoff
+    ? "Complete the step on the live page below — the agent is watching this same browser and will continue once you're done."
+    : "Sign in on the live page below — the agent is watching this same browser and will continue once you're done.";
+  const completeLabel = handoff ? "I'm done" : "I've signed in";
   const imgRef = useRef<HTMLImageElement>(null);
   const captureRef = useRef<HTMLTextAreaElement>(null);
   // Natural size of the captured page (device pixels from CDP frame metadata),
@@ -130,12 +140,12 @@ export function ScreencastModal({
   };
 
   return (
-    <Dialog open onOpenChange={(open) => { if (!open && !signingIn) onCancel(); }}>
+    <Dialog open onOpenChange={(open) => { if (!open && !completing) onCancel(); }}>
       <DialogContent className="max-w-[860px]">
         <DialogHeader>
-          <DialogTitle>Sign in to continue</DialogTitle>
+          <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
-            Sign in on the live page below — the agent is watching this same browser and will continue once you&apos;re done.
+            {description}
             {status === "connecting" ? " Connecting…" : status === "error" ? " Reconnecting…" : null}
           </DialogDescription>
         </DialogHeader>
@@ -152,7 +162,7 @@ export function ScreencastModal({
           {/* eslint-disable-next-line @next/next/no-img-element -- live screencast frames, not a static asset */}
           <img
             ref={imgRef}
-            alt="agent browser sign-in screen"
+            alt="agent browser screen"
             className="max-h-[60vh] w-auto cursor-crosshair rounded border border-border bg-black"
             draggable={false}
             onMouseDown={onMouseDown}
@@ -163,8 +173,8 @@ export function ScreencastModal({
           />
         </div>
         <div className="mt-2 flex gap-2">
-          <Button size="sm" disabled={signingIn} onClick={onSignedIn}>
-            {signingIn ? "Finishing…" : "I've signed in"}
+          <Button size="sm" disabled={completing} onClick={onComplete}>
+            {completing ? "Finishing…" : completeLabel}
           </Button>
           <Button size="sm" variant="outline" disabled={cancelling} onClick={onCancel}>
             Cancel

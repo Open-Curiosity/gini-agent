@@ -991,9 +991,10 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       {isBrowserConnect && isPending && signInStarted && setup?.payload?.screencast === true ? (
         <ScreencastModal
           setupRequestId={block.setupRequestId}
-          onSignedIn={() => browserConnect.mutate()}
+          handoff={setup?.payload?.mode === "handoff"}
+          onComplete={() => browserConnect.mutate()}
           onCancel={() => cancel.mutate()}
-          signingIn={browserConnect.isPending}
+          completing={browserConnect.isPending}
           cancelling={cancel.isPending}
         />
       ) : null}
