@@ -2828,6 +2828,117 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("request_confirmation pauses the turn with a confirmation.request setup card and no reason bubble", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm", undefined, "agent_c")
+    );
+
+    const summary = "Send this reply to Jen in the Awesomic thread";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary, details: "Hi Jen — ship it.", confirmLabel: "Send" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Jen that it's good" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+    expect(setup?.payload.summary).toBe(summary);
+    expect(setup?.payload.confirmLabel).toBe("Send");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const setupBlock = blocks.find((b) => b.kind === "setup_requested");
+    if (setupBlock?.kind === "setup_requested") {
+      expect(setupBlock.action).toBe("confirmation.request");
+      // The summary IS the block summary — that's what transcripts show.
+      expect(setupBlock.summary).toBe(summary);
+    } else {
+      throw new Error("missing setup_requested block");
+    }
+    // Like chat.choice, no assistant bubble accompanies the card — the summary
+    // lives in the card itself.
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("confirmation.request cancel resumes the chat loop with {confirmed:false}", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm-cancel", undefined, "agent_c")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary: "Send the reply to Jen" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Okay, I won't send it. What should I change?",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Jen" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+
+    await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
+
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    // Cancel must resume the loop, NOT fail the task.
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe("Okay, I won't send it. What should I change?");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    // The model receives an unambiguous boolean from the cancel.
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes('"confirmed":false'))).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");
