@@ -196,8 +196,92 @@ describe("applyImprovement edit branch", () => {
     });
 
     await expect(reviewImprovement(config, proposal.id, "approve")).rejects.toThrow();
-    // The proposal must not be left "applied" after a failed apply.
+    // The proposal must not be left "applied" after a failed apply, and it must
+    // be releasable back to "proposed" so a retry can re-approve.
     const stored = readState(instance).improvements.find((p) => p.id === proposal.id);
     expect(stored!.status).not.toBe("applied");
+    expect(stored!.status).toBe("proposed");
+  });
+
+  test("concurrent double-approve applies the edit once and audits once", async () => {
+    const instance = "edit-race";
+    const config = makeConfig(instance);
+    readState(instance);
+    writeUserSkill(instance, "payment-flow", USER_SKILL_BODY);
+    await reloadSkills(config);
+    const before = readState(instance).skills.find((s) => s.name === "payment-flow")!;
+
+    const proposal = await proposeImprovement(config, {
+      kind: "skill",
+      title: "Confirm before paying",
+      rationale: "Two failures paid the wrong invoice.",
+      payload: {
+        mode: "edit",
+        targetSkillId: before.id,
+        baseVersion: before.version,
+        baseBody: before.body,
+        edits: [{ op: "append", content: "3. Confirm the payee before clicking Pay." }]
+      }
+    });
+
+    // Fire two approves concurrently. Exactly one wins (status -> applied); the
+    // other sees the claim and rejects with "already ...". The append must NOT
+    // be doubled, and improvement.applied must be audited exactly once.
+    const results = await Promise.allSettled([
+      reviewImprovement(config, proposal.id, "approve"),
+      reviewImprovement(config, proposal.id, "approve")
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    const state = readState(instance);
+    const stored = state.improvements.find((p) => p.id === proposal.id)!;
+    expect(stored.status).toBe("applied");
+
+    const after = state.skills.find((s) => s.name === "payment-flow")!;
+    // The append landed exactly once (no double-append).
+    const occurrences = after.body.split("3. Confirm the payee before clicking Pay.").length - 1;
+    expect(occurrences).toBe(1);
+
+    const appliedAudits = state.audit.filter(
+      (a) => a.action === "improvement.applied" && a.target === proposal.id
+    );
+    expect(appliedAudits).toHaveLength(1);
+  });
+
+  test("a fully-stale edit (no op matches the live body) is refused, not silently applied", async () => {
+    const instance = "edit-stale";
+    const config = makeConfig(instance);
+    readState(instance);
+    writeUserSkill(instance, "payment-flow", USER_SKILL_BODY);
+    await reloadSkills(config);
+    const before = readState(instance).skills.find((s) => s.name === "payment-flow")!;
+
+    const proposal = await proposeImprovement(config, {
+      kind: "skill",
+      title: "Replace a step that no longer exists",
+      rationale: "Body changed since the proposal was generated.",
+      payload: {
+        mode: "edit",
+        targetSkillId: before.id,
+        baseVersion: before.version,
+        baseBody: before.body,
+        // This target is not a substring of the live body -> applied === 0.
+        edits: [{ op: "replace", target: "Step that does not exist in the body", content: "x" }]
+      }
+    });
+
+    await expect(reviewImprovement(config, proposal.id, "approve")).rejects.toThrow(
+      /changed since this proposal/
+    );
+    const state = readState(instance);
+    const stored = state.improvements.find((p) => p.id === proposal.id)!;
+    // Not applied, and released back to proposed for re-review.
+    expect(stored.status).toBe("proposed");
+    // The on-disk body is untouched (no no-op write flipped it to applied).
+    const after = state.skills.find((s) => s.name === "payment-flow")!;
+    expect(after.body).toBe(before.body);
   });
 });

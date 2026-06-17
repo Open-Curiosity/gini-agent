@@ -92,44 +92,89 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
 // transaction. Returns the updated proposal, or undefined when this isn't an
 // approved skill-edit (so the caller falls through to the sync path — including
 // REJECT of an edit proposal, which needs no disk write).
+//
+// Single-flight + atomic against a concurrent double-approve: the proposal is
+// CLAIMED under a lock (`proposed` -> `approved`) before the async install, so
+// a second concurrent approve sees `approved`/`applied` and bails instead of
+// re-applying the edits to the already-edited file (e.g. a double-append) and
+// double-emitting `improvement.applied`. The async `installSkillFromBody` runs
+// outside the lock; a final transaction re-checks the claim, flips to
+// `applied`, and audits exactly once. A failed install RELEASES the claim back
+// to `proposed` so a retry can re-approve.
 async function maybeApplySkillEditOutsideTransaction(
   config: RuntimeConfig,
   proposalId: string,
   decision: "approve" | "reject"
 ): Promise<ImprovementProposal | undefined> {
   if (decision !== "approve") return undefined;
-  const proposal = readState(config.instance).improvements.find((p) => p.id === proposalId);
-  if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
-  if (proposal.kind !== "skill" || proposal.payload.mode !== "edit") return undefined;
-  if (proposal.status !== "proposed" && proposal.status !== "approved") {
-    throw new Error(`Improvement proposal is already ${proposal.status}`);
-  }
+  const peek = readState(config.instance).improvements.find((p) => p.id === proposalId);
+  if (!peek) throw new Error(`Improvement proposal not found: ${proposalId}`);
+  if (peek.kind !== "skill" || peek.payload.mode !== "edit") return undefined;
 
-  const targetSkillId = String(proposal.payload.targetSkillId ?? "");
+  // Claim under the lock: require `proposed` and flip to `approved` atomically
+  // so only one approver proceeds. A concurrent approver finds a non-`proposed`
+  // status and throws `already approved`/`already applied`.
+  const claimed = await mutateState(config.instance, (state) => {
+    const live = state.improvements.find((p) => p.id === proposalId);
+    if (!live) throw new Error(`Improvement proposal not found: ${proposalId}`);
+    if (live.status !== "proposed") {
+      throw new Error(`Improvement proposal is already ${live.status}`);
+    }
+    live.status = "approved";
+    live.updatedAt = now();
+    return live;
+  });
+
+  const targetSkillId = String(claimed.payload.targetSkillId ?? "");
   const skill = readState(config.instance).skills.find((s) => s.id === targetSkillId);
-  if (!skill) throw new Error(`Skill edit target not found: ${targetSkillId}`);
+  // From here on, a thrown error must RELEASE the claim so the proposal is
+  // re-approvable; releaseClaim restores `proposed` then rethrows.
+  if (!skill) {
+    await releaseClaim(config, proposalId);
+    throw new Error(`Skill edit target not found: ${targetSkillId}`);
+  }
   // Bundled / legacy skills are never rewritten on disk (decision #6): a
   // recurring failure there is a finding, not an auto-edit. Refuse loudly so
   // the reviewer sees why.
   if ((skill.source ?? "user") !== "user" || !skill.manifestPath) {
+    await releaseClaim(config, proposalId);
     throw new Error(
       `Cannot edit skill ${skill.name}: only user skills with an on-disk SKILL.md are editable (bundled/legacy skills are propose-only).`
     );
   }
 
-  const edits = Array.isArray(proposal.payload.edits) ? (proposal.payload.edits as SkillEditOp[]) : [];
-  // Rebuild from the CURRENT file on disk (not the proposal's snapshot) so the
-  // edit applies to live content; split off the frontmatter, edit the body,
-  // reassemble with the original frontmatter header intact.
-  const fileText = readFileSync(skill.manifestPath, "utf8");
-  const { header, body } = splitSkillFile(fileText);
-  const result = applySkillEdits(body, edits);
-  const rebuilt = `${header}${result.body.endsWith("\n") ? result.body : `${result.body}\n`}`;
-  const installed = await installSkillFromBody(config, { body: rebuilt });
+  const edits = Array.isArray(claimed.payload.edits) ? (claimed.payload.edits as SkillEditOp[]) : [];
+  let result: ReturnType<typeof applySkillEdits>;
+  let installed: Awaited<ReturnType<typeof installSkillFromBody>>;
+  try {
+    // Rebuild from the CURRENT file on disk (not the proposal's snapshot) so the
+    // edit applies to live content; split off the frontmatter, edit the body,
+    // reassemble with the original frontmatter header intact.
+    const fileText = readFileSync(skill.manifestPath, "utf8");
+    const { header, body } = splitSkillFile(fileText);
+    result = applySkillEdits(body, edits);
+    // A fully-stale proposal (no op matched — the skill body changed since the
+    // proposal was generated, per `baseVersion`) would otherwise write the file
+    // back unchanged and flip to `applied`. Refuse it so a no-op never masquerades
+    // as an applied edit; the reviewer re-generates against the current body.
+    if (result.applied === 0) {
+      throw new Error(
+        `Cannot apply skill edit for ${skill.name}: the skill changed since this proposal was generated; please re-review.`
+      );
+    }
+    const rebuilt = `${header}${result.body.endsWith("\n") ? result.body : `${result.body}\n`}`;
+    installed = await installSkillFromBody(config, { body: rebuilt });
+  } catch (error) {
+    await releaseClaim(config, proposalId);
+    throw error;
+  }
 
   return mutateState(config.instance, (state) => {
     const live = state.improvements.find((p) => p.id === proposalId);
     if (!live) throw new Error(`Improvement proposal not found: ${proposalId}`);
+    // Re-check the claim is still ours. If a concurrent path already finalized
+    // it (applied) or it was rejected, return without re-auditing.
+    if (live.status !== "approved") return live;
     live.status = "applied";
     live.appliedTargetId = installed.skill.id;
     live.updatedAt = now();
@@ -146,6 +191,19 @@ async function maybeApplySkillEditOutsideTransaction(
       live.sourceTaskId ? { taskId: live.sourceTaskId } : { system: true }
     );
     return live;
+  });
+}
+
+// Release a claimed (status:"approved") edit proposal back to "proposed" so a
+// later approve can retry. Only releases when still "approved" — never clobbers
+// a status a concurrent path already advanced.
+async function releaseClaim(config: RuntimeConfig, proposalId: string): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const live = state.improvements.find((p) => p.id === proposalId);
+    if (live && live.status === "approved") {
+      live.status = "proposed";
+      live.updatedAt = now();
+    }
   });
 }
 
