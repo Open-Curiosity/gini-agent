@@ -36,13 +36,13 @@ function buildSpyDeps(opts?: {
 }): DispatchDeps & {
   calls: {
     api: Array<{ path: string; method: string | undefined }>;
-    navigate: string[];
+    navigate: Array<{ sessionId: string; threadId: string | null }>;
     notifyFailure: Array<"approve" | "deny">;
   };
 } {
   const calls = {
     api: [] as Array<{ path: string; method: string | undefined }>,
-    navigate: [] as string[],
+    navigate: [] as Array<{ sessionId: string; threadId: string | null }>,
     notifyFailure: [] as Array<"approve" | "deny">
   };
   return {
@@ -51,7 +51,7 @@ function buildSpyDeps(opts?: {
       if (opts?.apiShouldThrow) throw new Error("network");
       return {} as never;
     },
-    navigate: (sessionId) => { calls.navigate.push(sessionId); },
+    navigate: (sessionId, threadId) => { calls.navigate.push({ sessionId, threadId }); },
     notifyFailure: async (verb) => { calls.notifyFailure.push(verb); },
     calls
   };
@@ -128,11 +128,29 @@ describe("dispatchNotificationResponse", () => {
       }),
       deps
     );
-    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_5" });
-    expect(deps.calls.navigate).toEqual(["chat_5"]);
+    // No threadId on this push → main-chat tap (threadId null).
+    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_5", threadId: null });
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_5", threadId: null }]);
     // Importantly: a plain tap on an approval notification does NOT
     // post to the approve / deny endpoints. The user has to use the
     // explicit action buttons or resolve the approval in-app.
+    expect(deps.calls.api).toEqual([]);
+  });
+
+  test("Default tap on a threaded completion carries threadId so it deep-links to the thread view", async () => {
+    const deps = buildSpyDeps();
+    const outcome = await dispatchNotificationResponse(
+      // A message_completed push fired by threaded work carries threadId;
+      // the banner shows the thread's reply, so the tap must open the
+      // thread view (the main chat filters threaded blocks out).
+      buildResponse("expo.modules.notifications.actions.DEFAULT", {
+        sessionId: "chat_7",
+        threadId: "thread_3"
+      }),
+      deps
+    );
+    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_7", threadId: "thread_3" });
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_7", threadId: "thread_3" }]);
     expect(deps.calls.api).toEqual([]);
   });
 

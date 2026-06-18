@@ -408,9 +408,16 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
           void dispatchNotificationResponse(response, {
             apiCall: (path, init) => api(path, init),
-            navigate: (sessionId) => {
+            navigate: (sessionId, threadId) => {
               // expo-router uses dynamic segments via the bracketed path.
-              router.push(`/chat/${sessionId}`);
+              // A threaded completion deep-links into the thread view — the
+              // main chat filters threaded blocks out, so opening it would
+              // hide the reply the banner previewed.
+              router.push(
+                threadId
+                  ? `/chat/${sessionId}/thread/${threadId}`
+                  : `/chat/${sessionId}`
+              );
             },
             notifyFailure: notifyActionFailure
           });

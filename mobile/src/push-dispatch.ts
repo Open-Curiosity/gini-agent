@@ -60,7 +60,7 @@ export const APPROVAL_CATEGORY_ACTIONS: readonly ApprovalActionSpec[] = [
 ];
 
 export type NotificationDispatchOutcome =
-  | { kind: "tap"; sessionId: string }
+  | { kind: "tap"; sessionId: string; threadId: string | null }
   | { kind: "approve"; approvalId: string }
   | { kind: "deny"; approvalId: string }
   | { kind: "approve-failed"; approvalId: string }
@@ -69,7 +69,7 @@ export type NotificationDispatchOutcome =
 
 export interface DispatchDeps {
   apiCall: <T = unknown>(path: string, init?: { method?: string }) => Promise<T>;
-  navigate: (sessionId: string) => void;
+  navigate: (sessionId: string, threadId: string | null) => void;
   notifyFailure: (verb: "approve" | "deny") => Promise<void>;
 }
 
@@ -86,7 +86,10 @@ export interface ResponseLike {
  *   - APPROVE button → POST /api/authorizations/:id/approve
  *   - DENY button → POST /api/authorizations/:id/deny
  *   - any other actionIdentifier (default tap, future actions) →
- *     navigate to /chat/:sessionId if the payload carries one
+ *     navigate to the chat the payload names; a threaded completion
+ *     carries `threadId` so the tap deep-links into the thread view
+ *     (the main chat filters threaded blocks out, so opening it would
+ *     hide the very reply the banner previewed)
  *
  * The action buttons only ride on `authorization_requested` pushes (the
  * server-side NSE attaches the APPROVAL_REQUEST category for that event
@@ -105,11 +108,12 @@ export async function dispatchNotificationResponse(
   deps: DispatchDeps
 ): Promise<NotificationDispatchOutcome> {
   const rawData = response.notification.request.content.data as
-    | { sessionId?: unknown; approvalId?: unknown }
+    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
     | null
     | undefined;
   const sessionId = typeof rawData?.sessionId === "string" ? rawData.sessionId : null;
   const approvalId = typeof rawData?.approvalId === "string" ? rawData.approvalId : null;
+  const threadId = typeof rawData?.threadId === "string" ? rawData.threadId : null;
 
   if (response.actionIdentifier === APPROVE_ACTION) {
     if (!approvalId) return { kind: "ignored" };
@@ -139,8 +143,8 @@ export async function dispatchNotificationResponse(
   // default-action constant so a future custom action that doesn't
   // need an API call still routes to the chat.
   if (sessionId) {
-    deps.navigate(sessionId);
-    return { kind: "tap", sessionId };
+    deps.navigate(sessionId, threadId);
+    return { kind: "tap", sessionId, threadId };
   }
   return { kind: "ignored" };
 }
