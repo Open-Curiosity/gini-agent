@@ -7,6 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
   buildCrashReport,
@@ -148,6 +149,66 @@ describe("redactReportText", () => {
     const num = 123 as unknown as string;
     expect(() => redactReportText(num)).not.toThrow();
     expect(redactReportText(num)).toBe(num);
+  });
+
+  test("masks an email address to [email], keeping surrounding text", () => {
+    const out = redactReportText("contact jane.doe+test@example.co.uk for help");
+    expect(out).not.toContain("jane.doe+test@example.co.uk");
+    expect(out).toContain("[email]");
+    expect(out).toContain("contact ");
+    expect(out).toContain(" for help");
+  });
+
+  test("does not mistake a package spec / version string for an email", () => {
+    // "@scope/pkg" and "pkg@1.2.3" share the @ shape but have no dotted
+    // alphabetic TLD; they must survive so the error stays readable.
+    const text = "loaded pkg@1.2.3 from @scope/pkg";
+    const out = redactReportText(text);
+    expect(out).toBe(text);
+  });
+
+  test("collapses the running user's home dir to ~ (no OS username leaks), keeping path structure", () => {
+    // The exact crash from issue #403: an absolute source path carrying the OS
+    // username. The username is PII; the path structure is debugging signal and
+    // must survive.
+    const home = homedir();
+    const text = `at writeState (${home}/.gini/runtime/src/state/store.ts:93:3)`;
+    const out = redactReportText(text);
+    // Whatever the running user's home basename is, it must not survive.
+    expect(out).not.toContain(home);
+    expect(out).toContain("~/.gini/runtime/src/state/store.ts:93:3");
+  });
+
+  test("masks the username segment of any other-account home path (Unix + Windows)", () => {
+    // Derive an account name guaranteed to differ from the running user's home
+    // (so the home->~ step doesn't fire) while still being a real home shape, so
+    // this exercises the generic fallback regardless of the test machine's user.
+    const other = `${basename(homedir())}xalt`;
+    const text = [
+      `rename '/Users/${other}/.gini/instances/default/state.json.tmp'`,
+      `at handler (/home/${other}/proj/server.ts:12:1)`,
+      `C:\\Users\\${other}\\AppData\\gini\\state.json`
+    ].join("\n");
+    const out = redactReportText(text);
+    expect(out).not.toContain(other);
+    // The path structure after the username segment is preserved.
+    expect(out).toContain("/Users/<user>/.gini/instances/default/state.json.tmp");
+    expect(out).toContain("/home/<user>/proj/server.ts:12:1");
+    expect(out).toContain("C:\\Users\\<user>\\AppData\\gini\\state.json");
+  });
+
+  test("a username-prefix home dir is not over-matched (/Users/jane vs /Users/janedoe)", () => {
+    // The boundary anchor on the home->~ match must not let the running user's
+    // home (e.g. /Users/jane) also rewrite a distinct account whose name shares
+    // that prefix (/Users/janedoe). Build the colliding name from the real home.
+    const longer = `${basename(homedir())}xdoe`;
+    const text = `see /Users/${longer}/work/app.ts:1:1`;
+    const out = redactReportText(text);
+    // The prefix-sharing account is masked as a whole segment, not partially
+    // mangled into a "~doe" by a non-anchored home-prefix match.
+    expect(out).toContain("/Users/<user>/work/app.ts:1:1");
+    expect(out).not.toContain(longer);
+    expect(out).not.toContain("~");
   });
 
   test("redacts a single-quote-escaped secrets-env value as loaded (not half-stripped)", () => {

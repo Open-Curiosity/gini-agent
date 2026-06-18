@@ -40,6 +40,10 @@ function toolCall(overrides: Partial<ToolCallBlock>): ChatBlock {
   } as ChatBlock;
 }
 
+function toolResult(callId: string, taskId: string): ChatBlock {
+  return { kind: "tool_result", id: `r${ordinal}`, sessionId: "s", instance: "test", ordinal: ordinal++, createdAt: "2026-01-01T00:00:00.000Z", callId, preview: "", truncated: false, taskId } as ChatBlock;
+}
+
 // A job-cycle exchange: an assistant preamble, a tool call, and a final
 // reply, all stamped with the same taskId. Recurring-job channels emit these
 // with no user_text — the cycle is triggered by cron, not a user message.
@@ -278,5 +282,35 @@ describe("groupExchanges narration folding", () => {
       (i) => i.kind === "block" && i.block.kind === "assistant_text"
     );
     expect(standaloneAssistant.length).toBe(3);
+  });
+
+  test("a terminal run that ended on a tool call (no final answer) folds all narration with no standalone bubble", () => {
+    // The run carries a "Completed" phase (terminal) but the model stopped
+    // after a tool call — its last assistant_text precedes that call. The
+    // caller passes the taskId in terminalTaskIds; everything folds.
+    const items = groupExchanges(
+      [
+        assistant("narration", "task_term"),
+        toolCall({ toolName: "web_search", argsPreview: "first", status: "ok", taskId: "task_term" }),
+        toolResult("call-1", "task_term"),
+        assistant("court", "task_term"),
+        toolCall({ toolName: "web_fetch", argsPreview: "second", status: "ok", taskId: "task_term" }),
+        toolResult("call-2", "task_term")
+      ],
+      new Set(["task_term"])
+    );
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    const group = groups[0]!;
+    expect(group.calls.length).toBe(2);
+    expect(group.calls.map((c) => c.argsPreview)).toEqual(["first", "second"]);
+    // Both pre-tool narration lines fold into the process as steps.
+    const narrationSteps = group.steps.filter((s) => s.kind === "narration");
+    expect(narrationSteps.map((s) => s.kind === "narration" && s.block.text)).toEqual([
+      "narration",
+      "court"
+    ]);
+    // No assistant_text leaks out as a standalone bubble.
+    expect(items.some((i) => i.kind === "block" && i.block.kind === "assistant_text")).toBe(false);
   });
 });

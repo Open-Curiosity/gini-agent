@@ -14,6 +14,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { baseStateRoot } from "../paths";
 import { SECRET_PATTERNS, redactSecretValuesFromString } from "../tools/browser";
@@ -162,10 +163,50 @@ function secretsEnvValues(body: string): string[] {
   return values;
 }
 
-// Redact secrets/tokens from arbitrary report text. Applies the extended
-// pattern list, then scrubs the literal secrets-env values. Default to
-// dropping rather than including: pattern redaction runs first so a token is
-// removed even when its literal value isn't in the provided lists.
+// Email addresses are personal information. A crash error message can echo one
+// (a failed lookup, a validation error that includes user input), and no secret
+// pattern catches it. Mask local-part + domain to "[email]" while leaving the
+// surrounding text intact. The shape requires a dotted alphabetic TLD so package
+// specs and version strings ("pkg@1.2.3", "@scope/pkg") don't false-positive.
+const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
+// Mask the local OS username out of absolute filesystem paths. Crash reports
+// and shared logs carry source/state paths (e.g.
+// "/Users/jane/.gini/runtime/src/state/store.ts:93:3"); the path structure is
+// useful for debugging but the home-directory segment leaks the OS username,
+// which is personal information. Collapse the running user's home dir to "~"
+// and mask any other-account home segment (a second user, Linux /home, Windows
+// C:\Users) so no username survives into a published issue body. The rest of
+// the path is preserved.
+function redactHomePaths(text: string): string {
+  let out = text;
+  // 1. Running user's home dir -> "~", anchored at a path-segment boundary so
+  //    "/Users/jane" doesn't also rewrite "/Users/janedoe". The lookahead
+  //    requires the next char to end the home segment (separator, quote,
+  //    whitespace, etc.) rather than continue a longer name.
+  const home = homedir();
+  if (home && home.length > 1) {
+    const escaped = home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`${escaped}(?![A-Za-z0-9_.-])`, "g"), "~");
+  }
+  // 2. Generic fallback for any home path NOT under the running user's home.
+  //    Mask only the username segment (up to the next path separator/terminator)
+  //    and keep the remainder of the path.
+  out = out.replace(/\/Users\/[^/\s:)('"]+/g, "/Users/<user>");
+  out = out.replace(/\/home\/[^/\s:)('"]+/g, "/home/<user>");
+  out = out.replace(/([A-Za-z]:\\Users\\)[^\\/\s:)('"]+/gi, "$1<user>");
+  return out;
+}
+
+// Redact secrets/tokens AND personal information (OS username, email addresses)
+// from arbitrary report text. Applies the extended secret-pattern list, scrubs
+// the literal secrets-env values, masks email addresses, then masks
+// home-directory paths. Default to dropping rather than including: pattern
+// redaction runs first so a token is removed even when its literal value isn't
+// in the provided lists. NOTE: this scrubs known shapes (secrets, usernames,
+// emails) — it is NOT a general PII detector. Free text in error.message/stack
+// can still carry user-typed names, phone numbers, or non-home filenames; those
+// are bounded instead by the dropped `data` payload and consent-before-publish.
 export function redactReportText(text: string, opts: RedactOptions = {}): string {
   // A malformed log/error field can carry a non-string (e.g. a numeric
   // `message`). String.replace on a number throws, which would drop the whole
@@ -180,6 +221,8 @@ export function redactReportText(text: string, opts: RedactOptions = {}): string
   const literals: string[] = [];
   if (opts.secretsEnvBody) literals.push(...secretsEnvValues(opts.secretsEnvBody));
   if (literals.length > 0) out = redactSecretValuesFromString(out, literals);
+  out = out.replace(EMAIL_PATTERN, "[email]");
+  out = redactHomePaths(out);
   return out;
 }
 

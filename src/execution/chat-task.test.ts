@@ -16,7 +16,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
@@ -2828,6 +2828,117 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("request_confirmation pauses the turn with a confirmation.request setup card and no reason bubble", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm", undefined, "agent_c")
+    );
+
+    const summary = "Send this reply to Dana in the project thread";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary, details: "Hi Dana — ship it.", confirmLabel: "Send" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana that it's good" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+    expect(setup?.payload.summary).toBe(summary);
+    expect(setup?.payload.confirmLabel).toBe("Send");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const setupBlock = blocks.find((b) => b.kind === "setup_requested");
+    if (setupBlock?.kind === "setup_requested") {
+      expect(setupBlock.action).toBe("confirmation.request");
+      // The summary IS the block summary — that's what transcripts show.
+      expect(setupBlock.summary).toBe(summary);
+    } else {
+      throw new Error("missing setup_requested block");
+    }
+    // Like chat.choice, no assistant bubble accompanies the card — the summary
+    // lives in the card itself.
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("confirmation.request cancel resumes the chat loop with {confirmed:false}", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm-cancel", undefined, "agent_c")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary: "Send the reply to Dana" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Okay, I won't send it. What should I change?",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+
+    await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
+
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    // Cancel must resume the loop, NOT fail the task.
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe("Okay, I won't send it. What should I change?");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    // The model receives an unambiguous boolean from the cancel.
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes('"confirmed":false'))).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");
@@ -3817,6 +3928,57 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // Issue #397: an inline-handled tool (load_tools here; the deferred-not-loaded
+  // nudge and start_thread share the branch) must PERSIST its tool result to
+  // the durable transcript, paired with the assistant tool_use row. Otherwise a
+  // later turn (or any rebuild) replays the assistant tool_use with no result,
+  // and a tool-pairing-strict provider (Bedrock Converse, Anthropic Messages)
+  // 400s the whole request. Pin: after a load_tools turn, the channel's durable
+  // chatMessages carry both the assistant call AND a role:"tool" result for it.
+  test("inline load_tools persists a paired tool_result row in the durable transcript", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // This turn opens memory.db (recall + auto-retain), and memory-db.ts caches
+    // SQLite handles by instance NAME across the process. Derive the instance
+    // from the unique mkdtemp basename so a rerun in the same worker can't reuse
+    // a cached handle pointing at this run's already-removed state dir.
+    const config = buildConfig(workspaceRoot, `chat-task-inline-persist-${basename(workspaceRoot)}`);
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) =>
+      createChatSession(state, "Inline persist").id
+    );
+
+    // Turn 1: an inline load_tools call. Turn 2: a tool-less final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_inline_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_snapshot"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({ provider, text: "Ready.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "load the browser tools", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const durable = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.kind === "tool_transcript"
+    );
+    // The assistant tool_use row was persisted...
+    const assistantCall = durable.find(
+      (m) => m.role === "assistant" && (m.toolCalls ?? []).some((c) => c.id === "call_inline_load")
+    );
+    expect(assistantCall).toBeDefined();
+    // ...AND its inline result is now a paired durable row (the fix).
+    const pairedResult = durable.find((m) => m.role === "tool" && m.toolCallId === "call_inline_load");
+    expect(pairedResult).toBeDefined();
+    expect(String(pairedResult?.content)).toContain("callable directly");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // Fan-out watch worker history. A session-bound subagent (chatSessionId set,
   // no run.conversationId — exactly how dispatchFanOut spawns a concern-channel
   // worker) must land its turn in the channel's durable chatMessages so a later
@@ -4230,12 +4392,14 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
+    // trips), each result ~3k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
-    // ahead of the 13th call.
+    // ahead of the 13th call. The per-read filler is sized so the accumulated
+    // transcript sits below the chars/4 high-water mark given the always-on
+    // tool-schema floor and system-prompt slice.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(411));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(380));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5076,14 +5240,14 @@ describe("chat-task loop", () => {
     // live always-on catalog size (cleared in afterEach).
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Twelve modest reads (~910 tokens each). With echo reporting no usage the
+    // Twelve modest reads (~880 tokens each). With echo reporting no usage the
     // calibration gap stays 0, so the only trim trigger is the chars/4 live
     // budget — and the accumulated transcript stays well under it (the budget
-    // is 32,000 − 1,600 reserve − ~12,487 floor [12,207 pinned catalog + the
-    // system-prompt slice] = ~17,913 tokens), so no
+    // is 32,000 − 1,600 reserve − ~12,739 floor [12,207 pinned catalog + the
+    // system-prompt slice] ≈ 17,661 tokens), so no
     // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_630)}`);
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_510)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5769,12 +5933,12 @@ describe("buildInactiveSkillsBlock", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
       tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
-      connectors, improvements: [], pairingCodes: [], pairingRequests: [], devices: [],
+      connectors, improvements: [], skillOutcomes: [], learningFindings: [], pairingCodes: [], pairingRequests: [], devices: [],
       promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
       mcpServers: [], messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 
@@ -5880,12 +6044,12 @@ describe("buildMcpServersBlock", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
       tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
-      connectors: [], improvements: [], pairingCodes: [], pairingRequests: [], devices: [],
+      connectors: [], improvements: [], skillOutcomes: [], learningFindings: [], pairingCodes: [], pairingRequests: [], devices: [],
       promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
       mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 

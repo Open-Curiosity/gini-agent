@@ -5,6 +5,7 @@ import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, creat
 import { isSkillActive } from "../integrations/connectors";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
+import { isSilentReply } from "./silent";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -475,6 +476,24 @@ function findRunningRun(state: RuntimeState, jobId: string): JobRunRecord | unde
   return state.jobRuns.find((run) => run.jobId === jobId && run.status === "running");
 }
 
+// A "live turn" is a non-terminal task bound to this session that was NOT
+// spawned by a job (job-spawned tasks carry `jobId`). Used to defer a
+// scheduled chat-bound job while the user's own conversation turn is in
+// flight, so the job's messages never interleave with the active turn.
+//
+// EVERY non-terminal status counts, including `waiting_approval` — do NOT
+// narrow this to `status === "running"`. A parked turn (awaiting approval)
+// resumes and emits higher-ordinal blocks that bracket a job's blocks; a job
+// allowed to run in that gap would re-trigger the `groupExchanges` reorder
+// bug (its group renders out of order relative to the resumed turn). Deferring
+// through the entire non-terminal lifetime is what keeps jobs off the live
+// turn's ordinal range.
+function sessionHasActiveLiveTurn(state: RuntimeState, sessionId: string): boolean {
+  return state.tasks.some(
+    (t) => t.chatSessionId === sessionId && t.jobId === undefined && !isTerminalTaskStatus(t.status)
+  );
+}
+
 // Drift-free advance: starting from the previous nextRunAt, advance forward
 // by intervalSeconds until the next scheduled time is in the future. The
 // first advance consumes the run we just claimed; each subsequent advance is
@@ -678,11 +697,12 @@ async function finalizeShortCircuit(
   summary?: string
 ): Promise<void> {
   // Empty / "[SILENT]" suppresses chat + bridge delivery — a "nothing new" tick
-  // delivers nothing. The match is exact-trimmed, mirroring the chat-side
-  // suppression contract (src/execution/chat.ts) and the cron-hint instruction.
+  // delivers nothing. A trailing-line sentinel after a no-op preamble also
+  // suppresses, mirroring the chat-side suppression contract
+  // (src/execution/chat.ts) and the cron-hint instruction (see src/jobs/silent.ts).
   const effectiveSummary = summary ?? "[SILENT]";
   const trimmed = effectiveSummary.trim();
-  const isSilent = trimmed.length === 0 || trimmed === "[SILENT]";
+  const isSilent = trimmed.length === 0 || isSilentReply(effectiveSummary);
 
   const outcome = await mutateState(config.instance, (state) => {
     const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
@@ -826,6 +846,13 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // for the same job is still in-flight. Leave nextRunAt alone — the
       // next tick will retry once the in-flight run completes.
       if (findRunningRun(state, job.id)) continue;
+
+      // Defer a chat-bound job while its session has a live (user-initiated)
+      // turn in flight, so the job's messages never interleave with the active
+      // conversation. Leave nextRunAt untouched — the ~1s-tick scheduler
+      // retries once the live turn finishes. Mirrors the overlap-protection
+      // skip above.
+      if (job.chatSessionId && sessionHasActiveLiveTurn(state, job.chatSessionId)) continue;
 
       // Drift-free nextRunAt + missedRuns. The first advance consumes the
       // tick we're claiming now; each additional advance is a missed run.
