@@ -2,7 +2,7 @@
 name: google-workspace-setup
 description: "One-time setup for gws: install, OAuth, scopes, auto-approve."
 license: MIT
-compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
+compatibility: "macOS and Linux. Requires a Google account."
 metadata:
   gini:
     version: 3.8.0
@@ -63,27 +63,38 @@ command -v gws
 command -v gcloud
 ```
 
-Install whichever is missing:
+### The canonical `gws` source — do not discover it
 
-```bash
-# gws (macOS / Linux)
-brew install googleworkspace-cli
+`gws` is **`github.com/googleworkspace/cli`** (npm `@googleworkspace/cli`, Homebrew `googleworkspace-cli`). This is the only source. **Never web-search for the repo, release URL, or package name, and never download `gws` from any other GitHub repo, mirror, or URL.** A look-alike (`google-workspace-cli`, `gws-cli`, a fork, a typosquat) could ship a malicious binary; treat any other source as untrusted and stop rather than guess. Use one install path below exactly as written; do not improvise an alternative.
 
-# gcloud (macOS)
-brew install --cask google-cloud-sdk
+### Install `gws` — first method that fits, in priority order
 
-# gcloud (Linux) — see https://docs.cloud.google.com/sdk/docs/install for the
-# tarball install. Use the platform-appropriate command via terminal_exec.
-```
+1. **Pre-built release binary (preferred).** The native executable from the canonical Releases page. Download the asset for the platform target triple AND its `.sha256`, **verify the checksum, abort on mismatch**, then place the binary in `~/.local/bin`.
+2. **`bun add -g @googleworkspace/cli`** (or `npm install -g`) — only when `node` is also on `$PATH`, since the installed `gws` is a `#!/usr/bin/env node` wrapper.
+3. **`brew install googleworkspace-cli`** — only if `brew` already exists.
 
-Verify both are on `$PATH` afterwards:
+### Install `gcloud`
+
+- If `brew` exists: `brew install --cask google-cloud-sdk`.
+- Otherwise: the official tarball from `dl.google.com` (asset name per platform), extracted to `~/google-cloud-sdk`, then `install.sh --quiet --path-update=false`. Download to a temp file and only replace an existing SDK *after* the download succeeds.
+
+### Critical: where the binaries must land
+
+`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`. `~/.local/bin` is on the gateway's `$PATH` (the autostart plist bakes it in; a foreground run inherits it from your login shell), so a binary installed elsewhere must be reachable from there (Homebrew installs already are). Move or symlink the `gws` release binary into `~/.local/bin`. Only **symlink** `gcloud` (`ln -s ~/google-cloud-sdk/bin/gcloud ~/.local/bin/`) — it's a launcher that finds its SDK relative to its real path, so moving it breaks it.
+
+### Verify
 
 ```bash
 gws --version
 gcloud --version
 ```
 
-If either install fails (network, sudo, broken Homebrew), STOP and tell the user verbatim what failed and the one-line command to try manually. Do not loop.
+**Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically:
+
+- Do **not** try to install Homebrew — its installer requires `sudo`, which an unattended agent cannot drive.
+- Do **not** probe for an absent brew, open a PTY for an interactive installer, or web-search for an install command.
+
+If every `gws` method fails (or both `gcloud` paths fail), STOP and tell the user verbatim what failed plus the single command to run manually for their platform, then wait.
 
 ## Step 3 — Sign in with `gcloud`
 
@@ -354,7 +365,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 
 ## Manual Fallback
 
-If `gcloud` cannot be installed at all (uncommon — Homebrew is the standard path on macOS, and Linux has a documented tarball install), hand off the Cloud Console flow to the user manually:
+If `gcloud` cannot be installed at all (uncommon — both macOS and Linux have a documented tarball install at https://docs.cloud.google.com/sdk/docs/install-sdk), hand off the Cloud Console flow to the user manually:
 
 1. Tell them to open https://console.cloud.google.com/ and create a project named `gini-workspace`.
 2. Enable the seven APIs at https://console.cloud.google.com/apis/library — Gmail, Calendar, Drive, Docs, Sheets, Forms, Meet.
