@@ -34,6 +34,7 @@ import {
 } from "../provider";
 import { cancelTask, submitTask } from "../agent";
 import {
+  closeAllMemoryDbs,
   createAuthorization,
   createChatSession,
   createSetupRequest,
@@ -62,6 +63,16 @@ function makeWorkspace(): string {
   return dir;
 }
 
+// Unique instance name per call. getMemoryDb caches the SQLite handle by
+// instance, and afterEach deletes the state root; a fixed name reused across
+// runs (e.g. `bun test --rerun-each`) would reopen a stale cached handle
+// pointing at a deleted file (SQLITE_IOERR_VNODE / "no such savepoint").
+let instanceCounter = 0;
+function uniqueInstance(base: string): string {
+  instanceCounter += 1;
+  return `${base}-${instanceCounter}`;
+}
+
 beforeEach(() => {
   scratchHome = mkdtempSync(join(tmpdir(), "gini-cancel-repro-home-"));
   prevHome = process.env.HOME;
@@ -85,6 +96,9 @@ afterEach(() => {
   else process.env.GINI_LOG_ROOT = prevLog;
   if (prevEmbedding === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
   else process.env.GINI_EMBEDDING_PROVIDER = prevEmbedding;
+  // Close cached SQLite handles before deleting the state root so a stale
+  // handle can't outlive its file (the cache is keyed by instance name).
+  closeAllMemoryDbs();
   rmSync(scratchHome, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
   for (const dir of workspaceDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -137,7 +151,7 @@ async function waitForStable<T>(sample: () => T, stableMs: number, timeoutMs = 5
 
 describe("issue #395 — cancel mid-stream", () => {
   test("the in-flight streaming assistant_text is settled (not stuck) after a mid-stream cancel", async () => {
-    const config = buildConfig(makeWorkspace(), "cancel-midstream-cursor", "auto");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-midstream-cursor"), "auto");
     const provider = normalizeProvider(config.provider);
 
     const session = await mutateState(config.instance, (state) =>
@@ -198,7 +212,7 @@ describe("issue #395 — cancel mid-stream", () => {
   });
 
   test("a routed turn does not append a 'Completed' phase after 'Cancelled'", async () => {
-    const config = buildConfig(makeWorkspace(), "cancel-midstream-route", "auto");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-midstream-route"), "auto");
     const provider = normalizeProvider(config.provider);
 
     const session = await mutateState(config.instance, (state) =>
@@ -262,7 +276,7 @@ describe("issue #395 — cancel mid-stream", () => {
   });
 
   test("a tool_call awaiting approval is settled (not left running) when the task is cancelled", async () => {
-    const config = buildConfig(makeWorkspace(), "cancel-midstream-approval", "strict");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-midstream-approval"), "strict");
     const provider = normalizeProvider(config.provider);
 
     const session = await mutateState(config.instance, (state) =>

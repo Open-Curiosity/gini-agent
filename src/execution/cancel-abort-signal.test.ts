@@ -15,6 +15,7 @@ import {
 } from "../provider";
 import { cancelTask, submitTask } from "../agent";
 import {
+  closeAllMemoryDbs,
   createChatSession,
   createTask,
   getMemoryDb,
@@ -42,6 +43,17 @@ function makeWorkspace(): string {
   return dir;
 }
 
+// Unique instance name per call. getMemoryDb caches the SQLite handle by
+// instance, and afterEach deletes the state root; a fixed name reused across
+// runs (e.g. `bun test --rerun-each`) would reopen a stale cached handle
+// pointing at a deleted file (SQLITE_IOERR_VNODE / "no such savepoint"). A
+// fresh name per test never collides with a cached handle.
+let instanceCounter = 0;
+function uniqueInstance(base: string): string {
+  instanceCounter += 1;
+  return `${base}-${instanceCounter}`;
+}
+
 beforeEach(() => {
   scratchHome = mkdtempSync(join(tmpdir(), "gini-abort-home-"));
   prevHome = process.env.HOME;
@@ -65,6 +77,9 @@ afterEach(() => {
   else process.env.GINI_LOG_ROOT = prevLog;
   if (prevEmbedding === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
   else process.env.GINI_EMBEDDING_PROVIDER = prevEmbedding;
+  // Close cached SQLite handles before deleting the state root so a stale
+  // handle can't outlive its file (the cache is keyed by instance name).
+  closeAllMemoryDbs();
   rmSync(scratchHome, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
   for (const dir of workspaceDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -95,7 +110,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 
 describe("per-turn AbortSignal", () => {
   test("cancel aborts the in-flight model call at the source — the held call stops well before its full delay", async () => {
-    const config = buildConfig(makeWorkspace(), "abort-midcall");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("abort-midcall"));
     const provider = normalizeProvider(config.provider);
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "abort-midcall", undefined, "agent_a")
@@ -149,7 +164,7 @@ describe("per-turn AbortSignal", () => {
   });
 
   test("an aborted turn is cancelled, not failed, and records no provider auth failure", async () => {
-    const config = buildConfig(makeWorkspace(), "abort-not-failed");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("abort-not-failed"));
     const provider = normalizeProvider(config.provider);
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "abort-not-failed", undefined, "agent_b")
@@ -174,7 +189,7 @@ describe("per-turn AbortSignal", () => {
   });
 
   test("healOrphanedStreamingBlocks settles a terminal task's stuck block but leaves running/queued and post-cutoff blocks alone", async () => {
-    const config = buildConfig(makeWorkspace(), "boot-heal");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("boot-heal"));
     const cutoff = "2026-06-17T12:00:00.000Z";
     const before = "2026-06-17T11:00:00.000Z"; // < cutoff
     const after = "2026-06-17T13:00:00.000Z"; // >= cutoff
@@ -244,7 +259,7 @@ describe("per-turn AbortSignal", () => {
   });
 
   test("resume-path finalize settles a stale streaming block left by a prior process before the resumed turn runs", async () => {
-    const config = buildConfig(makeWorkspace(), "resume-finalize");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("resume-finalize"));
     const provider = normalizeProvider(config.provider);
 
     // Simulate a boot-resumed orphan: a top-level chat task left at status
@@ -284,7 +299,7 @@ describe("per-turn AbortSignal", () => {
   });
 
   test("cancel denies only UNRESOLVED gated tool_call rows — a resolved one being settled by resume stays ok", async () => {
-    const config = buildConfig(makeWorkspace(), "cancel-resolved-skip");
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-resolved-skip"));
 
     // A task paused at waiting_approval whose toolCallState.pending holds two
     // gated calls: one already RESOLVED (result set — an approval that resolved
