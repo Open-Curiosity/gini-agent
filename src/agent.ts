@@ -290,8 +290,14 @@ export async function cancelTask(
 ): Promise<Task> {
   // Tool-call ids that were awaiting approval when the cancel landed. Filled
   // inside the mutateState callback (before toolCallState is cleared) and
-  // read by the post-mutation chat-block emit to settle their tool_call rows.
+  // read by the post-mutation chat-block emit to settle their tool_call rows:
+  // `cancelledPendingToolCallIds` are genuinely-unresolved gated calls (settle
+  // to `denied`); `cancelledRanToolCallIds` are calls whose approval already
+  // ran (owner left `pending`) but whose result the resume path hadn't yet
+  // recorded — settle to `ok`, since the side effect happened and the resume
+  // path will bail on the now-terminal task without emitting it.
   let cancelledPendingToolCallIds: string[] = [];
+  let cancelledRanToolCallIds: string[] = [];
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -366,10 +372,13 @@ export async function cancelTask(
       if (setup.status === "pending") gatedToolCallIds.add(callId);
       else resolvedCallIds.add(callId); // completed/cancelled — owned by the resume path.
     }
-    // Subtract any call whose owner already left `pending` (its side effect ran
-    // or is running) so a still-unresolved snapshot entry can't get denied out
-    // from under the resume path that will settle it as `ok`.
+    // Deny the genuinely-unresolved gated calls; the calls whose owner already
+    // left `pending` (side effect ran) are settled to `ok` instead — the resume
+    // path would otherwise leave their tool_call row stuck `running` because it
+    // bails on the now-terminal task before emitting. Subtract the resolved set
+    // from the deny set so no call is both denied and ok'd.
     cancelledPendingToolCallIds = [...gatedToolCallIds].filter((id) => !resolvedCallIds.has(id));
+    cancelledRanToolCallIds = [...resolvedCallIds];
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -408,11 +417,19 @@ export async function cancelTask(
         finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
       }
       // Settle any tool_call row that was waiting on an approval when the
-      // cancel landed. Mirrors the deny path (emitToolCallStatus "denied")
-      // so the row stops spinning and the gate card reads as resolved
-      // rather than staying interactive after "Cancelled" (issue #395).
+      // cancel landed. A genuinely-unresolved gated call is flipped to
+      // `denied` (mirrors the deny path) so the row stops spinning and the
+      // gate card reads resolved rather than staying interactive after
+      // "Cancelled" (issue #395). A call whose approval already ran (owner left
+      // `pending`) is flipped to `ok`: the side effect happened, but the resume
+      // path bails on the now-terminal task before emitting, so without this
+      // the row would stay stuck `running` — re-creating the #395 symptom on a
+      // tool that actually succeeded.
       for (const callId of cancelledPendingToolCallIds) {
         emitToolCallStatus(emitCtx, { callId, status: "denied" });
+      }
+      for (const callId of cancelledRanToolCallIds) {
+        emitToolCallStatus(emitCtx, { callId, status: "ok" });
       }
       emitSystemNote(emitCtx, "Cancelled");
       emitPhase(emitCtx, "Cancelled");

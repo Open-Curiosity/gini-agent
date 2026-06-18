@@ -419,7 +419,9 @@ describe("per-turn AbortSignal", () => {
 
     const toolCalls = listChatBlocks(config.instance, seeded.sessionId).filter((b) => b.kind === "tool_call");
     const ran = toolCalls.find((b) => b.kind === "tool_call" && b.callId === "call_ran");
-    // Must NOT be denied — the side effect ran; the resume path will settle it.
-    expect(ran?.kind === "tool_call" && ran.status).not.toBe("denied");
+    // The side effect ran, so the row must settle to `ok` — not `denied` (it
+    // wasn't denied) and not left `running` (the resume path bails on the now-
+    // terminal task without emitting ok, so cancelTask must settle it).
+    expect(ran?.kind === "tool_call" && ran.status).toBe("ok");
   });
 });
