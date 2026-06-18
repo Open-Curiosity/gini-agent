@@ -227,6 +227,42 @@ describe("cdp attach", () => {
     }
   });
 
+  test("a cdp attach drops the cached spawned handle so the next tool call re-attaches", async () => {
+    // Regression (live-caught): without dropping the cached in-process handle,
+    // ensureShared short-circuits on the live spawned Chrome and never re-reads
+    // the freshly-persisted cdp record, so the agent keeps driving the spawned
+    // browser. connectBrowser must call disconnectSharedBrowser after the attach.
+    const config = testConfig("cdp-drops-cached-handle");
+    const browserMod = await import("../tools/browser");
+    browserMod.setBrowserInstance(config.instance);
+    let spawnedClosed = false;
+    browserMod.__test.installFakeSpawnedHandleForTest(9333, {
+      close: async () => {
+        spawnedClosed = true;
+      },
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/real" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    try {
+      const status = await connectBrowser(config, { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc" });
+      expect(status.connected).toBe(true);
+      // The cached spawned handle was torn down (its context.close() ran) and
+      // the shared slot is now empty, so the next ensureShared rebuilds via cdp.
+      expect(spawnedClosed).toBe(true);
+      expect(browserMod.__test.uninstallFakeBrowserForTest().kind).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.resetBrowserInstanceForTest();
+    }
+  });
+
   test("connect surfaces an unreachable CDP endpoint as a clear error (no record written)", async () => {
     const config = testConfig("cdp-attach-unreachable");
     const originalFetch = globalThis.fetch;
