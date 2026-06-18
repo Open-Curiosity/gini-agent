@@ -605,6 +605,8 @@ export function ensureChatBlocksKindConstraint(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_thread ON chat_blocks(session_id, thread_id, ordinal);
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_streaming ON chat_blocks(updated_at)
+      WHERE kind = 'assistant_text' AND json_extract(payload_json, '$.streaming') = 1;
   `);
 }
 

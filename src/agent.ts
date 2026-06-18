@@ -327,8 +327,18 @@ export async function cancelTask(
     // snapshot ids with the tool-call ids on the durable pending
     // authorization / setup-request rows for this task, which exist as soon as
     // dispatch creates the gate.
+    // Only deny entries that are still UNRESOLVED. An approval resolving in
+    // parallel (resolveAuthorization → resumeChatTask) sets `result` on its
+    // snapshot entry and emits the tool_call row as `ok` BEFORE clearing
+    // toolCallState. A cancel racing that window must not re-flip the
+    // already-settled `ok` row to `denied` — that would mislabel a tool that
+    // genuinely ran. Skipping resolved entries (result already set) leaves
+    // them for the resume path to settle; only the genuinely-pending gated
+    // calls the cancel is tearing down get denied.
     const gatedToolCallIds = new Set<string>(
-      (task.toolCallState?.pending ?? []).map((p) => p.toolCallId)
+      (task.toolCallState?.pending ?? [])
+        .filter((p) => typeof p.result !== "string")
+        .map((p) => p.toolCallId)
     );
     for (const auth of state.authorizations) {
       if (auth.taskId !== taskId || auth.status !== "pending") continue;

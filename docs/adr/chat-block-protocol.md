@@ -309,13 +309,20 @@ remote previews, screen readers) would need the same translation code.
     `authorization` / `setup_request` rows, so a cancel landing
     mid-dispatch — before the loop persists `toolCallState` — still
     stops the row spinning), then emits `system_note("Cancelled")` and
-    `phase("Cancelled")`. The runtime model call carries no
-    `AbortSignal`, so a turn cancelled mid-stream keeps producing
-    deltas until the call returns; the streaming flush re-checks
-    terminal status and drops post-cancel deltas (no new
+    `phase("Cancelled")`. The runtime model call now carries the turn's
+    `AbortSignal`; `cancelTask` aborts it at the source so the in-flight
+    provider fetch + stream reader stop immediately (rejecting with an
+    `AbortError`) instead of producing deltas until the connection's
+    natural end (see `src/execution/turn-abort.ts`). As defense-in-depth
+    for the brief window before the abort unwinds the stream, the streaming
+    flush re-checks terminal status and drops post-cancel deltas (no new
     `assistant_text` block is born after the cancel), and
     `switchTurnToThread` likewise refuses to emit a main-chat
-    `phase("Completed")` once the task is terminal.
+    `phase("Completed")` once the task is terminal. A stuck streaming block
+    left by a process that died mid-stream (before this landed) is healed:
+    `runChatTask` settles a resumed task's own stale block, and a one-shot
+    boot sweep (`healOrphanedStreamingBlocks`) settles orphaned blocks whose
+    task is terminal/waiting_approval/absent.
   - `failTask` mirrors cancelTask: finalize streaming text, emit
     `system_note(<error>)`, `phase("Failed")`.
   - `decideApproval(deny)` flips the matching `tool_call` to

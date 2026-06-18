@@ -282,4 +282,67 @@ describe("per-turn AbortSignal", () => {
     // And no assistant_text block is left streaming at all after the turn.
     expect(blocks.some((b) => b.kind === "assistant_text" && b.streaming)).toBe(false);
   });
+
+  test("cancel denies only UNRESOLVED gated tool_call rows — a resolved one being settled by resume stays ok", async () => {
+    const config = buildConfig(makeWorkspace(), "cancel-resolved-skip");
+
+    // A task paused at waiting_approval whose toolCallState.pending holds two
+    // gated calls: one already RESOLVED (result set — an approval that resolved
+    // and whose row the resume path settled to `ok`, not yet cleared from the
+    // snapshot) and one still UNRESOLVED. cancelTask must deny only the
+    // unresolved one; re-flipping the resolved `ok` row to `denied` would
+    // mislabel a tool that genuinely ran.
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "cancel-resolved-skip", undefined, "agent_s");
+      const t = createTask(config.instance, "gated work", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "waiting_approval";
+      t.mode = "chat";
+      t.toolCallState = {
+        messages: [],
+        toolsHash: "h",
+        iterations: 1,
+        pending: [
+          { toolCallId: "call_resolved", toolName: "terminal_exec", approvalId: "authz_a", result: "ran ok" },
+          { toolCallId: "call_unresolved", toolName: "terminal_exec", approvalId: "authz_b" }
+        ]
+      };
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+
+    // The resolved call's row was already settled to `ok` by the resume path.
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo ok",
+      argsFull: { command: "echo ok" },
+      status: "ok",
+      callId: "call_resolved",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+    // The unresolved call's row is still running (genuinely awaiting approval).
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo wait",
+      argsFull: { command: "echo wait" },
+      status: "running",
+      callId: "call_unresolved",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const toolCalls = listChatBlocks(config.instance, seeded.sessionId).filter((b) => b.kind === "tool_call");
+    const resolved = toolCalls.find((b) => b.kind === "tool_call" && b.callId === "call_resolved");
+    const unresolved = toolCalls.find((b) => b.kind === "tool_call" && b.callId === "call_unresolved");
+    // The resolved tool keeps its `ok` — not demoted to `denied` by the cancel.
+    expect(resolved?.kind === "tool_call" && resolved.status).toBe("ok");
+    // The genuinely-unresolved gated tool is settled to `denied`.
+    expect(unresolved?.kind === "tool_call" && unresolved.status).toBe("denied");
+  });
 });

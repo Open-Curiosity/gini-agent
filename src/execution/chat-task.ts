@@ -2237,17 +2237,19 @@ async function runLoop(
     routeResolved = !(isFirstModelCall && threadDetectionEnabled());
     const flush = async (): Promise<void> => {
       if (!pending) return;
-      // Cancel-during-stream guard. The provider call carries no AbortSignal,
-      // so a turn cancelled mid-stream keeps streaming deltas until the call
-      // returns. Without this check, a post-cancel flush would open a fresh
-      // assistant_text block (or keep growing one) that the cancelled
-      // bail-out path never settles — leaving a block stuck at streaming:true
-      // (the "stuck cursor" the user saw) and surfacing text the user asked
-      // to stop. Once the task is terminal, drop the buffered deltas and stop
-      // painting. cancelTask already settled whatever block existed at cancel
-      // time via findInFlightAssistantTextForTask; this closes the window
-      // where a new block would otherwise be born AFTER the cancel. A missing
-      // task row counts as terminal too, matching the top-of-loop guard.
+      // Cancel-during-stream guard (defense-in-depth). The provider call now
+      // carries the turn AbortSignal, so cancelTask aborts it at the source —
+      // but a few buffered deltas can still arrive in the brief window before
+      // the abort unwinds the stream reader. Without this check, such a
+      // post-cancel flush would open a fresh assistant_text block (or keep
+      // growing one) that the cancelled bail-out path never settles — leaving a
+      // block stuck at streaming:true (the "stuck cursor") and surfacing text
+      // the user asked to stop. Once the task is terminal, drop the buffered
+      // deltas and stop painting. cancelTask already settled whatever block
+      // existed at cancel time via findInFlightAssistantTextForTask; this
+      // closes the window where a new block would otherwise be born AFTER the
+      // cancel. A missing task row counts as terminal too, matching the
+      // top-of-loop guard.
       const flushTask = readState(config.instance).tasks.find((t) => t.id === taskId);
       if (!flushTask || isTerminalTaskStatus(flushTask.status)) {
         pending = "";
