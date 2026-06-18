@@ -340,3 +340,16 @@ export async function primeCredentials(): Promise<AuthCredentials | null> {
   cached = value;
   return value;
 }
+
+// Re-mirror the cached credentials into the App Group shared container on
+// cold start. The shared container is otherwise written only on sign-in
+// (saveCredentials) and after push registration — neither of which runs on
+// a plain relaunch of an already-signed-in user who doesn't open a chat. An
+// existing user (or anyone signed in before this feature shipped) would then
+// have an empty container and the NSE would silently fall back to the generic
+// banner. Call this from the root-layout prime sequence AFTER the device
+// token has been primed so writeSharedCredentialsForAuth folds it in. No-op
+// when signed out; best-effort (writeSharedCredentialsForAuth never throws).
+export function mirrorCachedCredentialsToSharedContainer(): void {
+  if (cached) writeSharedCredentialsForAuth(cached);
+}

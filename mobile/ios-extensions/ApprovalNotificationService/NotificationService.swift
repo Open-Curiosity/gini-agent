@@ -15,9 +15,12 @@
 //      the gateway; it never transits Apple. See ADR
 //      mobile-push-notifications.md.
 //
-//   2. Attach the approval category. For approval / setup events we set
-//      categoryIdentifier = "APPROVAL_REQUEST" so the OS renders the
-//      lock-screen Approve / Deny buttons the main app registered.
+//   2. Attach the approval category. For authorization_requested events
+//      only (see approvalEvents) we set categoryIdentifier =
+//      "APPROVAL_REQUEST" so the OS renders the lock-screen Approve / Deny
+//      buttons the main app registered. setup_requested is enriched too
+//      but carries no buttons — it needs the app (open a browser, fill a
+//      form), so it deep-links on tap instead.
 //
 // Routing fields live under userInfo["body"] (the dispatcher nests them
 // there because expo-notifications drops top-level userInfo keys on the
