@@ -10,11 +10,13 @@
 // the source.
 //
 // Protocol (mirrors approval-execution.ts's in-flight registry):
-//   1. `runLoop` calls `registerTurn(instance, taskId)` at entry and threads
-//      the returned controller's signal into every model/aux call for that
-//      turn. It MUST call `releaseTurn(instance, taskId)` in a `finally` so
-//      the entry is reaped on every exit (completion / cancel / throw).
-//   2. `cancelTask` (and the deny/fail cascades) call
+//   1. The turn entry points — `runChatTask` (fresh turn) and `resumeChatTask`
+//      (approval resume) — call `registerTurn(instance, taskId)` before
+//      invoking `runLoop`, thread the returned controller's signal into every
+//      model/aux call for that turn, and MUST call
+//      `releaseTurn(instance, taskId, controller)` in a `finally` so the entry
+//      is reaped on every exit (completion / cancel / throw).
+//   2. `cancelTask` (and the deny/fail cascades, via recordInFlightAborted) call
 //      `abortTurnForTask(instance, taskId, reason)` INSIDE their mutateState
 //      callback so the abort serializes with the task's status flip through
 //      the per-instance lock — the same ordering discipline the approved-

@@ -745,7 +745,7 @@ export interface ToolCallingResult {
 // loop calls the provider multiple times. A stub with `error` set makes
 // the echo call throw instead, exercising callers' provider-failure paths
 // (context-overflow retries, auth tagging, task failure).
-const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string; delayMs?: number }> = [];
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string; delayMs?: number; streamAfterAbort?: boolean }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
@@ -760,12 +760,26 @@ const echoToolCallingToolNames: string[][] = [];
 // provider that returns the whole string at once — callers' no-delta
 // paths (one-shot block emission, route finalization without a stream)
 // are unreachable otherwise, since echo streams every non-empty text.
+// `streamAfterAbort`: deliver this stub's text through onDelta and RETURN
+// normally even if the turn was aborted during its delayMs hold, instead of
+// the abortable sleep rejecting. This models a real provider that had already
+// buffered deltas on the wire when the abort fired — they arrive on a later
+// macrotask before the stream unwinds. It is the only way to exercise the
+// loop's defense-in-depth flush / route terminal-status guards (which drop
+// post-cancel deltas), since the normal abortable-sleep path rejects before
+// any delta and never reaches them. Has no effect when the turn isn't aborted.
 export function setEchoToolCallingResponse(
   result: ToolCallingResult,
   tag?: string,
-  opts?: { nonStreaming?: boolean; delayMs?: number }
+  opts?: { nonStreaming?: boolean; delayMs?: number; streamAfterAbort?: boolean }
 ): void {
-  echoToolCallingStubs.push({ tag, result, nonStreaming: opts?.nonStreaming, delayMs: opts?.delayMs });
+  echoToolCallingStubs.push({
+    tag,
+    result,
+    nonStreaming: opts?.nonStreaming,
+    delayMs: opts?.delayMs,
+    streamAfterAbort: opts?.streamAfterAbort
+  });
 }
 
 // Queue an echo tool-calling FAILURE: the next echo-backed
@@ -803,7 +817,7 @@ function nextEchoToolCallingResult(
   provider: ProviderConfig,
   lastUserText: string,
   onDelta?: (text: string) => void
-): { result: ToolCallingResult; nonStreaming: boolean; delayMs?: number } {
+): { result: ToolCallingResult; nonStreaming: boolean; delayMs?: number; streamAfterAbort: boolean } {
   const stub = echoToolCallingStubs.shift();
   if (stub?.error !== undefined) {
     if (stub.streamTextBeforeFailure && onDelta) {
@@ -815,7 +829,14 @@ function nextEchoToolCallingResult(
     }
     throw new Error(stub.error);
   }
-  if (stub?.result) return { result: stub.result, nonStreaming: Boolean(stub.nonStreaming), delayMs: stub.delayMs };
+  if (stub?.result) {
+    return {
+      result: stub.result,
+      nonStreaming: Boolean(stub.nonStreaming),
+      delayMs: stub.delayMs,
+      streamAfterAbort: Boolean(stub.streamAfterAbort)
+    };
+  }
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
   // a deterministic shape.
@@ -826,7 +847,8 @@ function nextEchoToolCallingResult(
       toolCalls: [],
       finishReason: "stop"
     },
-    nonStreaming: false
+    nonStreaming: false,
+    streamAfterAbort: false
   };
 }
 
@@ -864,13 +886,23 @@ export async function generateToolCallingResponse(
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
     echoToolCallingToolNames.push(tools.map((t) => t.function.name));
-    const { result, nonStreaming, delayMs } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
+    const { result, nonStreaming, delayMs, streamAfterAbort } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
     // Optional injected latency so concurrency tests can measure overlap:
     // a serial dispatch of N delayed children costs ~N*delay wall time; a
     // concurrent dispatch costs ~delay. Defaults to no delay (instant). The
     // sleep honors the abort signal so a test can cancel a turn mid-call and
-    // observe the same AbortError a real provider fetch would raise.
-    if (delayMs && delayMs > 0) await abortableSleep(delayMs, signal);
+    // observe the same AbortError a real provider fetch would raise — UNLESS
+    // the stub set streamAfterAbort, which models a real provider that already
+    // had buffered deltas on the wire: it swallows the abort and still streams
+    // + returns, so the loop's defense-in-depth post-cancel flush/route guards
+    // are exercised (they're unreachable via the rejecting path).
+    if (delayMs && delayMs > 0) {
+      if (streamAfterAbort) {
+        await abortableSleep(delayMs, signal).catch(() => {});
+      } else {
+        await abortableSleep(delayMs, signal);
+      }
+    }
     if (result.text && onDelta && !nonStreaming) {
       // Synthesize a single streamed delta so callers exercise their
       // streaming pipelines in echo-backed tests.

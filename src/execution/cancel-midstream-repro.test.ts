@@ -2,16 +2,22 @@
 // "Mobile: Cancel/Stop on a running turn shows 'Cancelled' but the agent
 //  keeps running."
 //
-// A turn cancelled while a model call is in flight kept painting: the
-// provider call carries no AbortSignal, so cancellation is purely state-based
-// and checked only at discrete loop checkpoints. The echo provider's delayMs
-// hook holds a model call open, which lets a cancel land while a turn is
-// genuinely in flight — the window the report describes. These tests pin the
-// observable symptoms:
+// A turn cancelled while a model call is in flight kept painting. The "full
+// fix" aborts the in-flight model call at the source (covered in
+// cancel-abort-signal.test.ts); these tests pin the DEFENSE-IN-DEPTH layer —
+// the loop's terminal-status guards that drop deltas/route/blocks which a real
+// provider can still deliver in the brief window AFTER the abort fires but
+// BEFORE the stream unwinds. The echo `streamAfterAbort` stub models exactly
+// that: it holds the call open with delayMs, then swallows the abort and
+// streams its text post-cancel, so the guards are genuinely exercised (the
+// plain abortable-sleep path rejects first and never reaches them). These
+// tests pin the observable symptoms:
 //
-//   1. The in-flight streaming assistant_text block is settled (not left
-//      streaming:true) after a mid-stream cancel — no "stuck cursor".
-//   2. A routed turn does not append a "Completed" phase after "Cancelled".
+//   1. The flush guard settles the in-flight streaming assistant_text (not
+//      left streaming:true) when a delta arrives post-cancel — no "stuck
+//      cursor".
+//   2. The switchTurnToThread guard keeps a routed turn from appending a
+//      "Completed" phase after "Cancelled" when the route resolves post-cancel.
 //   3. A tool_call awaiting approval is settled (not left `running`) when the
 //      task is cancelled — the gate card stops reading as live work.
 //   4. A tool_call whose approval row exists but whose loop snapshot has not
@@ -138,12 +144,16 @@ describe("issue #395 — cancel mid-stream", () => {
       createChatSession(state, "cancel-midstream-cursor", undefined, "agent_y")
     );
 
-    // A slow streaming text turn. The echo provider holds the model call open
-    // for delayMs, THEN streams the text through onDelta and returns. We
-    // cancel DURING the delay, so cancel lands before the post-delay flush
-    // opens the assistant_text block. Before the fix, that post-cancel flush
-    // opened a streaming:true block the cancelled bail-out never settled — a
-    // perpetually-streaming block with no closer.
+    // This pins the DEFENSE-IN-DEPTH flush terminal-status guard, not the
+    // source-abort path. streamAfterAbort makes the echo call SWALLOW the abort
+    // and still stream its delta AFTER the cancel landed — modeling a real
+    // provider that had buffered deltas on the wire when the abort fired (they
+    // arrive on a later macrotask before the stream unwinds). The post-cancel
+    // flush must then observe terminal status and drop the delta rather than
+    // open a streaming:true block the cancelled bail-out never settles (the
+    // "stuck cursor"). Without streamAfterAbort the abortable sleep rejects and
+    // the flush guard is never reached. (The pure source-abort behavior is
+    // covered separately in cancel-abort-signal.test.ts.)
     setEchoToolCallingResponse(
       {
         provider,
@@ -152,7 +162,7 @@ describe("issue #395 — cancel mid-stream", () => {
         finishReason: "stop"
       },
       undefined,
-      { delayMs: 400 }
+      { delayMs: 400, streamAfterAbort: true }
     );
 
     const task = await submitTask(config, "stream me something", {
@@ -196,14 +206,17 @@ describe("issue #395 — cancel mid-stream", () => {
     );
 
     // The model's reply begins with a <route>thread</route> directive. The
-    // turn is held open by delayMs; we cancel during the hold. The flush bails
-    // on the terminal guard before resolving the route, so the route resolves
-    // post-model in finalizeTurnRoute → switchTurnToThread. Without the
-    // terminal guard inside switchTurnToThread, it would emit a main-chat
-    // "Completed" phase AFTER cancelTask's "Cancelled" phase. We submit via
-    // submitChatMessage (not submitTask) so the turn has a user_text block to
-    // branch the thread from — otherwise switchTurnToThread bails at no-parent
-    // and the buggy emit never runs.
+    // turn is held open by delayMs; we cancel during the hold. streamAfterAbort
+    // makes the echo call SWALLOW the abort and still return its text AFTER the
+    // cancel landed (modeling a real provider whose response was already on the
+    // wire). The route then resolves post-model in finalizeTurnRoute →
+    // switchTurnToThread. Without the terminal guard inside switchTurnToThread,
+    // it would emit a main-chat "Completed" phase AFTER cancelTask's
+    // "Cancelled" phase. (Without streamAfterAbort the abortable sleep rejects
+    // and switchTurnToThread is never reached, so the guard would go untested.)
+    // We submit via submitChatMessage (not submitTask) so the turn has a
+    // user_text block to branch the thread from — otherwise switchTurnToThread
+    // bails at no-parent and the buggy emit never runs.
     setEchoToolCallingResponse(
       {
         provider,
@@ -212,7 +225,7 @@ describe("issue #395 — cancel mid-stream", () => {
         finishReason: "stop"
       },
       undefined,
-      { delayMs: 400 }
+      { delayMs: 400, streamAfterAbort: true }
     );
 
     const submitted = await submitChatMessage(config, session.id, { content: "answer me" }, { bypassQueue: true });
