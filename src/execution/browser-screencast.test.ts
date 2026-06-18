@@ -115,6 +115,10 @@ describe("ScreencastBridge.start", () => {
     };
     socket.open();
     await expect(p).rejects.toThrow(/socket dead/);
+    // A failed start must tear its own partial state down, not leak the open
+    // page socket (the caller discards the bridge and can't reach it later).
+    expect(socket.closed).toBe(true);
+    expect(bridge.isClosed()).toBe(true);
   });
 
   test("rejects (does not hang) when the socket closes before open", async () => {

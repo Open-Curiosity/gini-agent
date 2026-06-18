@@ -189,16 +189,25 @@ export class ScreencastBridge {
       this.signInFamily.add(pageTarget.id);
       this.visitedTargetIds.add(pageTarget.id);
     }
-    await this.attachTo(pageTarget.webSocketDebuggerUrl);
-    // Follow popup / new-tab sign-in: many OAuth flows open a popup the user
-    // must complete in. A browser-level Target.targetCreated stream tells us
-    // each new page target's openerId; the watcher re-points the screencast to
-    // a fresh page ONLY when it belongs to this sign-in's opener family, and
-    // falls back within the family when the watched page closes. Same-tab
-    // redirect sign-in needs no switch (the screencast follows the page target
-    // through its own navigations).
-    await this.startTargetDiscovery(port);
-    this.startTargetWatch(port);
+    // If any startup step fails (a wedged CDP send, the page target vanishing
+    // mid-attach), tear down the partially-built bridge before propagating, or
+    // the open page socket leaks — the caller discards this bridge and never
+    // reaches it for teardown. stop()/handleClosed are idempotent.
+    try {
+      await this.attachTo(pageTarget.webSocketDebuggerUrl);
+      // Follow popup / new-tab sign-in: many OAuth flows open a popup the user
+      // must complete in. A browser-level Target.targetCreated stream tells us
+      // each new page target's openerId; the watcher re-points the screencast to
+      // a fresh page ONLY when it belongs to this sign-in's opener family, and
+      // falls back within the family when the watched page closes. Same-tab
+      // redirect sign-in needs no switch (the screencast follows the page target
+      // through its own navigations).
+      await this.startTargetDiscovery(port);
+      this.startTargetWatch(port);
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
   }
 
   // Open a raw CDP socket to one page target's wsUrl and start its screencast.
