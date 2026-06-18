@@ -1,18 +1,24 @@
 // Browser automation tools. Drives Chromium via playwright-core in one of
-// two modes:
+// three modes:
 //
-//   - "persistent" (default): chromium.launchPersistentContext(dataDir, {
-//     headless }) — one BrowserContext backed by the per-instance profile
-//     directory at ~/.gini/instances/<inst>/chrome-profile/. Used for BOTH
-//     the headless default (no state.browser record) and the visible window
-//     (state.browser.mode === "managed") — the only difference is the
-//     `headless` flag at launch. Sign-ins land on disk under the profile dir
-//     and persist across Connect/Disconnect cycles and across runtime
-//     restarts. All tasks share the single context (cookies bleed across
-//     tasks within an instance, per the explicit product decision).
+//   - "spawned" (default): a per-instance branded Chrome the runtime launches
+//     itself (launchSpawnedChrome) over the pipe transport, with a free-picked
+//     --remote-debugging-port for the sign-in screencast. This is the agent's
+//     DEFAULT path when there is no state.browser record. Backed by the
+//     per-instance profile dir at ~/.gini/instances/<inst>/chrome-profile/.
+//   - "persistent": chromium.launchPersistentContext(dataDir, { headless }) —
+//     the visible "Connect"/managed window (state.browser.mode === "managed"),
+//     backed by the SAME per-instance profile dir; the headed/headless flag is
+//     the only launch difference.
 //   - "cdp": chromium.connectOverCDP(url) — attach to an external Chrome
 //     the user started themselves. We reuse browser.contexts()[0] for the
 //     same shared-cookie reason.
+//
+// All modes share the per-instance profile dir, so a sign-in done in any of
+// them is visible to the others; sign-ins persist across Connect/Disconnect
+// cycles and across runtime restarts. All tasks share the single context
+// (cookies bleed across tasks within an instance, per the explicit product
+// decision).
 //
 // "Connect" and "Disconnect" are visibility toggles. They tear down the
 // current shared handle so the next call relaunches with the right
@@ -32,15 +38,19 @@ import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
+import { launchSpawnedChrome } from "./chrome-launch";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { resolveImageByteLimit, resolveProviderModality } from "../provider-capabilities";
-import { addAudit, assertInsideWorkspace, mutateState, readState } from "../state";
+import { addAudit, assertInsideWorkspace, mutateState, readState, recordUsage } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
-// and cookies here; the directory survives Connect/Disconnect cycles and
-// runtime restarts. Removing it requires deleting the directory manually.
+// and cookies here; the directory survives runtime restarts and (for the
+// spawned default launch) Chrome process restarts. The spawned default
+// launch, the visible Connect/managed window, and a re-attach all share this
+// one dir, so a sign-in done in any of them is visible to the others.
+// Removing it requires deleting the directory manually.
 export function chromeProfileDirFor(instance: Instance): string {
   return join(instanceRoot(instance), "chrome-profile");
 }
@@ -56,6 +66,32 @@ export function peekCurrentBrowserUrl(taskId: string): string | undefined {
   if (!session) return undefined;
   try {
     return session.page.url();
+  } catch {
+    return undefined;
+  }
+}
+
+// Resolve the CDP targetId of the task's CURRENT page (session.page) — the exact
+// tab the agent is driving. The screencast binds to this target so it shows the
+// requesting task's page, never a sibling task's tab that happens to share a URL
+// in the shared per-instance context (matching the old single-window behavior,
+// where the user acted on the agent's actual page). The id equals the `id` field
+// Chrome's /json reports for that target. Returns undefined when there's no live
+// session or the CDP lookup fails — the caller then falls back to the URL hint.
+export async function peekCurrentBrowserTargetId(taskId: string): Promise<string | undefined> {
+  const session = sessions.get(taskId);
+  if (!session) return undefined;
+  try {
+    const cdp = await session.context.newCDPSession(session.page);
+    try {
+      const info = (await cdp.send("Target.getTargetInfo")) as {
+        targetInfo?: { targetId?: string };
+      };
+      const id = info?.targetInfo?.targetId;
+      return typeof id === "string" ? id : undefined;
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
   } catch {
     return undefined;
   }
@@ -148,19 +184,32 @@ interface Session {
 }
 
 // Discriminated union describing the currently-installed shared handle.
-// Persistent mode is used for BOTH the headless default and the visible
-// window — the only difference is whether `headed` is true. CDP attach
-// keeps its own variant because it carries a Browser handle (returned by
-// connectOverCDP) alongside the borrowed context.
+//   - spawned: the DEFAULT agent path. We launched a branded Chrome ourselves
+//     via launchPersistentContext (--headless=new + stealth flags + clean UA +
+//     the per-instance profile + a free-picked --remote-debugging-port) over
+//     the pipe transport. Carries the profileDir we reap on teardown (a
+//     profile-dir-scoped SIGKILL — never killall, never the user's :9222) and
+//     the debug port (used by the sign-in modal that attaches over CDP).
+//   - persistent: the visible "Connect"/managed window, launched by
+//     browser-connect via chromium.launchPersistentContext. Unchanged.
+//   - cdp: attach to an external Chrome the user started themselves. Unchanged.
+//
+// All three are PER INSTANCE: there is one shared browser per instance, stored
+// in the single `shared` slot below, and tasks share its context (cookies
+// bleed across tasks within an instance, per the explicit product decision).
 type SharedHandle =
+  | { kind: "spawned"; context: BrowserContext; port: number; profileDir: string }
   | { kind: "persistent"; context: BrowserContext; headed: boolean }
   | { kind: "cdp"; browser: Browser; context: BrowserContext };
 
+// The single instance-level handle every mode installs into. The spawned
+// default, the visible Connect window, and the cdp attach are each
+// one-per-instance, so a single slot fits all three.
 let shared: SharedHandle | null = null;
 let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefined;
 // In-flight launch/attach promise so concurrent ensureShared callers share
-// one chromium.launch() / launchPersistentContext() / connectOverCDP()
-// instead of orphaning the loser's handle.
+// one launchPersistentContext() / connectOverCDP() instead of orphaning the
+// loser's handle.
 let pendingShared: Promise<SharedHandle> | null = null;
 // Monotonically-increasing disconnect counter. Bumped at the start of
 // every disconnectSharedBrowser call. Replaces an earlier boolean
@@ -331,14 +380,16 @@ function activeBrowserRecord(): BrowserConnectionRecord | undefined {
 // chain starts so two concurrent cold-start callers see the same decision;
 // if the record changes mid-launch the result is a stale handle, but the
 // disconnect-generation re-check below catches that and forces a retry.
-type Mode = "persistent" | "cdp";
+type Mode = "spawned" | "persistent" | "cdp";
 
 function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
-  // Both "no record" (headless persistent) and "managed" (visible
-  // persistent) take the persistent branch; only an explicit cdp record
-  // diverges. The headed/headless distinction is decided inside
-  // ensureShared from the record's mode.
-  if (!record) return "persistent";
+  // The agent's DEFAULT path ("no record") now launches its own branded
+  // Chrome via the spawned provider (per-instance profile + free debug port).
+  // The visible "managed" Connect window still uses the persistent provider
+  // (chromium.launchPersistentContext); an explicit cdp record still attaches
+  // to the user's own Chrome. The headed/headless distinction for managed is
+  // decided inside the persistent provider from the record's mode.
+  if (!record) return "spawned";
   return record.mode === "managed" ? "persistent" : "cdp";
 }
 
@@ -355,16 +406,17 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
 // browser-automation-engine.md, "Remote session provider seam") and it
 // must hold for any future provider.
 //
-// Today's providers are the two modes that always existed: a persistent
-// local launch and a CDP attach to an external Chrome. The one capability
-// the local engine cannot fake is IP reputation (datacenter-IP blocks,
-// geo walls); a future remote/cloud-browser provider slots in as a third
-// entry that resolves its remote endpoint (provision a cloud session,
-// then attach over CDP/WebSocket) and returns a cdp-shaped SharedHandle —
-// or adds its own SharedHandle variant when its teardown needs extra
-// release work (e.g. an API call ending the cloud session). The
-// disconnect-generation choreography stays in ensureShared / teardown
-// call sites; it is transport-agnostic.
+// Today's providers are three: `spawned` (the DEFAULT — a per-instance branded
+// Chrome the runtime launches itself over the pipe transport), `persistent`
+// (the visible managed Connect window via launchPersistentContext), and `cdp`
+// (attach to the user's own external Chrome). The one capability the local
+// engine cannot fake is IP reputation (datacenter-IP blocks, geo walls); a
+// future remote/cloud-browser provider would slot in as a fourth entry that
+// resolves its remote endpoint (provision a cloud session, then attach over
+// CDP/WebSocket) and returns a cdp-shaped SharedHandle — or adds its own
+// SharedHandle variant when its teardown needs extra release work (e.g. an API
+// call ending the cloud session). The disconnect-generation choreography stays
+// in ensureShared / teardown call sites; it is transport-agnostic.
 interface BrowserSessionProvider {
   kind: Mode;
   // Establish the transport and return the live handle. Called by
@@ -374,6 +426,54 @@ interface BrowserSessionProvider {
   // runs on paths (disconnect, exit hooks) that cannot surface errors.
   disconnect(handle: SharedHandle): Promise<void>;
 }
+
+// The per-instance profile dir the spawned default launch uses. Refuses to
+// launch when no instance is registered (raw test imports install a fake
+// handle instead).
+function spawnedProfileDir(): string {
+  if (!runtimeInstance) {
+    throw new Error(
+      "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
+    );
+  }
+  return chromeProfileDirFor(runtimeInstance);
+}
+
+// The spawn-and-attach launcher, indirected through a module-level binding so
+// tests can swap it for a fake (like chromeKiller below) and exercise the
+// provider body without launching a real Chrome. Production uses the real
+// chrome-launch implementation.
+let spawnChrome: typeof launchSpawnedChrome = launchSpawnedChrome;
+
+const spawnedSessionProvider: BrowserSessionProvider = {
+  kind: "spawned",
+  async connect() {
+    // Launch our OWN branded Chrome (headless) against the per-instance profile
+    // dir on a free debug port, over Playwright's pipe transport. The user's
+    // :9222 is never touched; the debug port is free-picked above it (and is
+    // the endpoint the sign-in modal attaches to over CDP).
+    const profileDir = spawnedProfileDir();
+    const { context, port } = await spawnChrome({ profileDir, headless: true });
+    return { kind: "spawned", context, port, profileDir };
+  },
+  async disconnect(handle) {
+    if (handle.kind !== "spawned") return;
+    // Close the persistent context, which terminates the Chrome Playwright
+    // launched. Bound it so a wedged Chrome can't hang teardown; on timeout,
+    // reap by the instance profile dir (so the scan SIGKILLs only this
+    // instance's spawned Chrome — never killall, never the user's :9222). The
+    // profile dir on disk stays put so sign-ins persist.
+    const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
+    if (!settled) {
+      try {
+        const killed = chromeKiller(handle.profileDir);
+        if (killed >= 1) await new Promise((r) => setTimeout(r, 300));
+      } catch {
+        // best effort — a kill failure must never throw out of teardown.
+      }
+    }
+  }
+};
 
 const persistentSessionProvider: BrowserSessionProvider = {
   kind: "persistent",
@@ -489,6 +589,7 @@ const cdpSessionProvider: BrowserSessionProvider = {
 // teardownHandle dispatch through this table and need no changes.
 // Mutable only via __test.setSessionProviderForTest.
 const sessionProviders: Record<Mode, BrowserSessionProvider> = {
+  spawned: spawnedSessionProvider,
   persistent: persistentSessionProvider,
   cdp: cdpSessionProvider
 };
@@ -526,7 +627,11 @@ function isHandleAlive(handle: SharedHandle): boolean {
     switch (handle.kind) {
       case "cdp":
         return handle.browser.isConnected();
+      case "spawned":
       case "persistent":
+        // Both are persistent contexts (pipe transport) — probe the context's
+        // Browser via isContextConnected, which returns false on an external
+        // kill and true otherwise.
         return isContextConnected(handle.context);
     }
   } catch {
@@ -540,6 +645,18 @@ function isHandleAlive(handle: SharedHandle): boolean {
 // internal admission gate compares against.
 export function currentDisconnectGeneration(): number {
   return disconnectGeneration;
+}
+
+// The spawned default Chrome's CDP debug port, or null when the live handle
+// isn't a spawned one (no browser yet, or a managed/cdp record is active). The
+// sign-in screencast bridge dials ONLY this port (always ≥ DEFAULT_CDP_PORT_BASE,
+// well above the user's conventional :9222) to attach its raw-CDP screencast —
+// it never accepts a port from the client. Returns null rather than launching:
+// the bridge is a read/drive channel over an ALREADY-running headless Chrome,
+// not a reason to spawn one.
+export function getScreencastPort(): number | null {
+  if (shared && shared.kind === "spawned" && isHandleAlive(shared)) return shared.port;
+  return null;
 }
 
 async function ensureShared(): Promise<SharedHandle> {
@@ -729,8 +846,8 @@ function startSweeper(): void {
 // context is CREATED — impossible for both the persistent context
 // (launched before any task exists) and a CDP-attached user Chrome —
 // while tracing can start on an already-live context in either mode. The
-// BrowserContext is shared across tasks, so only one trace runs at a
-// time: the first session created while none is active claims it;
+// BrowserContext is shared across tasks (one per instance), so only one trace
+// runs at a time: the first session created while none is active claims it;
 // sessions starting while a trace is in flight are simply not recorded.
 //
 // Trace archives are raw Playwright captures (DOM snapshots +
@@ -872,13 +989,14 @@ async function getOrCreate(taskId: string): Promise<Session> {
   if (inflight) return inflight;
   const promise = (async () => {
     const handle = await ensureShared();
-    // Both persistent and cdp share a single BrowserContext across tasks
-    // (cookies bleed by design — one profile per instance). The first task
-    // claims any existing page (e.g. the about:blank Playwright opens at
-    // launch); subsequent tasks each get a fresh tab so they don't trample
-    // each other.
+    // Tasks sharing one BrowserContext share its cookies (by design — one
+    // profile per instance). The FIRST task on the context claims any existing
+    // page (e.g. the about:blank Chrome opens at launch); later tasks each get
+    // a fresh tab so they don't trample each other. Count by context (not
+    // global session count) so the initial page is claimed exactly once.
     const context = handle.context;
-    const reusable = sessions.size === 0 ? context.pages()[0] : undefined;
+    const contextHasSession = Array.from(sessions.values()).some((s) => s.context === context);
+    const reusable = contextHasSession ? undefined : context.pages()[0];
     const page = reusable ?? (await context.newPage());
     // Only mark the page as agent-owned when we just created it. A reused
     // pre-existing page (CDP-attached user tab, managed-mode profile's
@@ -1122,6 +1240,15 @@ export async function withTeardownLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export async function closeAll(): Promise<void> {
+  // Bump the generation so an in-flight launch that resolves during this
+  // teardown sees the mismatch and tears its own handle down instead of
+  // installing it into `shared` after our cleanup ran (a leak past process
+  // exit). Then drain the in-flight launch before tearing down, mirroring
+  // disconnectSharedBrowser.
+  disconnectGeneration++;
+  if (pendingShared) {
+    await pendingShared.catch(() => undefined);
+  }
   const ids = Array.from(sessions.keys());
   for (const id of ids) {
     const session = sessions.get(id);
@@ -1648,6 +1775,7 @@ async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: stri
       user: remainder.slice(0, SNAPSHOT_SUMMARY_INPUT_CAP),
       maxTokens: SNAPSHOT_SUMMARY_MAX_TOKENS
     });
+    void recordUsage(config.instance, { source: "aux" }, result.cost).catch(() => {});
     const summary = result.text.trim();
     return summary.length > 0 ? summary : undefined;
   } catch {
@@ -5027,11 +5155,35 @@ export const __test = {
     runtimeInstance = undefined;
   },
   // Swap a session provider so the seam-dispatch test can verify
-  // ensureShared / teardownHandle route through the registry without
-  // touching playwright-core. Pass null to restore the built-in provider.
+  // ensureShared / teardownHandle route through the registry without touching
+  // playwright-core. Pass null to restore the built-in provider.
   setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
-    sessionProviders[kind] =
-      provider ?? (kind === "persistent" ? persistentSessionProvider : cdpSessionProvider);
+    const builtIn: Record<Mode, BrowserSessionProvider> = {
+      spawned: spawnedSessionProvider,
+      persistent: persistentSessionProvider,
+      cdp: cdpSessionProvider
+    };
+    sessionProviders[kind] = provider ?? builtIn[kind];
+  },
+  // Swap the spawn-and-attach launcher so the spawned-provider tests exercise
+  // the real provider body without launching Chrome. Pass null to restore the
+  // production launcher.
+  setSpawnChromeForTest(fn: typeof launchSpawnedChrome | null): void {
+    spawnChrome = fn ?? launchSpawnedChrome;
+  },
+  // Read the resolved per-instance spawned profile dir (exercises the
+  // no-instance throw).
+  spawnedProfileDirForTest(): string {
+    return spawnedProfileDir();
+  },
+  // Drive a provider's connect() directly so the managed/cdp/spawned body
+  // branches (no-instance refusal, missing cdpUrl) can be exercised without
+  // routing a whole tool call.
+  connectProviderForTest(
+    kind: Mode,
+    record: BrowserConnectionRecord | undefined
+  ): Promise<SharedHandle> {
+    return sessionProviders[kind].connect(record);
   },
   // Reset the opt-in recording flag and any active trace claim so
   // recording tests don't leak state into siblings.
@@ -5061,6 +5213,17 @@ export const __test = {
     context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>
   ): void {
     shared = { kind: "persistent", context: context as BrowserContext, headed: false };
+  },
+  // Install a fake spawned handle so getScreencastPort and the spawned
+  // teardown can be asserted without launching Chrome. The context's
+  // browser().isConnected() drives liveness (getScreencastPort only returns
+  // the port for a LIVE spawned handle).
+  installFakeSpawnedHandleForTest(
+    port: number,
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>,
+    profileDir = "/tmp/fake-spawn-profile"
+  ): void {
+    shared = { kind: "spawned", context: context as BrowserContext, port, profileDir };
   },
   // Liveness probe over the currently-installed shared handle. Null when no
   // handle is installed. Lets tests assert that an externally-killed Chrome

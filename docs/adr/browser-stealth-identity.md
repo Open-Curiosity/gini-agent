@@ -2,7 +2,12 @@
 
 ## Decision
 
-The agent's managed/persistent browser launches as a normal branded Google Chrome rather than Playwright's bundled Chromium. Three coordinated choices, all centralized in `src/tools/chrome-discovery.ts` and shared by both launch sites (`src/tools/browser.ts` `ensureShared` and `src/capabilities/browser-connect.ts` `launchManaged`) via the `launchPersistentChrome` helper:
+The agent's browser launches as a normal branded Google Chrome rather than Playwright's bundled Chromium. The same stealth identity is shared by two launch mechanisms:
+
+- **The agent's default browser is a spawned per-instance Chrome.** `src/tools/chrome-launch.ts` (`launchSpawnedChrome`) drives a real branded Chrome via `chromium.launchPersistentContext` over Playwright's PIPE transport with `--headless=new`, the shared `CHROME_LAUNCH_ARGS`, the clean UA, the per-instance `--user-data-dir`, and a free-picked `--remote-debugging-port` in the launch args (the TCP debug port is an extra local-only endpoint used by the sign-in screencast bridge, not how the automation is driven — `connectOverCDP` over a TCP WebSocket hangs under playwright-core 1.60 + Bun, so the pipe is used instead). Teardown closes the persistent context; if that wedges, it reaps the Chrome bound to the instance's profile dir by scanning for the matching `--user-data-dir` (never `killall`, never the user's `:9222`). This is the `spawned` `BrowserSessionProvider` and is the path every agent tool call takes when no explicit `state.browser` record is set (see [Browser Automation Engine](browser-automation-engine.md)).
+- **The visible "Connect" window and CDP attach are unchanged.** The managed/visible launch (`src/capabilities/browser-connect.ts` `launchManaged`) still uses Playwright's `launchPersistentContext` against the per-instance profile dir, and CDP attach still reaches the user's own Chrome via `connectOverCDP`.
+
+The identity choices are centralized in `src/tools/chrome-discovery.ts` and reused by both mechanisms (`launchSpawnedChrome` and `launchPersistentChrome`):
 
 1. **Branded identity.** `resolveBrowserLaunchTarget` prefers the detected branded Google Chrome stable binary (launched via `executablePath`) over the bundled Chromium. The bundled Chromium remains the automatic fallback — used when no branded Chrome is installed, or when a branded launch fails to start/drive. `GINI_CHROME_PATH` still wins unconditionally (explicit binary). We launch by `executablePath` rather than Playwright's `channel: "chrome"` so the launch drives exactly the binary we already probe for the UA (`cleanChromeUserAgent`) and store in `record.chromePath` — a channel launch leans on Playwright's own separate channel detection, which can resolve a different binary than the one we discovered and divergence there would mislabel the UA and the recorded path.
 2. **Cleared `navigator.webdriver`.** Every managed/persistent launch carries `--disable-blink-features=AutomationControlled` (in the shared `CHROME_LAUNCH_ARGS`), which makes `navigator.webdriver` read `false`.
@@ -11,7 +16,7 @@ The agent's managed/persistent browser launches as a normal branded Google Chrom
 
 ## Profile Persistence And Login Consistency
 
-Each instance gets its own browser profile: both launch sites resolve the data dir to `chromeProfileDirFor(instance)` = `~/.gini/instances/<instance>/chrome-profile` (the visible "Connect" browser and the agent's headless browser share that one dir, so a login set in either is visible to the other), and `launchPersistentContext` persists cookies/localStorage to it. Three failure modes broke "login set once stays logged in" and are addressed here:
+The profile is per instance. `chromeProfileDirFor(instance)` resolves to `~/.gini/instances/<instance>/chrome-profile`, and the spawned default launch, the visible "Connect" / managed launch, and a re-attach all share that one dir — so a sign-in done in any of them (including through the sign-in screencast modal) is visible to every subsequent browser tool call in the instance. There is one shared browser per instance; cookies bleed across tasks within an instance, per the explicit product decision. Three failure modes broke "login set once stays logged in" and are addressed here:
 
 - **Keychain-encrypted cookies** couldn't be decrypted across launches on a locked-Keychain Mac → `--password-store=basic` (above).
 - **An externally-killed Chrome** (crash, or the user quitting the branded Chrome the agent now shares) used to wedge the runtime on a stale, dead handle so every later tool call failed until a gateway restart. `isContextConnected` (in `src/tools/browser.ts`) now probes `Browser.isConnected()` instead of `context.pages()` — which returns `[]` without throwing after an external kill — so `ensureShared` relaunches and `getOrCreate` drops a session whose Chrome died mid-task. The browser self-heals; cookies already flushed to the persistent profile survive the relaunch.
@@ -42,8 +47,10 @@ The CDP-attach mode (a user's own Chrome, reached via `connectOverCDP`) is uncha
 
 ## Acceptance Checks
 
-- `CHROME_LAUNCH_ARGS` contains `--disable-blink-features=AutomationControlled` and `--password-store=basic`, and both launch sites pass them through.
-- A login (persistent cookie + localStorage) set in an instance's browser is still present after a gateway restart, and after the agent's Chrome is killed and relaunched.
+- `CHROME_LAUNCH_ARGS` contains `--disable-blink-features=AutomationControlled` and `--password-store=basic`, and every launch mechanism (`launchSpawnedChrome`, `launchPersistentChrome`) passes them through.
+- The spawned default launch picks a free debug port at or above `DEFAULT_CDP_PORT_BASE` (well above the conventional `9222`), so it never collides with — or attaches to — a user's personal debugging Chrome on `9222`; on teardown it closes the persistent context and, only if that wedges, reaps the Chrome bound to the instance's profile dir (never `killall`).
+- The spawned default launch, the visible Connect/managed launch, and re-attach all target the per-instance `chrome-profile` dir (`chromeProfileDirFor(instance)`), so they share one signed-in profile.
+- A login (persistent cookie + localStorage) set in the instance's browser is still present after a gateway restart, and after the spawned Chrome is killed and relaunched.
 - With branded Chrome installed, `resolveBrowserLaunchTarget` returns `{ executablePath: <branded path>, branded: true }`; a branded target always carries a non-null `executablePath`.
 - `GINI_CHROME_PATH` pointing at an existing binary yields `{ executablePath: <path>, branded: false }`.
 - `cleanChromeUserAgent(null)` returns `undefined`; for a binary whose `--version` prints `Google Chrome 142.0.7000.1`, it returns a UA containing `Chrome/142.0.0.0` and the platform token, with no "Headless".

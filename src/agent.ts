@@ -37,6 +37,7 @@ import {
   now,
   readState,
   recordProviderAuthFailure,
+  recordUsage,
   upsertTask
 } from "./state";
 import type { AgentContext } from "./state/audit";
@@ -83,6 +84,7 @@ import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./memory";
+import { recordObjectiveOutcomes } from "./learning/outcomes";
 import { updateRunFromTask } from "./execution/runs";
 import { dispatchNextPendingChatMessage } from "./execution/chat";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
@@ -817,6 +819,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       hindsightUnitsRecalled
     }
   });
+  void recordUsage(config.instance, { source: "imperative", taskId, agentId: task.agentId }, providerResult.cost).catch(() => {});
 
   task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
@@ -860,6 +863,11 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   // pre-skip obvious tool invocations (read/list/find). Best-effort: log but
   // don't fail.
   void scheduleAutoRetain(config, task);
+  // Skill learning tier 1: harvest objective outcomes from the task's
+  // skill.script.invoked audit rows (ADR skill-learning-from-outcomes.md).
+  // Fire-and-forget; it swallows its own errors so it never destabilizes
+  // completion.
+  void recordObjectiveOutcomes(config, task);
 
   return task;
 }
@@ -1006,6 +1014,11 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   });
   if (!task) return;
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
+  // Skill learning tier 1: harvest objective failure outcomes from the failed
+  // task (ADR skill-learning-from-outcomes.md). Attributes any skill script
+  // failures and, when no script ran, an unattributed task-failure row.
+  // Fire-and-forget; swallows its own errors.
+  void recordObjectiveOutcomes(config, task);
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
@@ -1174,6 +1187,9 @@ export async function completeLowRiskToolTask(
   if (completed.status === "completed") {
     // Hindsight phase 5: auto-retain. Skip read/list/find — they're noise.
     void scheduleAutoRetain(config, completed);
+    // Skill learning tier 1: harvest objective outcomes (ADR
+    // skill-learning-from-outcomes.md). Fire-and-forget.
+    void recordObjectiveOutcomes(config, completed);
   }
   await updateRunFromTask(config, completed);
   if (completed.jobId) await finalizeJobRunFromTask(config, completed);

@@ -232,6 +232,36 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Skill-learning feedback capture (ADR skill-learning-from-outcomes.md).
+    // When the user answers a "Skill review" question about whether a recent
+    // action turned out right, the model records the verdict here so the next
+    // review reflects on it. Sync, low-risk: it only appends a SkillOutcome row.
+    toolset: "skills",
+    displayLabel: "Record skill feedback",
+    // Deferred: it's reachable on any turn (a Skill review question can land in
+    // any session) but is only needed when the user is answering one, so it
+    // surfaces by name + summary in the on-demand index and the model loads its
+    // schema via load_tools when it actually needs it. Keeping it out of the
+    // live tools array avoids adding a schema slot to every turn.
+    deferred: true,
+    indexSummary: "Record the user's verdict (right / wrong) on a recent action they were asked about in a Skill review.",
+    type: "function",
+    function: {
+      name: "record_skill_feedback",
+      description: "Record the user's verdict on whether a recent skill-driven action turned out right, in answer to a Skill review question. A negative verdict is attributed to the named skill so it can be improved. Only call this when the user is answering such a question.",
+      parameters: {
+        type: "object",
+        properties: {
+          skill_name: { type: "string", description: "The skill the question was about (e.g. 'apple-notes')." },
+          task_id: { type: "string", description: "The id of the task whose action the user is judging (from the review question)." },
+          ok: { type: "boolean", description: "true if the action turned out right, false if it was wrong." },
+          detail: { type: "string", description: "Optional: what went wrong, when ok is false." }
+        },
+        required: ["task_id", "ok"]
+      }
+    }
+  },
+  {
     // Subagent delegation. Spawns a constrained child task running the
     // chat-task agent loop with its own system prompt and toolset/skill
     // subsets. The dispatch waits for the child to reach a terminal state
@@ -725,12 +755,12 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_connect",
-      description: "Surface a Connect button in chat that hands the user a visible Chrome window on the agent's own browser profile, for a step only the user can perform; when they finish, the browser returns to headless and the agent continues with the persisted session. Two sanctioned uses — it is NEVER a first step and must NOT be called before navigating: always navigate with browser_navigate first. (1) Sign-in unblock (default, mode \"sign-in\"): ONLY when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. Never call it proactively for sign-in; for ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the agent continues. (2) Sensitive-step handoff (mode \"handoff\"): the task has reached a step the USER must perform themselves in the visible window — entering payment details, a final purchase confirmation — or the user chose via ask_user to finish manually. Only at such a genuine user-must-act step or on the user's explicit choice, never as a shortcut for steps you can drive yourself, and only when the user is at the gateway machine (the per-turn surface note tells you). The user clicks Connect, completes the step in the visible window, clicks \"I'm done\", then the agent continues — re-snapshot the page, confirm the outcome from it, and report. In both uses pass `url` = the page you ALREADY navigated to (the sign-in wall, or the page the user must act on), so the visible Chrome reopens that exact page and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
+      description: "Surface a Connect button in chat that lets the user act on the agent's own browser, for a step only the user can perform; when they finish, the agent continues with the persisted session. After they click Connect, a live view of the agent's browser opens in chat (a screencast of the headless browser they can click and type in) so the user does it without leaving the app. Two sanctioned uses — it is NEVER a first step and must NOT be called before navigating: always navigate with browser_navigate first. (1) Sign-in unblock (default, mode \"sign-in\"): ONLY when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. Never call it proactively for sign-in; for ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the agent continues. (2) Sensitive-step handoff (mode \"handoff\"): the task has reached a step the USER must perform themselves — entering payment details, a final purchase confirmation — or the user chose via ask_user to finish manually. Only at such a genuine user-must-act step or on the user's explicit choice, never as a shortcut for steps you can drive yourself, and only when the user is at the gateway machine (the per-turn surface note tells you). The user clicks Connect, completes the step, clicks \"I'm done\", then the agent continues — re-snapshot the page, confirm the outcome from it, and report. In both uses pass `url` = the page you ALREADY navigated to (the sign-in wall, or the page the user must act on), so the live view shows that exact page and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
       parameters: {
         type: "object",
         properties: {
           reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription', 'Enter your payment details to finish the booking')." },
-          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to — the sign-in wall, or the page the user must act on. The visible Chrome reopens this exact page, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
+          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to — the sign-in wall, or the page the user must act on. The live browser view shows this exact page, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
           mode: { type: "string", enum: ["sign-in", "handoff"], default: "sign-in", description: "Which sanctioned use this is. \"sign-in\" (default): clear a sign-in wall — the completion card reads \"I've signed in\". \"handoff\": the user performs a sensitive step themselves (payment entry, final confirmation) — the completion card reads \"I'm done\"." },
           headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / completion flow handles the headed→headless transition automatically.", default: false }
         },
@@ -2182,6 +2212,12 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // instance can't follow its own skill prompt without a toolset toggle.
     if (tool.function.name === "list_skills") return true;
     if (tool.function.name === "read_skill") return true;
+    // record_skill_feedback (ADR skill-learning-from-outcomes.md) — the model
+    // records the user's answer to a "Skill review" question. Always-on like
+    // read_skill: a review question can land in any session, and the agent must
+    // be able to capture the verdict regardless of toolset state. Low-risk: it
+    // only appends a SkillOutcome row.
+    if (tool.function.name === "record_skill_feedback") return true;
     // Always expose spawn_subagent. Like read_skill it's a runtime
     // capability not tied to a legacy default toolset row, and gating it
     // on enable would silently disable delegation on freshly cloned

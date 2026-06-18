@@ -21,7 +21,8 @@ import type {
   SubagentRecord,
   Task,
   TraceRecord,
-  AuditEvent
+  AuditEvent,
+  UsageSource
 } from "@runtime/types";
 import type {
   ChatMessage,
@@ -61,6 +62,31 @@ function scopedPath(path: string, agentId: string | undefined): string {
   if (!agentId) return path;
   const separator = path.includes("?") ? "&" : "?";
   return `${path}${separator}agentId=${encodeURIComponent(agentId)}`;
+}
+
+// One day's token usage from GET /api/usage — the server-side rollup of the
+// durable usage ledger (chat, jobs, subagents, memory, titles, vision …),
+// scoped to the active agent. Mirrors DayUsage in src/state/usage.ts.
+export interface UsageDay {
+  day: string;
+  dayStart: number;
+  input: number;
+  output: number;
+  total: number;
+  estimatedUsd: number;
+  bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
+}
+
+export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
+  const agentId = useActiveAgentId();
+  const { enabled: callerEnabled, ...rest } = options ?? {};
+  return useQuery<UsageDay[]>({
+    queryKey: ["usage", agentId ?? null, days],
+    queryFn: () => api<UsageDay[]>(scopedPath(`/usage?days=${days}`, agentId)),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    ...rest
+  });
 }
 
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {

@@ -1,5 +1,6 @@
 .gini/
 node_modules/
+coverage/
 .DS_Store
 .playwright-cli/
 .playwright-mcp/

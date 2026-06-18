@@ -49,6 +49,25 @@ export function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+// Request timeouts. A gateway that accepts the TCP connection but never
+// answers (a half-dead socket left behind by a torn-down chat SSE stream,
+// a proxy hop that dropped the response, the device losing the network
+// mid-flight) would otherwise leave the fetch pending forever: React
+// Query's `isLoading` stays latched, the screen's spinner never resolves,
+// and there's no error to retry — the user has to force-quit (issue #396).
+//
+// GETs are idempotent reads that should return in well under a second on
+// the local/Tailscale links this app talks to, and they're what backs the
+// list screens whose spinner the user stares at. A short ceiling means a
+// stuck read surfaces a retryable error fast instead of after a long hang
+// (with React Query's retry:1, the felt wait is two timeouts plus the
+// retry backoff). Writes (POST/PUT/PATCH/DELETE) can legitimately block on
+// server-side work, so they get a more forgiving ceiling. Either way the
+// per-call `timeoutMs` wins — the voice send path passes a much larger
+// value so first-run transcription isn't cut off.
+const GET_TIMEOUT_MS = 10_000;
+const WRITE_TIMEOUT_MS = 20_000;
+
 interface ApiOptions extends Omit<RequestInit, "headers" | "credentials"> {
   headers?: Record<string, string>;
   // Override the cached gateway credentials (used by the setup screen to
@@ -56,13 +75,20 @@ interface ApiOptions extends Omit<RequestInit, "headers" | "credentials"> {
   // rather than `credentials` to avoid colliding with the standard
   // RequestInit.credentials cookie/CORS field.
   auth?: AuthCredentials;
+  // Per-call request timeout in milliseconds. Defaults by method
+  // (GET_TIMEOUT_MS for reads, WRITE_TIMEOUT_MS for writes); pass a larger
+  // value for routes that block on slow server-side work (e.g. first-run
+  // voice transcription). A timeout aborts the in-flight fetch and surfaces
+  // as ApiError(0, …) so the caller settles into an error state instead of
+  // hanging.
+  timeoutMs?: number;
 }
 
 export async function api<T = unknown>(path: string, init: ApiOptions = {}): Promise<T> {
   const creds = init.auth ?? readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
 
-  const { auth: _auth, ...rest } = init;
+  const { auth: _auth, timeoutMs, signal: callerSignal, ...rest } = init;
 
   // Defensively re-derive the origin so a malformed value in storage
   // (e.g. one written by an older build that didn't normalize) can't
@@ -82,21 +108,87 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  const url = `${parsed.origin}/api${path}`;
-  const response = await fetch(url, { ...rest, headers });
-
-  // 204 No Content (or any empty body) — return null cast as T so callers
-  // that don't care about the body don't choke on JSON.parse.
-  const text = await response.text();
-  const value = text ? safeParse(text) : null;
-  if (!response.ok) {
-    const message =
-      (value && typeof value === "object" && "error" in value && typeof value.error === "string")
-        ? value.error
-        : `HTTP ${response.status}`;
-    throw new ApiError(response.status, message);
+  // Arm a timeout that aborts the request if the gateway never responds.
+  // RN polyfills AbortController (abort-controller@3) but NOT the static
+  // AbortSignal.timeout()/any() helpers, so wire it manually: our timer
+  // fires the controller. The internal timeout is what guarantees the
+  // request settles (issue #396) — it does not depend on the caller. A
+  // caller that DOES pass a `signal` (e.g. to forward React Query's
+  // cancellation) chains in so an upstream cancel also aborts; current
+  // query hooks don't forward one, so this is an opt-in capability, not a
+  // requirement.
+  //
+  // The timer must stay armed across BOTH the fetch AND the body read.
+  // Expo's winter fetch resolves the Response as soon as headers arrive
+  // and streams the body lazily, so a gateway that flushes headers then
+  // stalls the body would slip past a timer cleared right after fetch()
+  // and hang forever on response.text() — the exact infinite-spinner
+  // (issue #396) the timeout exists to prevent. So clear the timer only
+  // in the finally that wraps the whole request, after the body is read.
+  const controller = new AbortController();
+  // Default by method: a missing/"GET" method is an idempotent read and
+  // gets the short ceiling; anything else is a write and gets the longer
+  // one. An explicit timeoutMs overrides both.
+  const method = (rest.method ?? "GET").toUpperCase();
+  const defaultTimeout = method === "GET" ? GET_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+  const timeout = timeoutMs ?? defaultTimeout;
+  // Track WHY the controller aborted with an explicit flag rather than
+  // sniffing the thrown error's name. The aborted-request error shape is
+  // runtime-specific — RN's whatwg-fetch throws a DOMException named
+  // "AbortError", but Expo's winter fetch (the global on device) throws
+  // its own FetchError that is NOT named "AbortError" — so a name check
+  // would misclassify the timeout on device and let the raw error escape
+  // instead of the tagged ApiError(0). The flag is set only by our timer,
+  // so a caller-initiated cancel never trips it.
+  let didTimeout = false;
+  const timer = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeout);
+  // A caller-driven abort disarms the timer before aborting, so the timer
+  // can't fire afterward and flip didTimeout — that would misclassify a
+  // genuine caller cancellation as a timeout (the abort rejection reaches
+  // the catch a microtask later, leaving a window for the macrotask timer
+  // to run first). Both the already-aborted and the later-abort paths go
+  // through here so neither can race the flag.
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    controller.abort();
+  };
+  if (callerSignal) {
+    if (callerSignal.aborted) onCallerAbort();
+    else callerSignal.addEventListener("abort", onCallerAbort);
   }
-  return value as T;
+
+  const url = `${parsed.origin}/api${path}`;
+  try {
+    const response = await fetch(url, { ...rest, headers, signal: controller.signal });
+    // Read the body under the same armed timeout — a stalled body aborts
+    // here too. 204 No Content (or any empty body) → null cast as T so
+    // callers that don't care about the body don't choke on JSON.parse.
+    const text = await response.text();
+    const value = text ? safeParse(text) : null;
+    if (!response.ok) {
+      const message =
+        (value && typeof value === "object" && "error" in value && typeof value.error === "string")
+          ? value.error
+          : `HTTP ${response.status}`;
+      throw new ApiError(response.status, message);
+    }
+    return value as T;
+  } catch (err) {
+    // Our timer fired → tagged transport error so the query settles into
+    // isError instead of staying pending forever. A caller-initiated abort
+    // (didTimeout false) is a real cancellation — rethrow as-is so React
+    // Query treats it as a cancelled query, not a failure.
+    if (didTimeout) {
+      throw new ApiError(0, `Request to ${path} timed out`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
+  }
 }
 
 function safeParse(text: string): unknown {

@@ -16,6 +16,8 @@ export {
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
+export { recordUsage, applyUsage, localDayKey, buildDailyUsage, backfillUsageLedger, backfillUsageLedgerOnce } from "./usage";
+export type { DayUsage, DaySourceUsage } from "./usage";
 export { recordProviderAuthFailure, clearProviderAuthFailureIfPresent } from "./provider-auth";
 export {
   getMemoryDb,
@@ -112,6 +114,8 @@ export {
   findInFlightAssistantTextForTask,
   healOrphanedStreamingBlocks,
   taskProducedAssistantText,
+  latestAssistantTextForSession,
+  latestAssistantTextForThread,
   getLatestMessagesBySession,
   subscribeChatBlocks,
   subscribeAllChatBlocks
@@ -129,7 +133,10 @@ export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {
   addSseSubscription,
   isDeviceWatching,
-  hasAnyActiveSubscription
+  hasAnyActiveSubscription,
+  clearDeviceWatch,
+  clearSessionWatch,
+  clearStreamWatch
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,
@@ -166,6 +173,8 @@ export {
   createJob,
   createJobRun,
   createImprovementProposal,
+  createSkillOutcome,
+  createLearningFinding,
   createPairingCode,
   claimPairingCode,
   revokeDevice,

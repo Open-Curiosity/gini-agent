@@ -25,11 +25,13 @@ import {
   now,
   readState,
   readTrace,
-  recordProviderAuthFailure
+  recordProviderAuthFailure,
+  recordUsage
 } from "../state";
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
+import { recordObjectiveOutcomes } from "../learning/outcomes";
 import { recall } from "../memory";
 import {
   ProviderAuthError,
@@ -84,7 +86,8 @@ import type {
   SubagentRecord,
   Task,
   TaskToolCallState,
-  ToolCallSummary
+  ToolCallSummary,
+  UsageContext
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
@@ -1846,6 +1849,16 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
+  // Usage-ledger attribution for every model call in this turn. The source
+  // distinguishes a subagent child / scheduled job / ordinary chat by the
+  // task's own provenance; compaction/aux calls override source to "aux".
+  const usageBaseCtx: UsageContext = {
+    source: taskRow?.subagentId || taskRow?.parentTaskId ? "subagent" : taskRow?.jobId ? "job" : "chat",
+    agentId: effective.agentId,
+    taskId,
+    jobId: taskRow?.jobId,
+    subagentId: taskRow?.subagentId
+  };
   // Provider override passed into generateToolCallingResponse / generateAuxText
   // below. We must pass the RESOLVED provider whenever it differs from
   // config.provider — an agent override OR a transient dispatch fallback (the
@@ -2147,6 +2160,12 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
+      // Skill learning tier 1: harvest objective outcomes from the task's
+      // skill.script.invoked audit rows (ADR skill-learning-from-outcomes.md).
+      // The chat-turn terminal path is the real surface, so capture must ride
+      // here alongside auto-retain — agent.ts's completeTask/finishTaskTransition
+      // wiring does not cover the chat completion path. Fire-and-forget.
+      void recordObjectiveOutcomes(config, exhausted);
       if (exhausted.chatSessionId) {
         void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
           appendLog(config.instance, "chat.auto_title.failed", {
@@ -2459,6 +2478,7 @@ async function runLoop(
               turnSignal
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
+            void recordUsage(config.instance, { ...usageBaseCtx, source: "aux" }, aux.cost).catch(() => {});
             summaryText = aux.text.trim();
           } catch (error) {
             // Turn-abort: the in-flight compaction aux call was cancelled. Bail
@@ -2630,6 +2650,7 @@ async function runLoop(
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
+    void recordUsage(config.instance, usageBaseCtx, result.cost).catch(() => {});
     // Recalibrate the trim budget from the provider's real prompt-token
     // count for this call (when reported). Applies from the NEXT iteration's
     // elision pass onward.
@@ -2774,6 +2795,10 @@ async function runLoop(
       // the model's text stream doesn't retain a cancelled output.
       if (finished.status === "completed") {
         void scheduleAutoRetain(config, finished);
+        // Skill learning tier 1: harvest objective outcomes alongside
+        // auto-retain at the chat-turn terminal (ADR skill-learning-from-outcomes.md).
+        // Fire-and-forget.
+        void recordObjectiveOutcomes(config, finished);
         if (finished.chatSessionId) {
           void autoRenameChatAfterTurn(config, finished.chatSessionId).catch((error) => {
             appendLog(config.instance, "chat.auto_title.failed", {
@@ -2837,6 +2862,24 @@ async function runLoop(
 
     const pendingApprovals: PendingToolCall[] = [];
     const toolResultMessages: ToolCallingMessage[] = [];
+
+    // Append a tool result to this turn's working set AND persist it as a
+    // durable transcript row in one step. Every place that resolves a tool
+    // call must do both: the in-memory push keeps THIS turn's history paired,
+    // and the durable row keeps a later replay/rebuild paired. Splitting the
+    // two (push without persist) is exactly the dangling-tool_use bug the
+    // provider-side backstop in src/provider.ts had to catch — keep them
+    // together so a new branch can't reintroduce it. Branch-specific emit /
+    // trace / state-mutation calls stay at the call site; this owns only the
+    // push+persist pair.
+    const recordToolResult = (callId: string, content: string): void => {
+      toolResultMessages.push({ role: "tool", tool_call_id: callId, content });
+      persistTranscriptRow(config, taskId, transcriptSessionId, {
+        role: "tool",
+        toolCallId: callId,
+        content
+      });
+    };
 
     // Before we start dispatching tool calls, finalize the streaming
     // assistant_text block (if any) so clients see the model's
@@ -2902,16 +2945,7 @@ async function runLoop(
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
         const skipContent = JSON.stringify({ ok: false, skipped: true, reason: skipMessage });
-        toolResultMessages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: skipContent
-        });
-        persistTranscriptRow(config, taskId, transcriptSessionId, {
-          role: "tool",
-          toolCallId: call.id,
-          content: skipContent
-        });
+        recordToolResult(call.id, skipContent);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: skipMessage });
         emitToolResult(emitCtx, { callId: call.id, result: skipMessage });
         await mutateState(config.instance, (state) => {
@@ -3055,12 +3089,7 @@ async function runLoop(
         // paired (assistant tool_call -> tool result) in the exact sequence
         // the provider emitted the calls.
         for (const entry of settled) {
-          toolResultMessages.push({ role: "tool", tool_call_id: entry.member.id, content: entry.content });
-          persistTranscriptRow(config, taskId, transcriptSessionId, {
-            role: "tool",
-            toolCallId: entry.member.id,
-            content: entry.content
-          });
+          recordToolResult(entry.member.id, entry.content);
           if (entry.ok) {
             emitToolCallStatus(emitCtx, { callId: entry.member.id, status: "ok" });
           } else {
@@ -3112,7 +3141,7 @@ async function runLoop(
           }
         }
         const content = JSON.stringify(resultPayload);
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
+        recordToolResult(call.id, content);
         await mutateState(config.instance, (state) => {
           const item = findTask(state, taskId);
           if (isTerminalTaskStatus(item.status)) return;
@@ -3153,7 +3182,7 @@ async function runLoop(
           updateRecentToolCall(item, call.id, "done");
           item.updatedAt = now();
         });
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
+        recordToolResult(call.id, result);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
         emitToolResult(emitCtx, { callId: call.id, result });
         continue;
@@ -3173,7 +3202,7 @@ async function runLoop(
           ok: false,
           error: `Tool '${call.function.name}' is available but not loaded yet. Call load_tools({"names":["${call.function.name}"]}) first, then call it on the next turn.`
         });
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: nudge });
+        recordToolResult(call.id, nudge);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: "tool not loaded" });
         emitToolResult(emitCtx, { callId: call.id, result: nudge });
         await mutateState(config.instance, (state) => {
@@ -3230,16 +3259,7 @@ async function runLoop(
           workingMessages
         );
         if (dispatch.kind === "sync") {
-          toolResultMessages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: dispatch.result
-          });
-          persistTranscriptRow(config, taskId, transcriptSessionId, {
-            role: "tool",
-            toolCallId: call.id,
-            content: dispatch.result
-          });
+          recordToolResult(call.id, dispatch.result);
           // Flip the tool_call row to `ok` and append a tool_result
           // block carrying a truncated preview of the dispatch result.
           emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
@@ -3335,16 +3355,7 @@ async function runLoop(
           message: `Tool call ${call.function.name} failed: ${message}`,
           data: { toolCallId: call.id }
         });
-        toolResultMessages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `Error: ${message}`
-        });
-        persistTranscriptRow(config, taskId, transcriptSessionId, {
-          role: "tool",
-          toolCallId: call.id,
-          content: `Error: ${message}`
-        });
+        recordToolResult(call.id, `Error: ${message}`);
         emitToolCallStatus(emitCtx, {
           callId: call.id,
           status: "error",
@@ -3522,6 +3533,7 @@ async function runLoop(
       throw error;
     }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    void recordUsage(config.instance, usageBaseCtx, summaryResult.cost).catch(() => {});
     // Same clear seam as the main loop: a successful summary call proves the
     // credential works, so drop any persistent needs-reauth record (issue
     // #233). Lock-free check first — no state write on the healthy path.
@@ -3586,6 +3598,12 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
+      // Skill learning tier 1: harvest objective outcomes from the task's
+      // skill.script.invoked audit rows (ADR skill-learning-from-outcomes.md).
+      // The chat-turn terminal path is the real surface, so capture must ride
+      // here alongside auto-retain — agent.ts's completeTask/finishTaskTransition
+      // wiring does not cover the chat completion path. Fire-and-forget.
+      void recordObjectiveOutcomes(config, exhausted);
       if (exhausted.chatSessionId) {
         void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
           appendLog(config.instance, "chat.auto_title.failed", {

@@ -70,6 +70,8 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     jobs: [],
     connectors: [],
     improvements: [],
+    skillOutcomes: [],
+    learningFindings: [],
     pairingCodes: [],
     pairingRequests: [],
     devices: [],
@@ -92,7 +94,7 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     chatMessages: [],
     messagingMessages: [],
     runs: [],
-    planSteps: []
+    planSteps: [], usageLedger: []
   };
   return { ...base, ...overrides };
 }
