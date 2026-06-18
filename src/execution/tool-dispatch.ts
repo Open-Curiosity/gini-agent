@@ -3597,8 +3597,7 @@ async function requestBrowserConnect(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>,
-  reasonOverride?: string
+  args: Record<string, unknown>
 ): Promise<string> {
   const reason = requireString(args, "reason");
   // Target URL — the page the agent was trying to reach. The screencast binds
@@ -3624,7 +3623,7 @@ async function requestBrowserConnect(
       // it prominently. The web UI also reads evidence.reason for
       // the body when rendering a browser.connect card.
       target: reason,
-      reason: reasonOverride ?? "Signing in through the agent's browser requires explicit approval.",
+      reason: "Signing in through the agent's browser requires explicit approval.",
       payload: { reason, toolCallId, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     item.approvalIds.push(approval.id);

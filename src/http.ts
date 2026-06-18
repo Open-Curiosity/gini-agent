@@ -41,7 +41,9 @@ import {
 import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import {
   getOrStartBridge,
+  hasLiveBridgeForOwner,
   stopActiveBridge,
+  type ScreencastBridge,
   type ScreencastInput
 } from "./execution/browser-screencast";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
@@ -212,6 +214,44 @@ async function emitConnectorRequestAudit(
 }
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
+  // Resolve the live screencast bridge for an active browser.connect setup,
+  // relaunching the headless spawned Chrome first when it isn't running. Both
+  // the frames SSE and the input relay call this: an already-stamped sign-in
+  // card (signInStarted + screencast) skips /open-browser on a reconnect and
+  // hits these endpoints directly, so the relaunch recovery can't live only in
+  // /open-browser — a gateway restart / Chrome crash would otherwise leave the
+  // modal reconnecting into a permanent 409. The relaunch navigates to the
+  // recorded target page through browserNavigate's SSRF / domain-policy gate,
+  // exactly like /open-browser. Returns the bridge, or a JSON error Response.
+  async function resolveScreencastBridgeOrError(
+    setup: { id: string; taskId?: string; payload: Record<string, unknown> }
+  ): Promise<ScreencastBridge | Response> {
+    // Only relaunch when there's genuinely no browser to screencast: a live (or
+    // still-starting) bridge already held by this setup is reusable even if
+    // getScreencastPort() momentarily reads null, so skip the relaunch and let
+    // getOrStartBridge hand back the existing bridge.
+    if (getScreencastPort() === null && !hasLiveBridgeForOwner(setup.id)) {
+      const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
+      if (!targetUrl) {
+        return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot screencast." }, 409);
+      }
+      const navResult = JSON.parse(await browserNavigate(setup.taskId ?? `browser-connect-${setup.id}`, { url: targetUrl }, config)) as {
+        success?: boolean;
+        error?: string;
+      };
+      if (!navResult.success || getScreencastPort() === null) {
+        return json({ error: navResult.error ?? "Could not start the agent's browser for sign-in." }, 409);
+      }
+    }
+    const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+    const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
+    try {
+      return await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+  }
+
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     // `updateInProgress` reports the gateway's single-flight update guard.
@@ -1197,6 +1237,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // this lock, and stamping signInStarted/screencast onto an already
         // terminal row would mark a cancelled sign-in as live.
         if (!item || item.status !== "pending") return;
+        // Idempotency guard: /open-browser keeps the row pending, so two
+        // concurrent opens (double-click / retry) would both pass the pending
+        // check and each write a duplicate stage:open-browser audit row + trace.
+        // Skip when already stamped so the audit/trace fire exactly once.
+        if (item.payload.signInStarted === true) {
+          stamped = true;
+          return;
+        }
         stamped = true;
         item.payload = {
           ...item.payload,
@@ -1263,18 +1311,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       ) {
         return json({ error: "Screencast setup request not active" }, 404);
       }
-      // Bind to the exact page the requesting task is driving (its session.page
-      // CDP targetId), not whatever tab happens to be first or shares a URL, so
-      // the operator signs in on the right page even with sibling tabs open.
-      // The URL is a fallback hint when the targetId can't be resolved.
-      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
-      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
-      let bridge;
-      try {
-        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
-      } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, 409);
-      }
+      // Resolve the bridge, relaunching the headless Chrome first if it isn't
+      // running (a reconnect after a gateway/Chrome restart lands here, not on
+      // /open-browser). Binds to the exact page the requesting task drove via
+      // the helper's preferUrl/preferTargetId.
+      const resolved = await resolveScreencastBridgeOrError(setup);
+      if (resolved instanceof Response) return resolved;
+      const bridge = resolved;
       const encoder = new TextEncoder();
       let keepalive: ReturnType<typeof setInterval> | undefined;
       let unsubscribe: (() => void) | undefined;
@@ -1360,14 +1403,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       } catch {
         return json({ error: "Invalid JSON body" }, 400);
       }
-      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
-      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
-      let bridge;
-      try {
-        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
-      } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, 409);
-      }
+      const resolved = await resolveScreencastBridgeOrError(setup);
+      if (resolved instanceof Response) return resolved;
+      const bridge = resolved;
       // Relay the remote page's selection back (present for copy/cut/selectall
       // and double/drag selection) so the modal can serve it to the operator's
       // clipboard on a native copy/cut event.

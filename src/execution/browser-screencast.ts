@@ -528,6 +528,22 @@ export class ScreencastBridge {
     onClose?: () => void,
     onUrl?: (url: string) => void
   ): () => void {
+    // If the bridge already closed between the caller acquiring it and this
+    // subscribe (e.g. the CDP socket dropped in the await gap before the SSE
+    // ReadableStream's start() ran), handleClosed already fired and cleared
+    // closeSubscribers — a callback registered now would never fire and the
+    // SSE stream would dangle on keepalives. Fire onClose synchronously and
+    // hand back a no-op unsubscribe so the caller tears its stream down at once.
+    if (this.closed) {
+      if (onClose) {
+        try {
+          onClose();
+        } catch {
+          // ignore
+        }
+      }
+      return () => undefined;
+    }
     this.subscribers.add(onFrame);
     if (onClose) this.closeSubscribers.add(onClose);
     if (onUrl) {
@@ -790,6 +806,18 @@ export async function getOrStartBridge(
       }
     });
   return startingBridge;
+}
+
+// True when a live (or still-starting) bridge is already held by `owner`. Lets
+// the HTTP layer skip the relaunch-the-spawned-Chrome step when a reusable
+// bridge already exists for this setup — a getScreencastPort() null reading is
+// only a "no browser, must relaunch" signal when there's also no active bridge
+// to reuse (e.g. a test that installs a fake bridge without a spawned handle,
+// or a bridge that outlived a transient port blip).
+export function hasLiveBridgeForOwner(owner: string): boolean {
+  if (activeBridge && !activeBridge.isClosed() && activeOwner === owner) return true;
+  if (startingBridge && startingOwner === owner) return true;
+  return false;
 }
 
 // Tear down the active bridge (sign-in completed / cancelled / shutdown). Bumps

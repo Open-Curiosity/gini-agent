@@ -857,12 +857,12 @@ async function closeSession(taskId: string): Promise<void> {
   // (no-op unless this task holds the trace). Never throws.
   await stopSessionTrace(taskId, session.context);
   try {
-    // Shared context (persistent/cdp): close every page the agent opened
-    // during this task. The user's window, tabs the user opened
-    // themselves, and the agent's persistent profile stay alive — the
-    // ownedPageIds set tracks ONLY agent-opened tabs (initial page from
-    // getOrCreate plus any browser_tabs action:"new"), so user tabs are
-    // never in this set. The next task lands in the same profile.
+    // Shared spawned context: close every page the agent opened during this
+    // task. The spawned Chrome's initial tab and the persistent profile stay
+    // alive — the ownedPageIds set tracks ONLY agent-opened tabs (initial page
+    // from getOrCreate plus any browser_tabs action:"new"), so the shared
+    // context's first tab is never in this set. The next task lands in the
+    // same profile.
     for (const page of session.ownedPageIds) {
       await page.close().catch(() => undefined);
     }
@@ -2557,10 +2557,10 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
 //
 // For redaction, taskId is advisory: the pass consults
 // allRegisteredSecrets() across every active task's registry, not
-// just this task's. The shared BrowserContext (CDP / persistent
-// profile) bleeds DOM state across tasks — Task A's page can copy
-// a typed credential into document.title, then Task B reads that
-// title via its own snapshot/navigate response. A purely
+// just this task's. The shared spawned BrowserContext (one
+// per-instance profile) bleeds DOM state across tasks — Task A's
+// page can copy a typed credential into document.title, then Task B
+// reads that title via its own snapshot/navigate response. A purely
 // per-task lookup would miss this because Task B's registry is
 // empty. The union catches cross-task leaks at the cost of
 // over-redacting in edge cases where two tasks coincidentally

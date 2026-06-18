@@ -2761,6 +2761,55 @@ describe("runtime api", () => {
     expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
   });
 
+  test("frames reconnect on an already-stamped card relaunches the browser when none is live", async () => {
+    // After a gateway/Chrome restart, an already-stamped sign-in card (screencast
+    // + signInStarted, still pending) skips /open-browser — the modal reconnects
+    // straight to /frames. So /frames must itself attempt the headless relaunch
+    // when no browser is live and a URL is recorded, or the user is stuck on a
+    // permanent 409. In this unit context there's no real Chrome, so the relaunch
+    // fails fast and 409s — but via the relaunch path (distinct from the no-URL
+    // message), proving the reconnect recovery is wired through /frames.
+    const config = testConfig("frames-reconnect-relaunch");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        // Already stamped (the pre-restart open-browser ran); URL recorded.
+        payload: { toolCallId: "call_frames_relaunch", url: "https://example.com/login", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).not.toContain("no page URL is recorded");
+    // Row stays pending so a real retry (with a live browser) can recover.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("frames reconnect on a stamped card with NO recorded URL 409s with the no-URL message", async () => {
+    // The relaunch needs a target page; without a recorded URL there's nothing
+    // to navigate to, so /frames 409s with the distinct no-URL message rather
+    // than blindly relaunching.
+    const config = testConfig("frames-reconnect-no-url");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_frames_no_url", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+  });
+
   test("screencast endpoints reject a setup that isn't an active sign-in (lifecycle gate)", async () => {
     // A browser.connect setup that is NOT pending, OR not stamped screencast +
     // signInStarted, must be refused so a stale EventSource reconnect after
@@ -2866,6 +2915,42 @@ describe("runtime api", () => {
     expect(second.status).toBeGreaterThanOrEqual(400);
     const browserConnectAudits = readState(config.instance).audit.filter((a) => a.action === "browser.connect");
     expect(browserConnectAudits).toHaveLength(1);
+  });
+
+  test("open-browser is idempotent: a second open on an already-stamped row writes no duplicate audit", async () => {
+    // /open-browser keeps the row pending, so two opens (double-click / retry)
+    // both pass the pending check. The in-mutation already-stamped guard makes
+    // the second a no-op so exactly one stage:open-browser audit row exists.
+    const config = testConfig("open-browser-idempotent");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_idem", url: "https://example.com/login" }
+        })
+      );
+      const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(first.status).toBe(200);
+      const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The second open succeeds (idempotent) but writes no extra audit/trace.
+      expect(second.status).toBe(200);
+      const openAudits = readState(config.instance).audit.filter(
+        (a) => a.action === "browser.connect" && (a.evidence as Record<string, unknown> | undefined)?.stage === "open-browser"
+      );
+      expect(openAudits).toHaveLength(1);
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
   });
 
   test("screencast frames stream a frame and input dispatches with a live bridge", async () => {

@@ -487,6 +487,25 @@ describe("ScreencastBridge.stop + close", () => {
     expect(frames).toBe(0); // subscribers cleared on close
   });
 
+  test("subscribe after the bridge already closed fires onClose synchronously (no dangling stream)", async () => {
+    // If the bridge closes in the gap between a caller acquiring it and the SSE
+    // ReadableStream's start() calling subscribe(), handleClosed has already
+    // fired and cleared closeSubscribers. subscribe() must detect the closed
+    // state and fire onClose immediately — otherwise the SSE stream would never
+    // get its close signal and would dangle on keepalives forever.
+    const { bridge, socket } = bridgeWith();
+    await startWithOpen(bridge, socket);
+    socket.close();
+    expect(bridge.isClosed()).toBe(true);
+    let framed = 0;
+    let closed = 0;
+    const unsubscribe = bridge.subscribe(() => framed++, () => closed++);
+    expect(closed).toBe(1); // onClose fired synchronously on the late subscribe
+    expect(framed).toBe(0); // no stale frame replayed into a closed bridge
+    // The returned unsubscribe is a safe no-op.
+    expect(() => unsubscribe()).not.toThrow();
+  });
+
   test("an error event closes the bridge", async () => {
     const { bridge, socket } = bridgeWith();
     await startWithOpen(bridge, socket);
