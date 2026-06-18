@@ -220,11 +220,15 @@ endpoints themselves — the new surface is purely a delivery layer.
   or revoked notifications) deletes the row so subsequent fan-outs
   skip the dead token. Other non-2xx statuses are logged but the row
   stays — they may recover or require human intervention.
-- **De-registration on logout**: future work. The DELETE endpoint
-  exists (`DELETE /api/push/devices/:token`) but the mobile setup-flow
-  doesn't currently fire it. A user who hard-resets the app continues
-  to receive pushes until the next install does so via NSE delivery
-  failure or until the 410 path triggers.
+- **De-registration on logout**: sign-out (and credential swap) fires a
+  best-effort `DELETE /api/push/devices/:token` via `clearCredentials` →
+  `tryDeregisterCachedDevice` (`mobile/src/auth.ts`), draining any
+  in-flight registration first (bounded wait) so the delete can't race a
+  late register. Sign-out also clears the shared App Group credentials so
+  a backgrounded NSE can't keep fetching previews with the signed-out
+  bearer. The remaining gap is a hard app-reset (process killed without an
+  in-app logout), which never runs the JS path; that token is pruned
+  reactively by the 410 Unregistered cleanup above on the next fan-out.
 
 ## Build flow consequences
 

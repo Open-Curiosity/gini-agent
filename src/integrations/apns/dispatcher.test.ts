@@ -1,7 +1,7 @@
 // Unit tests for the APNs dispatcher. Pins:
-//   - approval_requested blocks fan out to every registered device
+//   - authorization_requested blocks fan out to every registered device
 //     with the right payload + topic
-//   - non-approval blocks (user_text, assistant_text, etc.) are
+//   - non-prompt blocks (user_text, assistant_text, etc.) are
 //     ignored — no push, no device list scan
 //   - a 410 Unregistered response triggers token cleanup so the
 //     dead token can't keep accruing pushes
@@ -61,7 +61,7 @@ function buildDevice(overrides?: Partial<PushDevice>): PushDevice {
 }
 
 describe("apns dispatcher", () => {
-  test("fans approval_requested out to every registered device with the privacy-safe payload", async () => {
+  test("fans authorization_requested out to every registered device with the privacy-safe payload", async () => {
     const { client, calls } = buildFakeClient();
     const devices = [
       buildDevice({ token: "tok_a", bundleId: "ai.lilaclabs.gini.mobile" }),

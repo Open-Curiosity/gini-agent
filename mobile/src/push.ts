@@ -13,7 +13,7 @@
 //      hex-encoded APNs token, NOT the Expo Push token — we send
 //      directly to APNs from the gateway.
 //   4. POST the token to `/api/push/devices` so the gateway can fan
-//      `approval_requested` notifications out to it.
+//      `authorization_requested` notifications out to it.
 //   5. Subscribe to `addPushTokenListener` so a rotated token
 //      (rare, but happens on restore-from-backup) re-registers.
 //   6. Subscribe to `addNotificationResponseReceivedListener` for tap +
@@ -82,7 +82,7 @@ export type {
 // Foreground presentation rule. Silent (content-available) pushes
 // must never surface a banner or play a sound — the badge update is
 // what they're for, and we manage that explicitly via refreshBadge
-// rather than letting APS set it. Alert payloads (approval_requested
+// rather than letting APS set it. Alert payloads (authorization_requested
 // and message_completed) keep their banner so the user notices the
 // signal without unlocking the device. Setting this once at module
 // load means every received notification is classified at delivery.

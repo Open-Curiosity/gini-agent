@@ -1,7 +1,7 @@
 // APNs dispatcher. Subscribes to the chat-blocks instance-wide emitter
 // and translates two kinds of blocks into APNs pushes:
-//   - `approval_requested` → alert push (always sent; the user needs to
-//     decide and may not be in the app).
+//   - `authorization_requested` → alert push (always sent; the user needs
+//     to decide and may not be in the app).
 //   - `phase` with a terminal label → routed by label and by whether the
 //     task produced a user-visible message:
 //       * `Completed` AND the task emitted ≥1 non-empty `assistant_text`
@@ -159,9 +159,9 @@ export function buildMessageCompletedPayload(
   };
 }
 
-// Builds the per-call APNs payload + headers for an approval_requested
-// block. Exported for tests that want to assert payload shape without
-// mocking the entire dispatcher.
+// Builds the per-call APNs payload + headers for an authorization_requested
+// (or setup_requested) prompt block. Exported for tests that want to assert
+// payload shape without mocking the entire dispatcher.
 type PendingPromptBlock =
   | (ChatBlock & { kind: "authorization_requested" })
   | (ChatBlock & { kind: "setup_requested" });
