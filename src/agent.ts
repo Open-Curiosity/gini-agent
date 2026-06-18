@@ -295,6 +295,12 @@ export async function cancelTask(
   // collected — their row is owned by executeApprovedAction (skip → denied) or
   // resumeChatTask (ran → ok), since only those sites know the real outcome.
   let cancelledPendingToolCallIds: string[] = [];
+  // True only when THIS call performed the cancel (flipped a live task to
+  // cancelled). A duplicate / racing Stop on an already-terminal task is a
+  // no-op: the post-mutate side effects below (Cancelled block emission,
+  // descendant cascade, queue drain) must NOT re-run, or a second Stop would
+  // append a duplicate "Cancelled" system_note + phase.
+  let didCancel = false;
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -303,6 +309,7 @@ export async function cancelTask(
       );
     }
     if (isTerminalTaskStatus(task.status)) return task;
+    didCancel = true;
     task.status = "cancelled";
     task.currentStep = "Cancelled";
     task.updatedAt = now();
@@ -404,6 +411,13 @@ export async function cancelTask(
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // A no-op cancel (the task was already terminal — a duplicate or racing
+  // Stop) stops here. The run/subagent syncs above are idempotent, but the
+  // cancellation SIDE EFFECTS below — the "Cancelled" block emission, the
+  // descendant cascade, and the queue drain — must fire exactly once, on the
+  // call that actually performed the cancel. Re-running them would append a
+  // duplicate "Cancelled" system_note + phase and re-drain the queue.
+  if (!didCancel) return task;
   // Chat-block emission for cancellation (ADR chat-block-protocol.md
   // risks §4). Flip any in-flight streaming assistant_text to
   // `streaming: false` while keeping the partial text the user already

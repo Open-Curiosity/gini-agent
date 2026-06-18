@@ -145,13 +145,14 @@ export interface SkillScriptResult {
 
 // The result for a skill.run skipped because the cancel already landed (at
 // either pre-spawn boundary). Reported `aborted: true` so the caller settles
-// the gated tool_call row `denied`. A trace row records the skip when there's
-// a task to attribute it to.
-function abortedSkillResult(
+// the gated tool_call row `denied`. Writes a distinct `aborted` audit row (and
+// a trace when there's a task) so a cancel-skipped high-risk script is
+// forensically greppable, matching the mid-run kill's `aborted: true` evidence.
+async function abortedSkillResult(
   config: RuntimeConfig,
   handle: SkillScriptHandle,
   taskId: string | undefined
-): SkillScriptResult {
+): Promise<SkillScriptResult> {
   if (taskId) {
     appendTrace(config.instance, taskId, {
       type: "tool",
@@ -159,6 +160,20 @@ function abortedSkillResult(
       data: { skill: handle.skill.name, script: handle.scriptName, aborted: true }
     });
   }
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: taskId ? "agent" : "runtime",
+        action: "skill.script.invoked",
+        target: handle.skill.id,
+        risk: "medium",
+        taskId,
+        evidence: { skill: handle.skill.name, script: handle.scriptName, ok: false, exitCode: -1, aborted: true, spawnSkipped: true }
+      },
+      taskId ? { taskId } : { system: true as const }
+    );
+  });
   return { ok: false, stdout: "", stderr: "", exitCode: -1, parsed: null, error: "Skill script aborted: task was cancelled.", aborted: true };
 }
 
@@ -180,7 +195,7 @@ export async function invokeSkillScript(
   // connector credentials), let alone spawn the script. This is the earliest
   // cancellation boundary; the same check repeats just before spawn to catch a
   // cancel that lands during the env resolve.
-  if (signal?.aborted) return abortedSkillResult(config, handle, options.taskId);
+  if (signal?.aborted) return await abortedSkillResult(config, handle, options.taskId);
   const connectorEnv = await resolveSkillEnv(config, handle.skill, options.taskId);
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
@@ -215,7 +230,7 @@ export async function invokeSkillScript(
   // starting a high-risk script (connector env, workspace access) only to
   // SIGTERM it a tick later is a needless side effect, and mirrors
   // terminal.exec's pre-spawn `signal.aborted` guard.
-  if (signal?.aborted) return abortedSkillResult(config, handle, options.taskId);
+  if (signal?.aborted) return await abortedSkillResult(config, handle, options.taskId);
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const proc = spawn(cmd, {
@@ -319,7 +334,11 @@ export async function invokeSkillScript(
           ok,
           exitCode,
           stdoutBytes: stdout.length,
-          stderrBytes: stderr.length
+          stderrBytes: stderr.length,
+          // Distinguish a cancel-killed run from an ordinary non-zero exit so
+          // the audit trail is greppable for cancelled side effects, matching
+          // terminal.exec_aborted's `aborted: true` evidence.
+          ...(aborted ? { aborted: true } : {})
         }
       },
       ctx

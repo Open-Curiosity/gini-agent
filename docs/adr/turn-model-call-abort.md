@@ -125,6 +125,23 @@ banner over a turn that visibly kept working. The fix threads a real
 `AbortSignal` end to end so the cancel deterministically stops the
 in-flight call at its source rather than relying on the next checkpoint.
 
+## Deferred
+
+- **Aborting the pre-turn recall embedding.** `runChatTask` runs
+  auto-recall (a Hindsight query that embeds the user's input) BEFORE it
+  registers the turn controller, so a Stop landing during recall does not
+  abort the embedding HTTP call — it completes in the background and the
+  turn then proceeds to the model call, where the loop's terminal-status
+  guard stops it. The wasted embedding (and the privacy nuance of
+  embedding a cancelled query) is a known, bounded gap: recall is a single
+  short call and the turn still stops before any model output is produced.
+  Closing it means registering the controller before recall AND threading
+  the signal through `recall` into the embedding provider's `embed()`
+  fetch — a cross-cutting change to the embedding-provider interface,
+  tracked as a follow-up rather than bundled here. Mirrors the
+  terminal.exec grandchildren / browser late-completion deferrals in
+  [approval-execution-abort.md](approval-execution-abort.md).
+
 ## Consequences
 
 - A cancelled turn's provider fetch + stream reader stop within

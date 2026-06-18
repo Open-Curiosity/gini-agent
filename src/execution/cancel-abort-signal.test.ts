@@ -710,4 +710,38 @@ describe("per-turn AbortSignal", () => {
     expect(toolCalls.every((b) => b.kind === "tool_call" && b.status !== "running")).toBe(true);
     expect(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status).toBe("cancelled");
   });
+
+  test("a duplicate Stop on an already-cancelled task does not append a second Cancelled block", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-duplicate-stop"), "auto");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "cancel-duplicate-stop", undefined, "agent_dup")
+    );
+    // A held model call so the first cancel lands on a genuinely-running turn.
+    setEchoToolCallingResponse(
+      { provider, text: "thinking...", toolCalls: [], finishReason: "stop" },
+      undefined,
+      { delayMs: 2000 }
+    );
+
+    const task = await submitTask(config, "do a thing", { mode: "chat", chatSessionId: session.id });
+    await waitFor(() => readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "running");
+
+    // First Stop performs the cancel and emits the terminal "Cancelled" blocks.
+    await cancelTask(config, task.id);
+    await waitFor(() => !__turnSnapshot(config.instance).some((e) => e.taskId === task.id), 2000);
+    const countCancelledPhases = (): number =>
+      listChatBlocks(config.instance, session.id).filter((b) => b.kind === "phase" && b.label === "Cancelled").length;
+    const countCancelledNotes = (): number =>
+      listChatBlocks(config.instance, session.id).filter((b) => b.kind === "system_note" && b.text === "Cancelled").length;
+    expect(countCancelledPhases()).toBe(1);
+    expect(countCancelledNotes()).toBe(1);
+
+    // A second Stop on the now-terminal task is a no-op: it must NOT append a
+    // duplicate "Cancelled" system_note or phase.
+    await cancelTask(config, task.id);
+    await cancelTask(config, task.id);
+    expect(countCancelledPhases()).toBe(1);
+    expect(countCancelledNotes()).toBe(1);
+  });
 });

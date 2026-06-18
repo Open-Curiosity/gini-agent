@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mutateState, readState } from "../state";
@@ -9,6 +9,14 @@ const ROOT = "/tmp/gini-skill-scripts-unit";
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
+});
+
+// Re-establish GINI_STATE_ROOT before EVERY test, not just once: under
+// `bun test --rerun-each` (or any interleaved multi-file run) a sibling test
+// file's afterEach restores its own saved GINI_STATE_ROOT, which would
+// otherwise leave this file's readState/mutateState pointing at the wrong root
+// mid-run. Re-pinning per test makes the suite order-independent.
+beforeEach(() => {
   process.env.GINI_STATE_ROOT = ROOT;
 });
 
@@ -253,7 +261,7 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     // Fire the abort shortly after the script spawns so it's genuinely mid-run.
     const fired = setTimeout(() => controller.abort(), 50);
     const startedAt = Date.now();
-    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal, taskId: "task_midrun" });
     clearTimeout(fired);
     const elapsed = Date.now() - startedAt;
     // The kill lands far below the 30s sleep — the script was SIGTERM'd.
@@ -264,6 +272,11 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     expect(result.parsed).toBeNull();
     // The abort WON the race, so the run is reported aborted.
     expect(result.aborted).toBe(true);
+    // The audit row carries the `aborted` marker so a cancel-killed run is
+    // forensically distinguishable from an ordinary non-zero exit.
+    const audit = readState(instance).audit.find((a) => a.action === "skill.script.invoked" && a.taskId === "task_midrun");
+    expect(audit).toBeDefined();
+    expect((audit?.evidence as { aborted?: boolean } | undefined)?.aborted).toBe(true);
   });
 
   test("a signal already aborted at entry kills the script immediately", async () => {
@@ -287,6 +300,12 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     expect(result.ok).toBe(false);
     expect(result.aborted).toBe(true);
     expect(result.exitCode).toBe(-1);
+    // The skip writes an aborted audit row marked spawnSkipped so the
+    // never-ran case is auditable, not silent.
+    const audit = readState(instance).audit.find((a) => a.action === "skill.script.invoked" && a.taskId === "task_preabort");
+    expect(audit).toBeDefined();
+    expect((audit?.evidence as { aborted?: boolean; spawnSkipped?: boolean } | undefined)?.aborted).toBe(true);
+    expect((audit?.evidence as { spawnSkipped?: boolean } | undefined)?.spawnSkipped).toBe(true);
   });
 
   test("a cancel landing during env-resolve (after entry, before spawn) skips the spawn", async () => {
