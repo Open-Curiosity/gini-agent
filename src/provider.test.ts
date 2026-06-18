@@ -16,6 +16,7 @@ import {
   generateToolCallingResponse,
   generateVisionAnalysis,
   anthropicNeedsHttps,
+  isAbortError,
   isAuthExpiredError,
   isContextOverflowError,
   isProviderConfigured,
@@ -2653,6 +2654,53 @@ describe("provider", () => {
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.setTimeout = originalSetTimeout;
+      restore();
+    }
+  });
+
+  test("codex cancel during the pre-retry wait skips attempt 2 at the source", async () => {
+    // The pre-retry settle wait now honors the turn's AbortSignal: a user
+    // cancel landing in that 50ms window must abort the retry rather than
+    // run the full delay and fire a second (already-doomed) request. Attempt
+    // 1 returns a session-expired 401; the signal is aborted as soon as that
+    // first fetch is observed, so the abortable wait rejects immediately and
+    // attempt 2 is never constructed.
+    const { restore } = installCodexAuth("codex-retry-cancel-skips-attempt-2");
+    const originalFetch = globalThis.fetch;
+    const controller = new AbortController();
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      // Cancel the turn the instant attempt 1 is in flight — models the user
+      // tapping Stop while the first request is being rejected.
+      controller.abort();
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      ));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools,
+        undefined,
+        undefined,
+        controller.signal
+      ).catch((e) => e);
+      // The cancel aborted the wait, so only attempt 1 ever ran.
+      expect(attempts).toBe(1);
+      // The surfaced error is the abort (AbortError-shaped), not the
+      // session-expired one — the retry path bailed before re-attempting.
+      expect(isAbortError(err)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
       restore();
     }
   });

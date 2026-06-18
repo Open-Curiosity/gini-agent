@@ -118,6 +118,28 @@ Per-action behaviour:
   [chat-block-protocol.md](chat-block-protocol.md) for the wire
   shape and [telegram-bridge.md](telegram-bridge.md) for the
   lifecycle.
+- **`skill.run`** — an approval-gated skill script (declared
+  `requires.approval`) runs as a Bun subprocess via
+  `invokeSkillScript`, which the signal is threaded into. Two
+  pre-execution `signal.aborted` checks guard the side effect: the
+  first runs BEFORE `resolveSkillEnv` so a cancelled run never even
+  decrypts the skill's connector secrets, the second runs after the
+  env resolve and before `spawn`. Once spawned, the abort race is wired
+  up BEFORE the first post-spawn await (the stdin write): the abort
+  sentinel re-checks `signal.aborted` synchronously at registration
+  (an `addEventListener` on an already-fired signal never fires, so a
+  cancel landing in the spawn→listener window would otherwise be
+  missed) and also kills the proc as soon as the abort wins. Like
+  `terminal.exec`, `invokeSkillScript` races `proc.exited` against the
+  abort and returns an explicit `aborted` verdict that is true ONLY
+  when the abort won the race (`winner === "aborted"`); a signal that
+  fires after a clean exit (the drain window) loses the race, so a
+  completed script is never mislabeled. The executor sets
+  `verdict.aborted` from that returned `result.aborted` (NOT the racy
+  caller-side `signal.aborted`), so the gated tool_call row settles
+  `denied` on a genuine kill and `ok` on a real success. Detached
+  grandchildren inside a shell script survive — the same SIGTERM-the-
+  immediate-proc limitation as `terminal.exec` below.
 
 `cancelTask`, `failTask`, and `decideApproval-deny` each call
 `abortApprovalsForTask` from inside their own `mutateState` callback
@@ -128,6 +150,13 @@ abort through all three terminal-transition paths closes the
 follow-up race codex flagged: a side effect that started under a
 won claim race no longer survives a sibling denial or a runtime
 failure.
+
+This registry aborts the **side effect** of an approved tool. The
+parallel mechanism that aborts the **model call** of a chat turn lives
+in `src/execution/turn-abort.ts`; the same three terminal-transition
+paths fire it (via `recordInFlightAborted`) alongside
+`abortApprovalsForTask`. See
+[turn-model-call-abort.md](turn-model-call-abort.md) for that protocol.
 
 ## Errors
 
@@ -249,6 +278,11 @@ follow-up.
   (see `src/execution/tool-dispatch.ts::requestCodeExec`), so it
   inherits the SIGTERM behavior described above. The same
   grandchildren limitation applies.
+- True process-tree teardown for `skill.run` grandchildren. The
+  script's immediate Bun process gets SIGTERM via the threaded
+  signal, but a shell script that backgrounds detached children
+  leaves them running, exactly as with `terminal.exec`. The same
+  `setsid`/`detached` fix would cover both.
 
 ## Audit action naming
 

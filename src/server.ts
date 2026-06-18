@@ -5,6 +5,7 @@ import { resolveSessionFromCookie } from "./governance/pairing";
 import "./hooks/builtins"; // registers trusted hook handlers (skill-script) before the scheduler/backfill run
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
+import { runSetupRequestSweep } from "./jobs/setup-request-sweep";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { runDailyReview } from "./learning/daily-review";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
@@ -12,7 +13,7 @@ import { install } from "./runtime";
 import { isRunning } from "./cli/process";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog, backfillEmailWatcherJobs, mutateState, now } from "./state";
+import { appendLog, backfillEmailWatcherJobs, healOrphanedStreamingBlocks, isTerminalTaskStatus, mutateState, now, readState } from "./state";
 import { reconcileInFlightTasks } from "./agent";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
@@ -87,10 +88,41 @@ await install(config);
 const installFinishedMs = performance.now();
 writePid(config);
 
-// Tell the browser session manager which instance this is, so the spawned
-// Chrome uses the per-instance profile dir. Without this the manager has no
-// instance to scope the profile to (which is fine for unit tests that import
-// the tools directly and never launch a real browser).
+// Heal orphaned streaming "stuck cursor" blocks left by a prior process that
+// died mid-stream (issue #395). MUST run here — after install() (the memory.db
+// schema/partial-index is ready) and BEFORE Bun.serve binds the HTTP port and
+// before reconcileInFlightTasks re-dispatches resumed turns — so the finalize
+// can never race a live or resumed writer (the only quiescent window; the
+// mutateState lock does not cover chat_blocks). The cutoff (bootStartedAt)
+// excludes any block this process will touch. The safety predicate excludes
+// running/queued tasks: a running/queued orphan is RESUMED by reconcile, whose
+// resume path (runChatTask) settles its own stale block — this sweep must not
+// contend. A block whose task is terminal/waiting_approval/absent has no
+// resumable writer and is safe to settle. Best-effort: a failure here must not
+// block boot. See ADR chat-block-protocol.md.
+try {
+  const tasksAtBoot = new Map(readState(config.instance).tasks.map((t) => [t.id, t.status]));
+  const healed = healOrphanedStreamingBlocks(config.instance, bootStartedAt, (taskId) => {
+    if (taskId === null) return true; // no owning task (legacy/pruned) — no resumable writer.
+    const status = tasksAtBoot.get(taskId);
+    if (status === undefined) return true; // task pruned from state — orphan, safe.
+    if (status === "running" || status === "queued") return false; // reconcile resumes these.
+    return isTerminalTaskStatus(status) || status === "waiting_approval";
+  });
+  if (healed > 0) {
+    appendLog(config.instance, "chat.streaming.healed-orphans", { count: healed });
+  }
+} catch (error) {
+  appendLog(config.instance, "chat.streaming.heal-error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+}
+
+// Tell the browser session manager which instance this is. The instance scopes
+// the spawned Chrome's per-instance profile dir and the lookup of the optional
+// CDP connection record. Without this the manager has no instance to consult
+// (which is fine for unit tests that import the tools directly and never launch
+// or attach a real browser).
 setBrowserInstance(config.instance);
 // Opt-in browser session trace recording (OFF unless the config flag is
 // explicitly true). Read once at boot, like the instance registration.
@@ -387,6 +419,26 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
   }
 })();
 
+// Periodic setup-request sweep. Runs alongside the re-probe loop and
+// auto-cancels pending setup requests older than the TTL (default 24h) so
+// a genuinely-abandoned request doesn't strand its task in
+// `waiting_approval` forever. Cadence: every minute.
+const SETUP_SWEEP_TICK_INTERVAL_MS = Number(process.env.GINI_SETUP_SWEEP_TICK_MS ?? 60_000);
+let setupSweepStopped = false;
+const setupSweepDone: Promise<void> = (async function setupSweepLoop(): Promise<void> {
+  while (!setupSweepStopped) {
+    try {
+      await runSetupRequestSweep(config);
+    } catch (error) {
+      appendLog(config.instance, "setup-request.sweep.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (setupSweepStopped) break;
+    await sleepUnlessStopping(SETUP_SWEEP_TICK_INTERVAL_MS);
+  }
+})();
+
 // Messaging inbound supervisor cadence. Shared across every bridge
 // supervisor (Telegram long-poll reconcile + Discord REST-poll
 // reconcile). A bridge added at runtime is picked up within one
@@ -491,6 +543,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   appendLog(config.instance, "runtime.stopped", { signal });
   schedulerStopped = true;
   reprobeStopped = true;
+  setupSweepStopped = true;
   telegramStopped = true;
   discordStopped = true;
   skillReviewStopped = true;
@@ -544,6 +597,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
     Promise.all([
       schedulerDone.catch(() => {}),
       reprobeDone.catch(() => {}),
+      setupSweepDone.catch(() => {}),
       skillReviewDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),

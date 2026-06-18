@@ -811,7 +811,10 @@ export interface ThreadReplyInput {
 export function useReplyToThread(sessionId: string | null, threadId: string | null) {
   const qc = useQueryClient();
   return useMutation<
-    { sessionId: string; threadId: string; runId: string; taskId: string; status: string },
+    // A reply runs immediately, or queues behind a live turn (ADR
+    // chat-message-queue.md) and returns the pending id instead.
+    | { sessionId: string; threadId: string; runId: string; taskId: string; status: string }
+    | { sessionId: string; queued: true; pendingId: string },
     Error,
     ThreadReplyInput
   >({
@@ -966,6 +969,12 @@ export function useCancelTask() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
       qc.invalidateQueries({ queryKey: ["chats"] });
+      // The cancel settles any open gate to `cancelled` server-side, but the
+      // setup-request cache only polls (no SSE bridge on mobile, unlike web's
+      // RuntimeStreamBridge). Without this, a setup card's Confirm/Choice
+      // controls keep reading `status === "pending"` and stay tappable until
+      // the next poll, firing a POST to a now-dead gate (issue #395).
+      qc.invalidateQueries({ queryKey: ["setup-requests"] });
     }
   });
 }

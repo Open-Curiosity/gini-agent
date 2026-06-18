@@ -1,7 +1,20 @@
 "use client";
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from "@/components/ui/select";
 import type { UsageDay } from "@/lib/queries";
+import type { AgentRow } from "@/lib/view-types";
+
+// Sentinel for the "sum across every agent" option in the agent dropdown; any
+// concrete agent id pins the chart to that agent. Exported so the home page,
+// which owns the filter state, agrees on the value.
+export const TOKEN_USAGE_ALL_AGENTS = "__all__";
 
 // Daily token-usage chart for the home page. Renders a stacked bar per day
 // (input on the bottom, output on top) over the supplied window, plus a
@@ -33,7 +46,17 @@ function dayTokens(d: UsageDay): number {
   return d.input + d.output;
 }
 
-export function TokenUsageChart({ days }: { days: UsageDay[] }) {
+export function TokenUsageChart({
+  days,
+  agents,
+  selectedAgentId,
+  onSelectAgent
+}: {
+  days: UsageDay[];
+  agents: AgentRow[];
+  selectedAgentId: string;
+  onSelectAgent: (value: string) => void;
+}) {
   const today = days[days.length - 1];
   const todayTokens = today ? dayTokens(today) : 0;
   const todayUsd = today?.estimatedUsd ?? 0;
@@ -46,8 +69,25 @@ export function TokenUsageChart({ days }: { days: UsageDay[] }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">Token usage</CardTitle>
-        <CardDescription>Input vs output tokens per day · last {days.length || 14} days</CardDescription>
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <CardTitle className="text-sm">Token usage</CardTitle>
+            <CardDescription>Input vs output tokens per day · last {days.length || 14} days</CardDescription>
+          </div>
+          <Select value={selectedAgentId} onValueChange={onSelectAgent}>
+            <SelectTrigger size="sm" aria-label="Filter token usage by agent" className="min-w-[9rem]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={TOKEN_USAGE_ALL_AGENTS}>All agents</SelectItem>
+              {agents.map((a) => (
+                <SelectItem key={a.id} value={a.id}>
+                  {a.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </CardHeader>
       <CardContent className="space-y-3">
         <div>
