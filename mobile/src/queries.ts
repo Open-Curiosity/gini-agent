@@ -35,6 +35,13 @@ const CHAT_TERMINAL_TASK_STATUSES = new Set<string>([
   "waiting_approval"
 ]);
 
+// Request timeout for voice-message sends. A voice POST blocks on
+// server-side transcription, and the very first one also waits on the
+// local whisper model downloading — the composer warns this "can take a
+// minute." Both the main chat and threaded replies pass this so the
+// default write timeout can't abort a legitimate first-run transcription.
+const VOICE_SEND_TIMEOUT_MS = 120_000;
+
 
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
@@ -769,7 +776,10 @@ export function useReplyToThread(sessionId: string | null, threadId: string | nu
       if (parentBlockId) payload.parentBlockId = parentBlockId;
       return api(`/chat/${sessionId}/threads/${threadId}/messages`, {
         method: "POST",
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        // Threaded voice replies hit the same blocking transcription as the
+        // main chat, so they need the same generous ceiling.
+        ...(audio ? { timeoutMs: VOICE_SEND_TIMEOUT_MS } : {})
       });
     },
     onSuccess: () => {
@@ -880,7 +890,10 @@ export function useSendMessage(sessionId: string | null) {
       if (audio) body.audio = audio;
       return api<SendMessageResult>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        // Voice sends block on transcription (first run also downloads the
+        // model), so the default write timeout would cut them off.
+        ...(audio ? { timeoutMs: VOICE_SEND_TIMEOUT_MS } : {})
       });
     },
     onSuccess: () => {
