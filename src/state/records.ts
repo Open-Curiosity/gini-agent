@@ -1471,9 +1471,9 @@ export function createRelayRecord(
 
 // Mint (or, on re-entry, the field-default shape for) the tunnel selection
 // singleton. Unlike most create* helpers this does NOT push onto a list —
-// the tunnel is a singleton stored at `state.tunnel`, mirroring
-// `state.browser`. The integration module assigns the returned record to
-// `state.tunnel` inside its mutateState callback. No audit row here; the
+// the tunnel is a singleton stored at `state.tunnel`. The integration module
+// assigns the returned record to `state.tunnel` inside its mutateState
+// callback. No audit row here; the
 // integration emits action-specific audit rows (select/connect/disconnect)
 // at its side-effecting call sites, matching createRelayRecord's split of
 // "record shape" from "side-effect audit".
