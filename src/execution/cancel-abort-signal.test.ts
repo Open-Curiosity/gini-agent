@@ -641,6 +641,11 @@ describe("per-turn AbortSignal", () => {
     expect(msgRow?.kind === "tool_call" && msgRow.status).not.toBe("ok");
     expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_msg")).toBe(false);
     expect(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status).toBe("cancelled");
+    // The messaging.send audit row carries the `aborted` marker so a
+    // cancel-killed send is distinguishable from an ordinary delivery failure.
+    const sendAudit = readState(config.instance).audit.find((a) => a.action === "messaging.send" && a.taskId === seeded.taskId);
+    expect(sendAudit).toBeDefined();
+    expect((sendAudit?.evidence as { aborted?: boolean } | undefined)?.aborted).toBe(true);
   });
 
   test("cancel denies a live pending gate even when a resolved row of the SAME task shares its deterministic callId", async () => {

@@ -2790,7 +2790,11 @@ async function runApprovedActionImpl(
             textBytes: text.length,
             ok: resultPayload.ok,
             messageId: resultPayload.messageId ?? null,
-            error: resultPayload.error ?? null
+            error: resultPayload.error ?? null,
+            // Distinguish a cancel-killed send from an ordinary delivery failure
+            // so the audit trail is greppable for cancelled high-risk sends,
+            // matching terminal.exec_aborted / skill.run's aborted evidence.
+            ...(verdict.aborted ? { aborted: true } : {})
           }
         },
         approvalAgentContext(approval)
