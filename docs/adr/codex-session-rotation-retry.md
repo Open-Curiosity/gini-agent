@@ -71,7 +71,6 @@ Retry behavior is pinned in `src/provider.test.ts`:
 
 ## Out Of Scope
 
-- **AbortSignal plumbing.** No longer out of scope — the provider pipeline now carries the turn's `AbortSignal` end to end (see `src/execution/turn-abort.ts` and the codex `/responses` fetch + reader), so a cancel aborts the in-flight request (including a session-rotation retry) at the source. The chat-task status-flip re-check remains as defense-in-depth.
 - **Multi-retry strategy.** A second consecutive session-expired usually means the CLI hasn't yet refreshed; looping further would burn quota without helping. The fixed cap-at-one stays.
 - **Caching the parsed `auth.json`.** Every request re-reads. Caching would require an invalidation surface; the cost is one `readFileSync` per request, which is negligible compared to the model call.
 - **ADR for the chat-task post-await cancellation model.** That contract lives in `src/execution/chat-task.ts` comments today; promoting it to an ADR is independent of this one.

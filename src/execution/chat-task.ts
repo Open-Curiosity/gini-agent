@@ -3758,10 +3758,13 @@ export async function resumeChatTask(
       data: { toolCallId, taskStatus: stage.task.status }
     });
     // The task was cancelled (or failed) while this approved tool's side effect
-    // was running — resume is being called WITH its result, so the side effect
-    // genuinely completed. Settle the tool_call row to `ok` (and surface the
-    // result) here, because the loop won't re-enter to do it and cancelTask
-    // deliberately doesn't touch approved-but-unsettled rows. Without this the
+    // was running, but the side effect ran to COMPLETION (not aborted): an
+    // aborted action never reaches here — executeApprovedAction inspects the
+    // action's own abort verdict and settles its row `denied` itself instead
+    // of routing the abort-result string through this bail. So a resume that
+    // does land here is a genuine success whose result the loop won't re-enter
+    // to surface, and cancelTask deliberately leaves approved-but-unsettled
+    // rows to this site. Settle to `ok` and surface the result; without it the
     // row stays stuck `running` after "Cancelled" for a tool that succeeded
     // (issue #395). Best-effort.
     try {

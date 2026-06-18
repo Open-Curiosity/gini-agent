@@ -1897,7 +1897,7 @@ async function executeApprovedAction(
     // effect that already wrote its normal audit row. Pass
     // `shouldResumeChat: false` to `runApprovedAction` and call
     // `resumeChatTask` AFTER releasing.
-    const rawResult = await runApprovedAction(config, approval, guardController!.signal, {
+    const { result: rawResult, aborted } = await runApprovedAction(config, approval, guardController!.signal, {
       shouldResumeChat: false,
       extraEvidence,
       chatToolCallId
@@ -1909,6 +1909,29 @@ async function executeApprovedAction(
     // cap. Apply the same universal per-tool ceiling here so a large
     // terminal/self-op result can't dominate the model context.
     const result = typeof rawResult === "string" ? capToolResultText(rawResult, approval.action) : rawResult;
+    if (aborted) {
+      // The side effect was aborted by a cancel/fail/sibling-deny (its OWN
+      // verdict, not the racy call-site signal). Settle the gated tool_call
+      // row to `denied` HERE rather than routing the abort-result string
+      // through resumeChatTask: its terminal bail hard-codes `ok`, which would
+      // paint a killed terminal.exec (or any aborted action) as a success
+      // (issue #395 follow-up). Mirror the skip-path settle above. The result
+      // string still returns to the HTTP/CLI caller for its own bookkeeping;
+      // we just don't re-enter the chat loop with it. Best-effort: a chat-
+      // block failure must not break the lifecycle.
+      if (chatToolCallId && approval.taskId) {
+        try {
+          const emitCtx = resolveEmitContext(config, approval.taskId);
+          if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
+        } catch (error) {
+          appendLog(config.instance, "chat.abort_block.emit_failed", {
+            taskId: approval.taskId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+      return result;
+    }
     if (shouldResumeChat && chatToolCallId && approval.taskId && typeof result === "string") {
       await resumeChatTask(config, approval.taskId, chatToolCallId, result);
     }
@@ -1932,11 +1955,41 @@ interface RunApprovedActionContext {
 // wires the signal into `proc.kill`; an uncancellable native API
 // (browser.upload_file's setInputFiles) races the await against the
 // signal and reports the result as `_aborted` if the signal wins.
+interface ApprovedActionResult {
+  result: string | undefined;
+  // True when a cancel / fail / sibling-deny aborted the side effect — either
+  // before it started or mid-run. The caller settles the tool_call row
+  // `denied` on this verdict instead of routing the abort-result string
+  // through resumeChatTask's terminal bail, which hard-codes `ok` and would
+  // mislabel a killed terminal.exec (or any aborted action) as successful
+  // (issue #395 follow-up). The verdict is the side effect's OWN observation
+  // (`winner === "aborted"`, `outcome.kind === "aborted"`, the pre-spawn
+  // `signal.aborted` checks) — NOT the caller's `signal.aborted`, which is a
+  // false positive in the drain window where the side effect completes and the
+  // cancel fires before the caller reads the signal.
+  aborted: boolean;
+}
+
 async function runApprovedAction(
   config: RuntimeConfig,
   approval: Authorization,
   signal: AbortSignal,
   ctx: RunApprovedActionContext
+): Promise<ApprovedActionResult> {
+  // The verdict is flipped inside runApprovedActionImpl at each abort branch,
+  // co-located with the `_aborted` audit emission so a new action branch that
+  // adds an abort path sets it in the same place it writes its abort audit.
+  const verdict = { aborted: false };
+  const result = await runApprovedActionImpl(config, approval, signal, ctx, verdict);
+  return { result, aborted: verdict.aborted };
+}
+
+async function runApprovedActionImpl(
+  config: RuntimeConfig,
+  approval: Authorization,
+  signal: AbortSignal,
+  ctx: RunApprovedActionContext,
+  verdict: { aborted: boolean }
 ): Promise<string | undefined> {
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
@@ -1994,6 +2047,7 @@ async function runApprovedAction(
       };
     });
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
           type: "tool",
@@ -2050,6 +2104,7 @@ async function runApprovedAction(
       };
     });
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
           type: "tool",
@@ -2091,6 +2146,7 @@ async function runApprovedAction(
     // but honoring it here keeps audit semantics consistent with
     // the post-spawn abort path.
     if (signal.aborted) {
+      verdict.aborted = true;
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
     const proc = spawn(spawnArgs, {
@@ -2164,6 +2220,7 @@ async function runApprovedAction(
     // record reflects WHY the cancel happened, not just that one
     // happened.
     if (winner === "aborted") {
+      verdict.aborted = true;
       const task = await mutateState(config.instance, (state) => {
         addAudit(
           state,
@@ -2313,6 +2370,7 @@ async function runApprovedAction(
       signal
     );
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       const reason = readSignalReason(signal) ?? "task.cancelled";
       const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser upload aborted: task was cancelled." });
       const task = await mutateState(config.instance, (state) => {
@@ -2446,6 +2504,7 @@ async function runApprovedAction(
       signal
     );
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       const reason = readSignalReason(signal) ?? "task.cancelled";
       const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser download aborted: task was cancelled." });
       const task = await mutateState(config.instance, (state) => {
@@ -2562,6 +2621,7 @@ async function runApprovedAction(
       ? approval.payload.scriptArgs as Record<string, unknown>
       : {};
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ ok: false, aborted: true, error: "skill.run aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
@@ -2632,6 +2692,7 @@ async function runApprovedAction(
     const text = String(approval.payload.text ?? "");
     const target = typeof approval.payload.target === "string" ? approval.payload.target : undefined;
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ success: false, aborted: true, error: "messaging.send aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
@@ -2710,6 +2771,7 @@ async function runApprovedAction(
       ? approval.payload.args as Record<string, unknown>
       : {};
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ ok: false, aborted: true, error: "self.config aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {

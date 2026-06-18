@@ -13,7 +13,7 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { cancelTask, submitTask } from "../agent";
+import { cancelTask, decideApproval, submitTask } from "../agent";
 import {
   closeAllMemoryDbs,
   createAuthorization,
@@ -27,6 +27,7 @@ import {
   mutateState,
   readState
 } from "../state";
+import { __inFlightSnapshot } from "./approval-execution";
 import { __turnSnapshot } from "./turn-abort";
 import type { RuntimeConfig, TaskStatus } from "../types";
 
@@ -87,7 +88,7 @@ afterEach(() => {
   clearEchoToolCallingResponses();
 });
 
-function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
+function buildConfig(workspaceRoot: string, instance: string, approvalMode: "auto" | "strict" = "auto"): RuntimeConfig {
   return {
     instance,
     port: 7338,
@@ -96,7 +97,7 @@ function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
     workspaceRoot,
     stateRoot: process.env.GINI_STATE_ROOT ?? root,
     logRoot: process.env.GINI_LOG_ROOT ?? `${root}-logs`,
-    approvalMode: "auto"
+    approvalMode
   };
 }
 
@@ -464,5 +465,62 @@ describe("per-turn AbortSignal", () => {
     expect(ran?.kind === "tool_call" && ran.status).toBe("ok");
     // And the result is surfaced.
     expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_ran")).toBe(true);
+  });
+
+  test("an approved terminal.exec aborted mid-run settles `denied`, never `ok` — a killed command is not a success", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("approved-abort-not-ok"), "strict");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "approved-abort-not-ok", undefined, "agent_k")
+    );
+
+    // The model asks to run a long-sleeping shell command. In strict mode this
+    // gates: the loop pauses at waiting_approval with a pending authorization.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_sleep",
+          type: "function",
+          function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sleep 30" }) }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "run a long command", { mode: "chat", chatSessionId: session.id });
+    await waitFor(() => readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "waiting_approval");
+
+    const approvalId = readState(config.instance).authorizations.find((a) => a.taskId === task.id && a.status === "pending")?.id;
+    expect(approvalId).toBeDefined();
+
+    // Approve WITHOUT awaiting: executeApprovedAction spawns `sleep 30` and
+    // blocks on it. We cancel while it is genuinely in flight (the approval
+    // claims the in-flight registry around the spawned proc), so the abort
+    // fires the claimed controller → `proc.kill()` → `winner === "aborted"`.
+    const approving = decideApproval(config, approvalId!, "approve");
+    // Wait until the side effect is actually in flight (registry claim live)
+    // before cancelling — cancelling before the spawn would exercise the
+    // pre-spawn abort branch, not the mid-run kill we want to pin.
+    await waitFor(() => __inFlightSnapshot(config.instance).some((e) => e.taskId === task.id));
+
+    await cancelTask(config, task.id);
+    // Let the approve path unwind (the killed proc resolves, the abort audit
+    // and the row settle land).
+    await approving;
+    await waitFor(() => isTerminalTaskStatus(readState(config.instance).tasks.find((t) => t.id === task.id)?.status ?? "running"));
+
+    const blocks = listChatBlocks(config.instance, session.id);
+    const sleepRow = blocks.find((b) => b.kind === "tool_call" && b.callId === "call_sleep");
+    // The killed command must NOT read as a success. Before the fix the resume
+    // terminal-bail hard-coded `ok`; now executeApprovedAction settles the
+    // aborted row `denied` and never routes the abort-result through resume.
+    expect(sleepRow?.kind === "tool_call" && sleepRow.status).toBe("denied");
+    expect(sleepRow?.kind === "tool_call" && sleepRow.status).not.toBe("ok");
+    // No tool_result block may surface the aborted command's output as a
+    // completed result (resume's emitToolResult is skipped for the abort).
+    expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_sleep")).toBe(false);
+    expect(readState(config.instance).tasks.find((t) => t.id === task.id)?.status).toBe("cancelled");
   });
 });
