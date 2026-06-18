@@ -34,8 +34,13 @@ import type { Instance } from "../types";
 // addSseSubscription call inserts its own handle (so two concurrent
 // streams for the same (device, session) don't collapse to one slot
 // and a single cleanup can't yank the peer's record). Handles are
-// stored as `${sessionId}::${nonce}`; membership checks scan the small
-// Set for the session prefix.
+// stored as `${sessionId}::${streamId}::${nonce}` when the client names
+// its stream, or `${sessionId}::${nonce}` when it doesn't; membership
+// checks scan the small Set for the session prefix. The middle
+// `streamId` segment lets a client clear exactly the stream it opened
+// (clearStreamWatch) without disturbing a sibling stream on the same
+// session — on iOS the Thread View is presented as a card OVER the main
+// chat, so both screens hold a stream on the same sessionId at once.
 const subscriptions: Map<string, Map<string, Set<string>>> = new Map();
 
 function instanceBucket(instance: Instance): Map<string, Set<string>> {
@@ -57,7 +62,8 @@ function instanceBucket(instance: Instance): Map<string, Set<string>> {
 export function addSseSubscription(
   instance: Instance,
   deviceToken: string,
-  sessionId: string
+  sessionId: string,
+  streamId?: string
 ): () => void {
   const bucket = instanceBucket(instance);
   let sessions = bucket.get(deviceToken);
@@ -65,7 +71,14 @@ export function addSseSubscription(
     sessions = new Set();
     bucket.set(deviceToken, sessions);
   }
-  const handle = `${sessionId}::${Math.random().toString(36).slice(2)}`;
+  const nonce = Math.random().toString(36).slice(2);
+  // Encode the client-supplied streamId as a middle segment so
+  // clearStreamWatch can target exactly this stream. Omitted when the
+  // client doesn't name one (web/CLI/legacy), which keeps the bare
+  // `${sessionId}::${nonce}` shape the session-prefix checks expect.
+  const handle = streamId
+    ? `${sessionId}::${streamId}::${nonce}`
+    : `${sessionId}::${nonce}`;
   sessions.add(handle);
 
   let removed = false;
@@ -150,6 +163,38 @@ export function clearSessionWatch(
   let cleared = 0;
   for (const handle of [...sessions]) {
     if (handle.startsWith(`${sessionId}::`)) {
+      sessions.delete(handle);
+      cleared += 1;
+    }
+  }
+  if (sessions.size === 0) bucket.delete(deviceToken);
+  if (bucket.size === 0) subscriptions.delete(instance);
+  return cleared;
+}
+
+// Drop watch entries for ONE stream of a device — the specific stream the
+// client named with `streamId` on its SSE handshake. Used when a chat
+// screen unmounts: it clears only the handle(s) that screen registered,
+// leaving a sibling stream on the SAME session intact. This is the
+// over-clear fix — on iOS the Thread View is pushed as a card over the
+// main chat, so both screens open a stream on the same sessionId; a
+// session-wide clear on the thread's unmount would wipe the still-mounted
+// main chat's watch and unsuppress its completion pushes. Scoped to the
+// `${sessionId}::${streamId}::` prefix so only the departed stream goes.
+// Returns the number of handles cleared. Idempotent.
+export function clearStreamWatch(
+  instance: Instance,
+  deviceToken: string,
+  sessionId: string,
+  streamId: string
+): number {
+  const bucket = subscriptions.get(instance);
+  const sessions = bucket?.get(deviceToken);
+  if (!bucket || !sessions) return 0;
+  const prefix = `${sessionId}::${streamId}::`;
+  let cleared = 0;
+  for (const handle of [...sessions]) {
+    if (handle.startsWith(prefix)) {
       sessions.delete(handle);
       cleared += 1;
     }

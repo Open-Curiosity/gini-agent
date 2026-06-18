@@ -132,7 +132,8 @@ export {
   isDeviceWatching,
   hasAnyActiveSubscription,
   clearDeviceWatch,
-  clearSessionWatch
+  clearSessionWatch,
+  clearStreamWatch
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,

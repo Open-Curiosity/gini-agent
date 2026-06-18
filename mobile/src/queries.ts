@@ -386,6 +386,17 @@ export function useChatStream(
   // wherever we mutate dataRef.
   const lastSeenIdRef = useRef<string | null>(null);
 
+  // Stable id for THIS hook instance's stream, generated once per mount and
+  // sent both on the SSE handshake (?streamId=) and on the unmount unwatch
+  // beacon. It lets the gateway clear exactly the stream this screen opened
+  // without disturbing a sibling stream on the SAME session — the Thread
+  // View is presented as a card over the main chat, so both screens hold a
+  // stream on the same sessionId and a session-wide clear on the thread's
+  // unmount would wipe the still-mounted main chat's watch.
+  const streamIdRef = useRef<string>(
+    `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+  );
+
   useEffect(() => {
     // Reset unconditionally before branching so a sessionId change
     // (chat A → chat B) doesn't leave chat A's blocks rendered until
@@ -465,7 +476,9 @@ export function useChatStream(
       if (es) return;
       let endpoint: { url: string; headers: Record<string, string> };
       try {
-        endpoint = resolveStreamEndpoint(`/chat/${sessionId}/stream`);
+        endpoint = resolveStreamEndpoint(
+          `/chat/${sessionId}/stream?streamId=${encodeURIComponent(streamIdRef.current)}`
+        );
       } catch (err) {
         if (!cancelled) setError(err as Error);
         return;
@@ -672,21 +685,26 @@ export function useChatStream(
     };
   }, [sessionId, threadId]);
 
-  // Session-change / unmount unwatch beacon. Kept in its own effect keyed
-  // ONLY on sessionId (not threadId) so it fires when the user leaves a
-  // chat for good — not when they toggle between that chat's main view and
-  // a thread, which reuses the SAME /chat/:id/stream and must not have its
-  // watch-state cleared. closeStream() (in the effect above) closes our SSE
-  // end, but behind a relay the gateway-side socket can linger, leaving
-  // this session's watch-state stale and suppressing its completion pushes.
-  // A SESSION-SCOPED unwatch drops only this session (clearSessionWatch),
-  // never the whole device — the next chat's stream is opening concurrently
-  // and a device-wide clear could race-wipe its fresh registration.
-  // Best-effort; a reopened chat re-registers via its own SSE handshake.
+  // Unmount unwatch beacon. closeStream() (in the effect above) closes our
+  // SSE end, but behind a relay the gateway-side socket can linger, leaving
+  // this stream's watch-state stale and suppressing the session's completion
+  // pushes. This STREAM-SCOPED unwatch drops only the stream THIS hook opened
+  // (matched by the streamId it sent on the handshake), so it can't wipe a
+  // sibling stream the client holds on the same session: the Thread View is
+  // presented as a card over the main chat, so both screens watch the same
+  // sessionId at once, and a session-wide clear on the thread's unmount would
+  // unsuppress the still-mounted main chat's pushes. Keyed on the
+  // [sessionId, streamId] pair (streamId is mount-stable) so it fires once on
+  // real teardown. Best-effort; a reopened screen re-registers via its own
+  // SSE handshake under a fresh streamId.
   useEffect(() => {
     if (!sessionId) return;
+    const streamId = streamIdRef.current;
     return () => {
-      void api(`/push/unwatch?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST" }).catch(() => {});
+      void api(
+        `/push/unwatch?sessionId=${encodeURIComponent(sessionId)}&streamId=${encodeURIComponent(streamId)}`,
+        { method: "POST" }
+      ).catch(() => {});
     };
   }, [sessionId]);
 

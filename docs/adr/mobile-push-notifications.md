@@ -76,13 +76,16 @@ The chosen design uses two transports in concert:
   `APNS_KEY_P8_PATH` from env. The key never leaves the gateway
   process. ES256 JWT is cached for 50 minutes and rotated on demand.
 - **Payload scope**: APNs alert payloads contain `{ sessionId, blockId,
-  approvalId, event }` and a fixed `{ title, body }` generic string. No
-  chat text, no tool name, no approval summary. Silent payloads carry the
-  same routing fields and `content-available: 1`. The exhaustive privacy
-  assertion is pinned in `src/integrations/apns/dispatcher.test.ts` — any
-  future regression that adds user content to the **wire** surface fails
-  the suite. The rich preview the user sees is fetched on-device by the
-  NSE (see "NSE enrichment" below), never placed on the wire.
+  approvalId, event }` — plus `threadId` when the completed block belongs
+  to a thread — and a fixed `{ title, body }` generic string. No chat
+  text, no tool name, no approval summary. The routing ids (including
+  `threadId`) are opaque identifiers, not user content. Silent payloads
+  carry the same routing fields and `content-available: 1`. The
+  exhaustive privacy assertion is pinned in
+  `src/integrations/apns/dispatcher.test.ts` — any future regression that
+  adds user content to the **wire** surface fails the suite. The rich
+  preview the user sees is fetched on-device by the NSE (see "NSE
+  enrichment" below), never placed on the wire.
 - **Apple sees**: sessionId-shaped opaque strings, app bundle id, and
   the generic title. Apple does not see the chat content, the agent
   name, or any user-authored text — even though the user reads a rich
@@ -103,9 +106,12 @@ The chosen design uses two transports in concert:
 
 The `message_completed` alert payload carries the same routing fields
 as the silent variant (`sessionId`, `blockId`, `event: "message_completed"`,
-`silent: false`) plus a generic `aps.alert` envelope. No `category` is
-attached — the only action is the default tap, which deep-links to the
-chat detail via the existing response listener.
+`silent: false`, and `threadId` when the completed block is threaded) plus
+a generic `aps.alert` envelope. The `threadId` lets the NSE ask the
+gateway for the **thread's** own latest reply instead of the main chat's,
+so a notification fired by threaded work previews the right text. No
+`category` is attached — the only action is the default tap, which
+deep-links to the chat detail via the existing response listener.
 
 The "no active subscription" check is per-device, not per-credential:
 two iOS installs of the same human can be in different app states
@@ -120,14 +126,17 @@ user read a notification without tapping in — while keeping chat text off
 Apple's servers — the NSE fetches the real preview on-device after the
 push arrives:
 
-1. **Server**: `GET /api/push/preview?sessionId=&event=&approvalId=`
+1. **Server**: `GET /api/push/preview?sessionId=&event=&approvalId=&threadId=`
    (`src/http.ts`) returns a notification-ready `{ title, body }` built by
-   `src/integrations/apns/preview.ts`. Three event kinds resolve:
+   `src/integrations/apns/preview.ts`. The optional `threadId` is forwarded
+   from the push payload by the NSE. Three event kinds resolve:
    - `message_completed` → the **latest** non-empty `assistant_text` in
-     the session (`latestAssistantTextForSession`). Reading the newest
-     block — not a specific one — is what makes a banner collapsed onto a
-     single session entry track the last message across multiple agent
-     turns.
+     the session (`latestAssistantTextForSession`), or in the thread when
+     `threadId` is present (`latestAssistantTextForThread`) so a threaded
+     completion previews the thread's own reply rather than stale main-chat
+     text. Reading the newest block — not a specific one — is what makes a
+     banner collapsed onto a single session entry track the last message
+     across multiple agent turns.
    - `authorization_requested` → the approval's risk + reason
      (`[high] <reason>`), titled `Approve in <chat>?`.
    - `setup_requested` → the setup ask, titled `Finish a step in <chat>`.

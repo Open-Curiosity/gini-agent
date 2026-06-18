@@ -7,6 +7,7 @@ import {
   addSseSubscription,
   clearDeviceWatch,
   clearSessionWatch,
+  clearStreamWatch,
   appendTrace,
   assertInsideWorkspace,
   createSetupRequest,
@@ -564,7 +565,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // suppression registry, which is correct — no push is ever sent
       // to them anyway.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
-      return chatBlockStream(config, request, params[0], deviceToken);
+      // Optional client-named stream id. When present it's woven into the
+      // watch handle so POST /push/unwatch?streamId= can clear exactly
+      // this stream (the screen that opened it) without disturbing a
+      // sibling stream the client holds on the same session.
+      const streamId = (new URL(request.url).searchParams.get("streamId") ?? "").trim() || null;
+      return chatBlockStream(config, request, params[0], deviceToken, streamId);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -1728,22 +1734,31 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // relay the gateway-side socket can stay open after the phone is gone
     // (keepalive writes keep succeeding into the relay buffer), so cancel()
     // may never fire and the stale entry permanently suppresses completion
-    // pushes for that session. Two callers:
+    // pushes for that session. Three callers, narrowest-scope-wins:
     //   - background: app posts with NO sessionId → clear the whole device
     //     bucket (it's watching nothing).
-    //   - navigate away / unmount: app posts WITH ?sessionId → clear only
-    //     the departed session, so a different chat the client just opened
-    //     isn't race-cleared.
+    //   - screen unmount: app posts WITH ?sessionId&streamId → clear only
+    //     the one stream that screen opened, leaving a sibling stream on the
+    //     SAME session (e.g. the main chat under a Thread View card) intact.
+    //   - ?sessionId without streamId (legacy/web): clear the whole session
+    //     for the device.
     // Best-effort and idempotent; device-scoped like /read and /badge.
     ["POST", /^\/api\/push\/unwatch$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const sessionId = (new URL(request.url).searchParams.get("sessionId") ?? "").trim();
-      const cleared = sessionId
-        ? clearSessionWatch(config.instance, dev.token, sessionId)
-        : clearDeviceWatch(config.instance, dev.token);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const streamId = (params.get("streamId") ?? "").trim();
+      let cleared: number;
+      if (sessionId && streamId) {
+        cleared = clearStreamWatch(config.instance, dev.token, sessionId, streamId);
+      } else if (sessionId) {
+        cleared = clearSessionWatch(config.instance, dev.token, sessionId);
+      } else {
+        cleared = clearDeviceWatch(config.instance, dev.token);
+      }
       return json({ ok: true, cleared });
     }],
     // Chat read-state + badge endpoints. The mobile app POSTs to
@@ -3338,7 +3353,8 @@ function chatBlockStream(
   config: RuntimeConfig,
   request: Request,
   sessionId: string,
-  deviceToken: string | null
+  deviceToken: string | null,
+  streamId: string | null = null
 ): Response {
   let closed = false;
   let keepalive: Timer | undefined;
@@ -3381,7 +3397,7 @@ function chatBlockStream(
       // suppress pushes to a foregrounded mobile device sharing the
       // same credential.
       if (deviceToken) {
-        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId, streamId ?? undefined);
       }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay

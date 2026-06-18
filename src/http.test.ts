@@ -5170,6 +5170,37 @@ describe("runtime api", () => {
       }
     });
 
+    test("POST /api/push/unwatch?sessionId&streamId clears only that stream, not a sibling on the same session", async () => {
+      const config = testConfig("push-unwatch-stream");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_stream", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Thread View (card over the main chat) and the main chat both open
+        // a stream on the SAME session, each with its own streamId. Tearing
+        // down the thread must leave the main chat's watch intact.
+        addSseSubscription(config.instance, "tok_stream", "chat_a", "stream_main");
+        addSseSubscription(config.instance, "tok_stream", "chat_a", "stream_thread");
+
+        const res = await call(
+          handler,
+          config,
+          "/api/push/unwatch?sessionId=chat_a&streamId=stream_thread",
+          { method: "POST", headers: { "x-device-token": "tok_stream" } }
+        );
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(1);
+        // The main chat's stream is still registered → session still watched.
+        expect(isDeviceWatching(config.instance, "tok_stream", "chat_a")).toBe(true);
+      } finally {
+        __resetSseSubscriptionsForTests();
+      }
+    });
+
     test("POST /api/push/unwatch requires auth + a registered device token", async () => {
       const config = testConfig("push-unwatch-auth");
       const handler = createHandler(config);

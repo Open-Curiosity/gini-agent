@@ -5,6 +5,7 @@ import {
   addSseSubscription,
   clearDeviceWatch,
   clearSessionWatch,
+  clearStreamWatch,
   hasAnyActiveSubscription,
   isDeviceWatching
 } from "./sse-subscriptions";
@@ -142,5 +143,51 @@ describe("sse-subscriptions registry", () => {
     expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
     // Bucket pruned → device reports no active subscriptions.
     expect(hasAnyActiveSubscription(INST, "tok_a")).toBe(false);
+  });
+
+  test("clearStreamWatch drops only the named stream, leaving a sibling stream on the same session", () => {
+    // The over-clear scenario: the Thread View is presented as a card over
+    // the main chat, so both screens open a stream on the SAME session, each
+    // with its own streamId. Tearing down the thread must NOT clear the main
+    // chat's watch.
+    addSseSubscription(INST, "tok_a", "chat_x", "stream_main");
+    addSseSubscription(INST, "tok_a", "chat_x", "stream_thread");
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(true);
+    // Thread screen unmounts → clears only its own stream.
+    expect(clearStreamWatch(INST, "tok_a", "chat_x", "stream_thread")).toBe(1);
+    // The main chat's stream is still registered → still watching.
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(true);
+    // And clearing the main stream too finally drops the session.
+    expect(clearStreamWatch(INST, "tok_a", "chat_x", "stream_main")).toBe(1);
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+  });
+
+  test("clearStreamWatch is a no-op (0) for an unknown device, session, or stream", () => {
+    expect(clearStreamWatch(INST, "tok_none", "chat_x", "s1")).toBe(0);
+    addSseSubscription(INST, "tok_a", "chat_x", "s1");
+    // Wrong session.
+    expect(clearStreamWatch(INST, "tok_a", "chat_other", "s1")).toBe(0);
+    // Right session, wrong stream id.
+    expect(clearStreamWatch(INST, "tok_a", "chat_x", "s2")).toBe(0);
+    // The real stream is untouched by the misses.
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(true);
+    expect(clearStreamWatch(INST, "tok_a", "chat_x", "s1")).toBe(1);
+  });
+
+  test("clearStreamWatch prunes the empty device bucket after the last stream", () => {
+    addSseSubscription(INST, "tok_a", "chat_x", "s1");
+    expect(clearStreamWatch(INST, "tok_a", "chat_x", "s1")).toBe(1);
+    expect(hasAnyActiveSubscription(INST, "tok_a")).toBe(false);
+  });
+
+  test("a stream registered with a streamId is still seen by the session-prefix watch check", () => {
+    // isDeviceWatching keys on the `${sessionId}::` prefix, which a
+    // three-segment `${sessionId}::${streamId}::${nonce}` handle must still
+    // satisfy so suppression is unaffected by naming the stream.
+    addSseSubscription(INST, "tok_a", "chat_x", "stream_1");
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(true);
+    // A bare clearSessionWatch still clears a named stream (legacy path).
+    expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
   });
 });
