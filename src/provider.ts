@@ -527,29 +527,27 @@ export function isAbortError(error: unknown): boolean {
 }
 
 // Sleep that rejects promptly when `signal` aborts, instead of running the full
-// duration. Used by the echo provider's injected `delayMs` so a test can abort
+// duration. Used by the echo provider's injected `delayMs` (so a test can abort
 // a turn mid-call and observe the same deterministic AbortError a real provider
-// fetch would raise. Rejects with the signal's reason (an AbortError-shaped
-// DOMException) so isAbortError classifies it. No signal → a plain sleep.
-// Module-private: only the echo branch uses it.
+// fetch would raise) and by withCodexSessionRetry's pre-retry wait (so a cancel
+// during the 50 ms settle window skips the second attempt at the source).
+// Rejects with the signal's reason (an AbortError-shaped DOMException) so
+// isAbortError classifies it. Both branches go through setTimeout so the delay
+// stays observable to tests that spy on it.
 async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (!signal) {
-    await Bun.sleep(ms);
-    return;
-  }
-  if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
   const { promise, resolve, reject } = Promise.withResolvers<void>();
   const timer = setTimeout(resolve, ms);
   const onAbort = (): void => {
     clearTimeout(timer);
-    reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    reject(signal!.reason ?? new DOMException("Aborted", "AbortError"));
   };
-  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
   try {
     await promise;
   } finally {
     clearTimeout(timer);
-    signal.removeEventListener("abort", onAbort);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -1305,7 +1303,7 @@ async function callToolCallingResponses(
     });
 
     return readResponsesToolCallingStream(response, provider, onDelta, signal);
-  });
+  }, signal);
 }
 
 interface ResponsesInputShape {
@@ -3426,7 +3424,7 @@ async function callOpenAIResponses(
         ...(signal ? { signal } : {})
       });
       return readCodexStream(response, provider, onDelta, signal);
-    });
+    }, signal);
   }
 
   const bearer = readOpenAIBearer(provider);
@@ -3873,14 +3871,22 @@ export const CODEX_RETRY_REWRITE_DELAY_MS = 50;
 //     empty auth.json mid-rewrite. Without this branch the parse failure
 //     surfaces as a permanent generic Error and the user sees a hard
 //     failure from a transient mid-write read.
-async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
+async function withCodexSessionRetry<T>(make: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   try {
     return await make();
   } catch (err) {
     if (!(err instanceof CodexSessionExpiredError) && !(err instanceof CodexAuthRaceError)) {
       throw err;
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
+    // Honor the turn's cancellation during the pre-retry wait: abortableSleep
+    // rejects with the signal's reason (an AbortError) the moment the user
+    // cancels, so attempt 2 is never constructed. Without the signal the wait
+    // would run to its full 50 ms and then fire a fresh fetch whose
+    // already-aborted signal rejects it — correct outcome, but a wasted
+    // round-trip. The throw propagates as an abort, which isAbortError
+    // classifies upstream (it is not a session/auth error, so it bypasses the
+    // second-failure credential handling below).
+    await abortableSleep(CODEX_RETRY_REWRITE_DELAY_MS, signal);
     try {
       return await make();
     } catch (retryErr) {

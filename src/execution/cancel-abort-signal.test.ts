@@ -5,7 +5,7 @@
 // and the boot-time orphan heal.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -477,14 +477,21 @@ describe("per-turn AbortSignal", () => {
   });
 
   test("an approved terminal.exec aborted mid-run settles `denied`, never `ok` — a killed command is not a success", async () => {
-    const config = buildConfig(makeWorkspace(), uniqueInstance("approved-abort-not-ok"), "strict");
+    const workspace = makeWorkspace();
+    const config = buildConfig(workspace, uniqueInstance("approved-abort-not-ok"), "strict");
     const provider = normalizeProvider(config.provider);
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "approved-abort-not-ok", undefined, "agent_k")
     );
 
-    // The model asks to run a long-sleeping shell command. In strict mode this
-    // gates: the loop pauses at waiting_approval with a pending authorization.
+    // The command writes a marker into the workspace, THEN sleeps. The marker
+    // is proof the process actually spawned and `zsh -lc` began executing —
+    // so polling for it before cancelling guarantees the abort lands in the
+    // mid-run window (proc.kill → `winner === "aborted"`), not the pre-spawn
+    // `signal.aborted` branch. Both branches settle `denied`, so without this
+    // proof-of-spawn the test could silently pass via pre-spawn and never
+    // exercise the mid-run kill it means to pin. The cwd is config.workspaceRoot.
+    const marker = join(workspace, "spawned.marker");
     setEchoToolCallingResponse({
       provider,
       text: "",
@@ -492,7 +499,7 @@ describe("per-turn AbortSignal", () => {
         {
           id: "call_sleep",
           type: "function",
-          function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sleep 30" }) }
+          function: { name: "terminal_exec", arguments: JSON.stringify({ command: "touch spawned.marker; sleep 30" }) }
         }
       ],
       finishReason: "tool_calls"
@@ -504,15 +511,14 @@ describe("per-turn AbortSignal", () => {
     const approvalId = readState(config.instance).authorizations.find((a) => a.taskId === task.id && a.status === "pending")?.id;
     expect(approvalId).toBeDefined();
 
-    // Approve WITHOUT awaiting: executeApprovedAction spawns `sleep 30` and
-    // blocks on it. We cancel while it is genuinely in flight (the approval
-    // claims the in-flight registry around the spawned proc), so the abort
-    // fires the claimed controller → `proc.kill()` → `winner === "aborted"`.
+    // Approve WITHOUT awaiting: executeApprovedAction spawns the command and
+    // blocks on it. We cancel only once the marker proves the proc spawned, so
+    // the abort fires the claimed controller → `proc.kill()` → mid-run kill.
     const approving = decideApproval(config, approvalId!, "approve");
-    // Wait until the side effect is actually in flight (registry claim live)
-    // before cancelling — cancelling before the spawn would exercise the
-    // pre-spawn abort branch, not the mid-run kill we want to pin.
-    await waitFor(() => __inFlightSnapshot(config.instance).some((e) => e.taskId === task.id));
+    // Proof-of-spawn: the registry claim happens BEFORE the spawn, so waiting
+    // on __inFlightSnapshot alone could let the cancel land pre-spawn. The
+    // marker file only exists once the shell actually ran.
+    await waitFor(() => existsSync(marker));
 
     await cancelTask(config, task.id);
     // Let the approve path unwind (the killed proc resolves, the abort audit
@@ -531,6 +537,17 @@ describe("per-turn AbortSignal", () => {
     // completed result (resume's emitToolResult is skipped for the abort).
     expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_sleep")).toBe(false);
     expect(readState(config.instance).tasks.find((t) => t.id === task.id)?.status).toBe("cancelled");
+
+    // Pin that the MID-RUN kill path ran, not the pre-spawn branch: the mid-run
+    // audit carries captured-output evidence (stdoutBytes) that the pre-spawn
+    // emitTerminalAborted row (which sets spawnSkipped:true) never writes. This
+    // makes the test fail if the abort ever regresses to landing pre-spawn.
+    const abortedAudit = readState(config.instance).audit.find(
+      (a) => a.action === "terminal.exec_aborted" && a.taskId === task.id
+    );
+    expect(abortedAudit).toBeDefined();
+    expect((abortedAudit?.evidence as { spawnSkipped?: boolean } | undefined)?.spawnSkipped).toBeUndefined();
+    expect((abortedAudit?.evidence as { stdoutBytes?: number } | undefined)?.stdoutBytes).toBeDefined();
   });
 
   test("an approved messaging.send aborted mid-send settles `denied`, never `ok` — the bridge swallows the AbortError but the signal still tells the truth", async () => {
