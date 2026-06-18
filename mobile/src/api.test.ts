@@ -231,6 +231,17 @@ describe("api() request timeout (issue #396)", () => {
     expect((err as Error).message).toBe("HTTP 500");
   });
 
+  test("a non-ok runtime-action body surfaces its `message` when there is no `error`", async () => {
+    // fill_secret / connector routes reject with { ok: false, message: "..." }
+    // rather than { error: "..." }; the actionable text must reach the card
+    // instead of a bare "HTTP <status>".
+    setFetch(async () => jsonResponse({ ok: false, message: "Browser session expired" }, 409));
+    const err = await api("/setup-requests/x/complete", { method: "POST" }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(409);
+    expect((err as Error).message).toBe("Browser session expired");
+  });
+
   test("an empty 204 body resolves to null", async () => {
     setFetch(async () => new Response("", { status: 204 }));
     const result = await api("/chat/x/read", { method: "DELETE" });

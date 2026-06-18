@@ -169,10 +169,22 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     const text = await response.text();
     const value = text ? safeParse(text) : null;
     if (!response.ok) {
+      // Two error-body shapes flow through the gateway: generic 4xx/5xx
+      // { error: "..." }, and the fill_secret / connector runtime-action
+      // routes { ok: false, message: "..." }. Read both so a non-2xx
+      // fill_secret response surfaces its actionable message (e.g. "Browser
+      // session expired") instead of a bare "HTTP <status>". Mirrors
+      // web/src/lib/api.ts.
+      const envelope =
+        value && typeof value === "object"
+          ? (value as { error?: unknown; message?: unknown })
+          : null;
       const message =
-        (value && typeof value === "object" && "error" in value && typeof value.error === "string")
-          ? value.error
-          : `HTTP ${response.status}`;
+        typeof envelope?.error === "string"
+          ? envelope.error
+          : typeof envelope?.message === "string"
+            ? envelope.message
+            : `HTTP ${response.status}`;
       throw new ApiError(response.status, message);
     }
     return value as T;
