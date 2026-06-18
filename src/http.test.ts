@@ -2738,27 +2738,69 @@ describe("runtime api", () => {
     // Restart/crash/disconnect drops the in-process spawned handle while the
     // durable card survives. With a recorded url, open-browser relaunches the
     // headless Chrome and navigates to it (the spawn-only replacement for the
-    // removed managed relaunch) instead of stranding the user. In this unit
-    // context there's no real Chrome to launch, so the navigate fails and the
-    // endpoint surfaces the relaunch failure as 409 — but the recovery path was
-    // taken, and the row stays pending for a later real retry.
+    // removed managed relaunch) instead of stranding the user. We STUB the spawn
+    // launcher to throw so the relaunch fails deterministically (no dependence
+    // on ambient "is real Chrome installed?"), proving the recovery path was
+    // taken and surfaces a 409 with the row left pending for a later real retry.
     const config = testConfig("open-browser-relaunch-attempt");
     const handler = createHandler(config);
     const { createSetupRequest } = await import("./state");
-    const setup = await mutateState(config.instance, (state) =>
-      createSetupRequest(state, {
+    const browserMod = await import("./tools/browser");
+    const browserTest = browserMod.__test;
+    browserMod.setBrowserInstance(config.instance);
+    browserTest.setSpawnChromeForTest(async () => {
+      throw new Error("stubbed: no Chrome in this unit test");
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "Sign in",
+          reason: "Sign in",
+          payload: { toolCallId: "call_relaunch", url: "https://example.com/login" }
+        })
+      );
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      // Distinct from the no-URL message: this 409 came from the relaunch attempt.
+      expect(body.error).not.toContain("no page URL is recorded");
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    } finally {
+      browserTest.setSpawnChromeForTest(null);
+      browserTest.uninstallFakeBrowserForTest();
+      browserTest.resetBrowserInstanceForTest();
+    }
+  });
+
+  test("open-browser refuses (no relaunch/navigate) when the user's Chrome is attached over CDP", async () => {
+    // A stale Connect card racing a later cdp attach: the screencast streams the
+    // SPAWNED Chrome, but the user is on cdp. /open-browser must NOT relaunch +
+    // navigate the user's external Chrome to the recorded URL — it refuses with
+    // the cdp-specific 409 BEFORE any navigation. (The dispatch guard stops NEW
+    // cards on cdp; this covers an already-minted card hitting /open-browser.)
+    const config = testConfig("open-browser-cdp-refuse");
+    const handler = createHandler(config);
+    const { createSetupRequest, now } = await import("./state");
+    const setup = await mutateState(config.instance, (state) => {
+      // Active cdp transport + a stale card carrying a recorded URL.
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+      return createSetupRequest(state, {
         action: "browser.connect",
         target: "Sign in",
         reason: "Sign in",
-        payload: { toolCallId: "call_relaunch", url: "https://example.com/login" }
-      })
-    );
+        payload: { toolCallId: "call_cdp_stale", url: "https://example.com/login" }
+      });
+    });
     const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
     expect(res.status).toBe(409);
     const body = await res.json();
-    // Distinct from the no-URL message: this 409 came from the relaunch attempt.
-    expect(body.error).not.toContain("no page URL is recorded");
-    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    expect(String(body.error)).toContain("attached over CDP");
+    // The card was NOT stamped as a live screencast (no navigation happened).
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    expect(after?.status).toBe("pending");
+    expect(after?.payload.signInStarted).toBeUndefined();
+    expect(after?.payload.screencast).toBeUndefined();
   });
 
   test("frames reconnect on an already-stamped card relaunches the browser when none is live", async () => {

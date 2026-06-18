@@ -214,26 +214,32 @@ async function emitConnectorRequestAudit(
 }
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
-  // Resolve the live screencast bridge for an active browser.connect setup,
-  // relaunching the headless spawned Chrome first when it isn't running. Both
-  // the frames SSE and the input relay call this: an already-stamped sign-in
-  // card (signInStarted + screencast) skips /open-browser on a reconnect and
-  // hits these endpoints directly, so the relaunch recovery can't live only in
-  // /open-browser — a gateway restart / Chrome crash would otherwise leave the
-  // modal reconnecting into a permanent 409. The relaunch navigates to the
-  // recorded target page through browserNavigate's SSRF / domain-policy gate,
-  // exactly like /open-browser. Returns the bridge, or a JSON error Response.
   // Ensure a spawned Chrome is live for a browser.connect sign-in, relaunching
   // it headless and navigating to the recorded target page when it isn't (a
   // gateway restart / Chrome crash drops the in-process handle while the
   // durable setup row survives). Returns null on success, or a JSON error
   // Response. The navigate runs the same SSRF / domain-policy gate as any tool
   // navigation. Shared by /open-browser (stage 1) and the frames/input recovery
-  // path (a reconnect after a restart skips /open-browser).
+  // path (a reconnect after a restart skips /open-browser). Refuses when the
+  // user's own Chrome is attached over CDP (no spawned browser to screencast).
   async function ensureSpawnedBrowserForSignIn(
     setup: { id: string; taskId?: string; payload: Record<string, unknown> }
   ): Promise<Response | null> {
     if (getScreencastPort() !== null) return null;
+    // No spawned Chrome to screencast. If the user has attached their OWN Chrome
+    // over CDP, do NOT relaunch/navigate — the relaunch would resolve the cdp
+    // transport and drive the user's external Chrome to the recorded URL (a
+    // stale Connect card racing a later cdp attach), which is a surprising
+    // side effect with no screencast to show. Refuse before the navigate; the
+    // user completes the step in their own visible Chrome. (The dispatch guard
+    // stops NEW cards on cdp; this covers an already-minted card hitting
+    // /open-browser or a stamped card's frames/input reconnect.)
+    if ((readState(config.instance).browser?.mode ?? null) === "cdp") {
+      return json(
+        { error: "Your own Chrome is attached over CDP, so there's no in-chat browser to open. Complete this step directly in your Chrome window, then continue." },
+        409
+      );
+    }
     const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
     if (!targetUrl) {
       return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." }, 409);
@@ -248,6 +254,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     return null;
   }
 
+  // Resolve the live screencast bridge for an active browser.connect setup,
+  // relaunching the headless spawned Chrome first when it isn't running. Both
+  // the frames SSE and the input relay call this: an already-stamped sign-in
+  // card (signInStarted + screencast) skips /open-browser on a reconnect and
+  // hits these endpoints directly, so the relaunch recovery can't live only in
+  // /open-browser — a gateway restart / Chrome crash would otherwise leave the
+  // modal reconnecting into a permanent 409. Returns the bridge, or a JSON
+  // error Response.
   async function resolveScreencastBridgeOrError(
     setup: { id: string; taskId?: string; payload: Record<string, unknown> }
   ): Promise<ScreencastBridge | Response> {

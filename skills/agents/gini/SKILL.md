@@ -657,17 +657,14 @@ from BotFather and recreate the bridge. (Human-operator CLI mirror:
 `gini messaging health`, then
 `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.)
 
-**Headless browser launch fails with "Failed to launch Chromium"** — the
-error message ends with `Run \`bunx playwright install chromium\` to
-install the browser.` Run that command and retry; Playwright's bundled
-Chromium isn't present until then.
-
 **Spawned browser launch fails with "Failed to launch Chromium"** — the
-error message ends with `Confirm Chrome / Chromium is installed (or set
-GINI_CHROME_PATH) and retry.` The runtime auto-installs Playwright's Chromium
-when no browser is on disk; if that fails, install Chrome or set
-`GINI_CHROME_PATH` to a Chromium-compatible executable and retry the browser
-tool call.
+error names what to do (`Confirm Chrome / Chromium is installed (or set
+GINI_CHROME_PATH), or run \`bunx playwright install chromium\``). The runtime
+auto-installs Playwright's Chromium when no browser is on disk; if that fails,
+install Chrome or set `GINI_CHROME_PATH` to a Chromium-compatible executable
+and retry the browser tool call. (This applies to the default spawned
+transport; a `cdp` attach instead fails with a "Failed to attach over CDP"
+message — disconnect and let the agent use its own spawned browser.)
 
 **Sign-in screencast won't open ("The agent's browser isn't running")** —
 the spawned Chrome wasn't live when Connect was clicked (e.g. after a gateway

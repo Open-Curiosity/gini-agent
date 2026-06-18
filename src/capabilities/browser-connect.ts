@@ -213,7 +213,11 @@ async function connectBrowserInner(
   // Otherwise it's a pure no-op acknowledgement — the spawned Chrome launches
   // lazily on the first browser_* tool call.
   if (typeof input.cdpUrl !== "string" || input.cdpUrl.length === 0) {
-    if (readState(config.instance).browser) return await disconnectBrowserInner(config);
+    // Route through the public disconnectBrowser so the teardown shares the
+    // pendingDisconnect single-flight (a concurrent /api/browser/disconnect
+    // folds into the same promise rather than double-tearing-down + writing a
+    // duplicate audit row).
+    if (readState(config.instance).browser) return await disconnectBrowser(config);
     return { connected: false };
   }
 
@@ -354,6 +358,14 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   // the user's Chrome (never killing it); for the default spawned Chrome it
   // tears the spawned handle down and the next tool call relaunches the same
   // profile dir. The on-disk profile is untouched either way.
+  //
+  // We write a `browser.disconnect` audit row ONLY when a cdp record exists:
+  // that is a user-meaningful transport change (the user detaches the runtime
+  // from their own external Chrome and reverts to the spawned default). A
+  // spawned-handle drop with no record is an internal lifecycle reset — the
+  // same per-instance Chrome relaunches on the next tool call — so auditing it
+  // would be noise, not a security-relevant event. (The asymmetry is by design,
+  // not a missing audit row.)
   if (existing) {
     await mutateState(config.instance, (state) => {
       state.browser = null;
