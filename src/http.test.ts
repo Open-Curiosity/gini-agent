@@ -2711,6 +2711,147 @@ describe("runtime api", () => {
     expect(input.status).toBe(409);
   });
 
+  test("open-browser 409s with the no-URL message when no browser is live and no page URL is recorded", async () => {
+    // A pending browser.connect with no live spawned Chrome AND no recorded url
+    // can't relaunch anything to screencast, so it 409s with the distinct
+    // no-URL message rather than attempting a blind navigate.
+    const config = testConfig("open-browser-no-url-no-browser");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_no_url" }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+    // The row stays pending so a later retry (once a browser is live) works.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("open-browser attempts a headless relaunch+navigate when a URL is recorded but no browser is live", async () => {
+    // Restart/crash/disconnect drops the in-process spawned handle while the
+    // durable card survives. With a recorded url, open-browser relaunches the
+    // headless Chrome and navigates to it (the spawn-only replacement for the
+    // removed managed relaunch) instead of stranding the user. We STUB the spawn
+    // launcher to throw so the relaunch fails deterministically (no dependence
+    // on ambient "is real Chrome installed?"), proving the recovery path was
+    // taken and surfaces a 409 with the row left pending for a later real retry.
+    const config = testConfig("open-browser-relaunch-attempt");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const browserMod = await import("./tools/browser");
+    const browserTest = browserMod.__test;
+    browserMod.setBrowserInstance(config.instance);
+    browserTest.setSpawnChromeForTest(async () => {
+      throw new Error("stubbed: no Chrome in this unit test");
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "Sign in",
+          reason: "Sign in",
+          payload: { toolCallId: "call_relaunch", url: "https://example.com/login" }
+        })
+      );
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      // Distinct from the no-URL message: this 409 came from the relaunch attempt.
+      expect(body.error).not.toContain("no page URL is recorded");
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    } finally {
+      browserTest.setSpawnChromeForTest(null);
+      browserTest.uninstallFakeBrowserForTest();
+      browserTest.resetBrowserInstanceForTest();
+    }
+  });
+
+  test("open-browser refuses (no relaunch/navigate) when the user's Chrome is attached over CDP", async () => {
+    // A stale Connect card racing a later cdp attach: the screencast streams the
+    // SPAWNED Chrome, but the user is on cdp. /open-browser must NOT relaunch +
+    // navigate the user's external Chrome to the recorded URL — it refuses with
+    // the cdp-specific 409 BEFORE any navigation. (The dispatch guard stops NEW
+    // cards on cdp; this covers an already-minted card hitting /open-browser.)
+    const config = testConfig("open-browser-cdp-refuse");
+    const handler = createHandler(config);
+    const { createSetupRequest, now } = await import("./state");
+    const setup = await mutateState(config.instance, (state) => {
+      // Active cdp transport + a stale card carrying a recorded URL.
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+      return createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_cdp_stale", url: "https://example.com/login" }
+      });
+    });
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(String(body.error)).toContain("attached over CDP");
+    // The card was NOT stamped as a live screencast (no navigation happened).
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    expect(after?.status).toBe("pending");
+    expect(after?.payload.signInStarted).toBeUndefined();
+    expect(after?.payload.screencast).toBeUndefined();
+  });
+
+  test("frames reconnect on an already-stamped card relaunches the browser when none is live", async () => {
+    // After a gateway/Chrome restart, an already-stamped sign-in card (screencast
+    // + signInStarted, still pending) skips /open-browser — the modal reconnects
+    // straight to /frames. So /frames must itself attempt the headless relaunch
+    // when no browser is live and a URL is recorded, or the user is stuck on a
+    // permanent 409. In this unit context there's no real Chrome, so the relaunch
+    // fails fast and 409s — but via the relaunch path (distinct from the no-URL
+    // message), proving the reconnect recovery is wired through /frames.
+    const config = testConfig("frames-reconnect-relaunch");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        // Already stamped (the pre-restart open-browser ran); URL recorded.
+        payload: { toolCallId: "call_frames_relaunch", url: "https://example.com/login", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).not.toContain("no page URL is recorded");
+    // Row stays pending so a real retry (with a live browser) can recover.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("frames reconnect on a stamped card with NO recorded URL 409s with the no-URL message", async () => {
+    // The relaunch needs a target page; without a recorded URL there's nothing
+    // to navigate to, so /frames 409s with the distinct no-URL message rather
+    // than blindly relaunching.
+    const config = testConfig("frames-reconnect-no-url");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_frames_no_url", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+  });
+
   test("screencast endpoints reject a setup that isn't an active sign-in (lifecycle gate)", async () => {
     // A browser.connect setup that is NOT pending, OR not stamped screencast +
     // signInStarted, must be refused so a stale EventSource reconnect after
@@ -2746,6 +2887,112 @@ describe("runtime api", () => {
       body: JSON.stringify({ kind: "move", x: 1, y: 1 })
     }, config.token);
     expect(r2.status).toBe(404);
+  });
+
+  test("open-browser refuses a row cancelled before the stamp mutation (in-mutation status recheck)", async () => {
+    // /open-browser checks pending on a pre-read, then stamps screencast +
+    // signInStarted inside mutateState. A /cancel that commits in that window
+    // must not get a live sign-in stamped on top: the in-mutation status
+    // recheck returns 410 and leaves the cancelled row untouched.
+    const config = testConfig("open-browser-raced-cancel");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    // A live spawned handle so getScreencastPort is non-null (we get past the
+    // 409 no-browser gate and reach the stamp mutation).
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_race" }
+        })
+      );
+      // Cancel the row first — this is the racer that wins.
+      await mutateState(config.instance, (state) => {
+        const row = state.setupRequests.find((s) => s.id === setup.id);
+        if (row) row.status = "cancelled";
+      });
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The pre-read pending gate already 410s here; the in-mutation recheck is
+      // the backstop for a cancel that lands AFTER that gate. Either way the
+      // contract is: no live sign-in stamped on a terminal row.
+      expect(res.status).toBe(410);
+      const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+      expect(after?.status).toBe("cancelled");
+      expect(after?.payload.signInStarted).toBeUndefined();
+      expect(after?.payload.screencast).toBeUndefined();
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
+  });
+
+  test("browser.connect /complete claims the row BEFORE writing the audit row (no duplicate on double-submit)", async () => {
+    // The non-screencast fallback must resolve (claim pending->completed) before
+    // writing the rich browser.connect audit row. A second /complete loses the
+    // claim (ApprovalRaceLostError) and writes ZERO side effects, so exactly one
+    // browser.connect audit row exists no matter how many completes race.
+    const config = testConfig("browser-connect-complete-claim-first");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in to the store",
+        reason: "Sign in to the store",
+        // No screencast marker → the non-screencast fallback path.
+        payload: { toolCallId: "call_complete", reason: "Sign in to the store" }
+      })
+    );
+    const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(first.status).toBe(200);
+    // Second complete on the now-terminal row loses the claim.
+    const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(second.status).toBeGreaterThanOrEqual(400);
+    const browserConnectAudits = readState(config.instance).audit.filter((a) => a.action === "browser.connect");
+    expect(browserConnectAudits).toHaveLength(1);
+  });
+
+  test("open-browser is idempotent: a second open on an already-stamped row writes no duplicate audit", async () => {
+    // /open-browser keeps the row pending, so two opens (double-click / retry)
+    // both pass the pending check. The in-mutation already-stamped guard makes
+    // the second a no-op so exactly one stage:open-browser audit row exists.
+    const config = testConfig("open-browser-idempotent");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_idem", url: "https://example.com/login" }
+        })
+      );
+      const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(first.status).toBe(200);
+      const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The second open succeeds (idempotent) but writes no extra audit/trace.
+      expect(second.status).toBe(200);
+      const openAudits = readState(config.instance).audit.filter(
+        (a) => a.action === "browser.connect" && (a.evidence as Record<string, unknown> | undefined)?.stage === "open-browser"
+      );
+      expect(openAudits).toHaveLength(1);
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
   });
 
   test("screencast frames stream a frame and input dispatches with a live bridge", async () => {
@@ -2912,6 +3159,42 @@ describe("runtime api", () => {
     );
     await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
     expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("cancel stops the owner's bridge unconditionally, even if the row isn't yet stamped screencast", async () => {
+    // /cancel must not gate the bridge teardown on a pre-claim screencast read:
+    // payload.screencast can flip true (via /open-browser) in the window between
+    // that read and the atomic claim. Install a live bridge owned by the setup
+    // on a row that is NOT yet stamped screencast, cancel it, and assert the
+    // bridge is torn down anyway — the unconditional owner-scoped stop.
+    const config = testConfig("screencast-cancel-unstamped");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        // Deliberately NOT stamped screencast/signInStarted yet.
+        payload: { toolCallId: "call_sc_unstamped" }
+      })
+    );
+    let stopped = false;
+    const fakeBridge = {
+      isClosed: () => false,
+      stop: async () => {
+        stopped = true;
+      }
+    } as unknown as import("./execution/browser-screencast").ScreencastBridge;
+    sc.__setActiveBridgeForTest(fakeBridge, setup.id);
+    try {
+      await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+      expect(stopped).toBe(true);
+    } finally {
+      await sc.stopActiveBridge();
+    }
   });
 
   test("a frames request after a screencast complete is rejected (no bridge recreation)", async () => {
@@ -3476,43 +3759,73 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  // Round-1 review fix: browser-connect throws with prefixes that the
-  // gateway's catch-all previously mapped to 500. The webapp needs them as
-  // 4xx so it can render the original message instead of "internal error".
-  test("browser connect returns 400 for unsupported cdpUrl protocol", async () => {
-    const config = testConfig("browser-bad-proto");
+  // Default transport (issue #420): /api/browser/connect with NO cdpUrl is a
+  // no-op acknowledgement — the spawned Chrome launches lazily on the first
+  // browser tool call, not at connect time, and carries no record.
+  test("browser connect with no cdpUrl returns the stable disconnected status", async () => {
+    const config = testConfig("browser-connect-empty-body");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
       config,
       "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "file:///etc/passwd" })
-      },
+      { method: "POST", body: JSON.stringify({}) },
       config.token
     );
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(201);
     const body = await response.json();
-    expect(body.error).toMatch(/Unsupported/);
+    expect(body.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
-  test("browser connect returns 400 for garbage cdpUrl", async () => {
-    const config = testConfig("browser-bad-url");
+  // A cdpUrl with an unsupported protocol is user-input error → 400, and no
+  // record is written. (Validation happens before any probe/attach.)
+  test("browser connect rejects an unsupported cdpUrl protocol with 400", async () => {
+    const config = testConfig("browser-connect-bad-protocol");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
       config,
       "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "not-a-url" })
-      },
+      { method: "POST", body: JSON.stringify({ cdpUrl: "file:///etc/passwd" }) },
       config.token
     );
     expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.error).toMatch(/Invalid cdpUrl/);
+    expect(String(body.error ?? body.message)).toContain("Unsupported cdpUrl protocol");
+    expect(readState(config.instance).browser ?? null).toBeNull();
+  });
+
+  // An unreachable (but well-formed) loopback CDP endpoint surfaces as 400 with
+  // a clear "Could not reach CDP endpoint" message, and writes no record. The
+  // server-side env knobs shrink the probe deadline so the test doesn't burn
+  // the full 15s budget (they are NOT plumbed from the POST body).
+  test("browser connect surfaces an unreachable cdp endpoint as 400", async () => {
+    const config = testConfig("browser-connect-unreachable-cdp");
+    const handler = createHandler(config);
+    const prevTimeout = process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+    const prevInterval = process.env.GINI_CDP_PROBE_INTERVAL_MS;
+    process.env.GINI_CDP_PROBE_TIMEOUT_MS = "40";
+    process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+    try {
+      const response = await rawCall(
+        handler,
+        config,
+        "/api/browser/connect",
+        // Port 1 is reserved and never listening, so the probe always fails.
+        { method: "POST", body: JSON.stringify({ cdpUrl: "ws://127.0.0.1:1/devtools/browser/abc" }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(String(body.error ?? body.message)).toContain("Could not reach CDP endpoint");
+      expect(readState(config.instance).browser ?? null).toBeNull();
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+      else process.env.GINI_CDP_PROBE_TIMEOUT_MS = prevTimeout;
+      if (prevInterval === undefined) delete process.env.GINI_CDP_PROBE_INTERVAL_MS;
+      else process.env.GINI_CDP_PROBE_INTERVAL_MS = prevInterval;
+    }
   });
 
   test("PATCH /api/settings/auto-approve rejects out-of-union approvalMode with 400", async () => {
@@ -3553,26 +3866,14 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
-  test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
-    const config = testConfig("browser-unreachable");
+  test("GET /api/browser reports the stable disconnected status", async () => {
+    const config = testConfig("browser-status");
     const handler = createHandler(config);
-    // Port 1 is reserved; probe will time out. The point of this test is
-    // the status mapping, so use a short-lived test by aborting once we
-    // see the response.
-    const response = await rawCall(
-      handler,
-      config,
-      "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "http://127.0.0.1:1/" })
-      },
-      config.token
-    );
-    expect(response.status).toBe(400);
+    const response = await rawCall(handler, config, "/api/browser", {}, config.token);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.error).toMatch(/Could not reach CDP endpoint/);
-  }, 30_000);
+    expect(body.connected).toBe(false);
+  });
 
   test("stamps the active agent on records and filters listings by agentId", async () => {
     const config = testConfig("records-agentid");
@@ -6513,13 +6814,6 @@ function testConfig(instance: string): RuntimeConfig {
   // because the inode is gone. removeMemoryDb closes the cached handle
   // AND unlinks the file + WAL/SHM siblings in one shot.
   removeMemoryDb(instance);
-  // The unreachable-CDP test posts to the real /api/browser/connect route,
-  // which omits the in-process probe override by design. Shrink the probe via
-  // the server-side env knob so the test exercises the 400 mapping without
-  // burning the production probe deadline. Server env, not POST body, so the
-  // network-input boundary stays intact.
-  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
-  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
   // resumeChatTask polls for the loop's flip to waiting_approval before
   // staging a tool result. In-process the flip lands within a couple of
   // mutateState boundaries, and several fill_secret / approval tests seed a

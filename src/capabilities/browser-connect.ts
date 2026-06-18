@@ -5,61 +5,38 @@
 //   POST /api/browser/connect         -> connectBrowser
 //   POST /api/browser/disconnect      -> disconnectBrowser
 //
-// Profile persistence shape:
+// Two transports (see issue #420):
 //
-// The agent ALWAYS drives the same per-instance profile directory at
-// ~/.gini/instances/<inst>/chrome-profile/. Sign-ins land in that dir and
-// survive across:
-//   - Connect/Disconnect cycles (visibility toggle only)
-//   - Runtime restarts
-//   - Idle teardown
-// The only way to lose them is to manually rm -rf the profile dir.
+//   - DEFAULT (no record): the runtime drives its OWN spawned per-instance
+//     Chrome (src/tools/browser.ts), launched lazily on the first browser tool
+//     call against ~/.gini/instances/<inst>/chrome-profile/. Sign-ins land in
+//     that profile dir and survive runtime/Chrome restarts and idle teardown.
+//     Sign-in happens in-place via the `browser.connect` SetupRequest's in-chat
+//     screencast of that headless Chrome — no persisted record.
 //
-// Two connection modes (the third "headless" state is "no record"):
+//   - "cdp" (POST /api/browser/connect with `{ cdpUrl }`): the user points the
+//     runtime at their OWN already-running external Chrome over a CDP websocket
+//     URL. We probe the endpoint, persist the URL (credentials stripped) as the
+//     `state.browser` record, and attach over CDP — never spawning or signalling
+//     that process. connectOverCDP works under Bun via the bundled-ws→built-in
+//     patch (patches/playwright-core@1.60.0.patch); it's an opt-in transport for
+//     users who run their own Chrome.
 //
-//   - "managed": no body. The runtime calls chromium.launchPersistentContext
-//     against the per-instance profile dir with `headless: false` — Chrome
-//     opens visibly so the user can sign in. The session manager pulls the
-//     live BrowserContext from its own ensureShared() each time it needs
-//     it. Disconnecting closes only the visible window; the next tool call
-//     relaunches the same profile dir with `headless: true`.
+// (The old "managed" visible-window mode was removed — issue #420.)
 //
-//   - "cdp": body carries `{ cdpUrl }`. The runtime probes the supplied
-//     CDP endpoint and stores the URL verbatim — minus any embedded
-//     credentials in the redaction copy that lands in the audit row.
-//     CDP attach is known-flaky under the current Playwright + Bun
-//     stack; the UI warns users to prefer managed mode.
-//
-// The shape returned by all three GET/POST handlers is `{ connected:
-// boolean, record?: BrowserConnectionRecord }` so the CLI / webapp can
-// render a uniform status card.
+// The shape returned by the GET/POST handlers is `{ connected: boolean,
+// record?: BrowserConnectionRecord }` so the CLI / webapp can render a uniform
+// status card.
 
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { instanceRoot } from "../paths";
+import { mkdirSync } from "node:fs";
 import { addAudit, mutateState, now, readState } from "../state";
-import { launchPersistentChrome } from "../tools/chrome-discovery";
-import {
-  chromeProfileDirFor,
-  disconnectSharedBrowser,
-  materializeManagedForConnect,
-  safetyCheck,
-  withTeardownLock
-} from "../tools/browser";
+import { chromeProfileDirFor, disconnectSharedBrowser, safetyCheck } from "../tools/browser";
 import type { BrowserConnectionRecord, RuntimeConfig } from "../types";
 
-// We poll a user-supplied CDP /json/version endpoint every 500ms for up
-// to 15s before giving up. Used only by `cdp` mode now (managed mode no
-// longer probes — Playwright owns the lifecycle).
+// We poll a user-supplied CDP /json/version endpoint every 500ms for up to 15s
+// before giving up — the only place this capability waits on the network.
 const PROBE_INTERVAL_MS = 500;
 const PROBE_TIMEOUT_MS = 15_000;
-// Sentinel cdpUrl value persisted for managed-mode records. The session
-// manager doesn't read cdpUrl when mode === "managed" (it pulls the live
-// BrowserContext from ensureShared instead), but the field is non-null in
-// BrowserConnectionRecord to keep the GET /api/browser response shape
-// stable across modes. The CLI / UI hides this value behind a friendly
-// label.
-const MANAGED_CDP_SENTINEL = "internal:managed";
 
 type Status = {
   connected: boolean;
@@ -67,72 +44,31 @@ type Status = {
 };
 
 // Pinpointed view of the /json/version JSON. We only care about the
-// webSocketDebuggerUrl when a managed launch finishes booting — the rest
-// of the payload is metadata we don't use.
+// webSocketDebuggerUrl; the rest of the payload is metadata we don't use.
 interface CdpVersionInfo {
   webSocketDebuggerUrl?: string;
   Browser?: string;
 }
 
+// The tool-result JSON the chat-task loop receives when a browser.connect
+// SetupRequest completes via the non-screencast fallback. Shared with the HTTP
+// /complete handler (which needs it for the atomic claim's toolResult, BEFORE
+// this module's audit write runs) so the two paths can never drift.
+export const BROWSER_CONNECT_SPAWNED_RESULT = JSON.stringify({ success: true, connected: true, mode: "spawned" });
+
+// GET /api/browser status. Reports the persisted cdp record when one exists
+// (the user attached their own Chrome); otherwise the default spawned Chrome is
+// an internal on-demand handle the user doesn't toggle, so `connected: false`
+// is the truthful state.
 export function getBrowserConnection(config: RuntimeConfig): Status {
-  const state = readState(config.instance);
-  const record = state.browser ?? null;
+  const record = readState(config.instance).browser ?? null;
   if (!record) return { connected: false };
   return { connected: true, record };
 }
 
-// Strip embedded `user:pass@` credentials before persisting a redacted
-// form for audit / event logs. We never want a basic-auth-bearing ws:// URL
-// to leak through the activity stream.
-function redactUrlCredentials(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if (parsed.username || parsed.password) {
-      parsed.username = "";
-      parsed.password = "";
-      return parsed.toString();
-    }
-    return url;
-  } catch {
-    // Not a valid URL — caller will already have failed validation, but
-    // be defensive so we never echo raw input back into the audit row.
-    return "<redacted>";
-  }
-}
-
-// Same shape as redactUrlCredentials, but used at the storage boundary
-// (state.json, GET /api/browser, the webapp): we actually drop the
-// credentials rather than redacting to a sentinel. A user who supplies
-// `ws://alice:pass@host/...` should not see their password rendered back
-// in the status card.
-function stripUrlCredentials(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if (parsed.username || parsed.password) {
-      parsed.username = "";
-      parsed.password = "";
-      return parsed.toString();
-    }
-    return url;
-  } catch {
-    // Caller already validated — but if a fresh probe somehow returned a
-    // malformed URL, drop it on the floor rather than persist garbage.
-    return url;
-  }
-}
-
-// Thin alias kept for back-compat with the test helpers. The managed (visible
-// Connect) launch uses the SAME per-instance profile dir as the agent's
-// spawned default browsing, so a sign-in done in the visible window is visible
-// to the agent's subsequent headless tool calls.
-function profileDirFor(config: RuntimeConfig): string {
-  return chromeProfileDirFor(config.instance);
-}
-
-// HTTP probe of a CDP endpoint. The /json/version path returns Chrome's
-// build info and the webSocketDebuggerUrl we'll later hand to Playwright.
-// Returns the parsed body on success or null if the host did not respond
-// with a JSON payload before the deadline.
+// HTTP probe of a CDP endpoint. The /json/version path returns Chrome's build
+// info and the webSocketDebuggerUrl. Returns the parsed body on success or null
+// if the host did not respond with a JSON payload before the deadline.
 async function probeCdp(
   httpUrl: string,
   deadlineMs: number,
@@ -142,8 +78,8 @@ async function probeCdp(
   while (Date.now() < start + deadlineMs) {
     try {
       const response = await fetch(`${httpUrl.replace(/\/$/, "")}/json/version`, {
-        // AbortSignal.timeout keeps a single hung connection from eating
-        // the entire poll budget.
+        // AbortSignal.timeout keeps a single hung connection from eating the
+        // entire poll budget.
         signal: AbortSignal.timeout(intervalMs * 2)
       });
       if (response.ok) {
@@ -151,18 +87,17 @@ async function probeCdp(
         if (body && typeof body === "object") return body;
       }
     } catch {
-      // Connection refused / network errors are expected during the
-      // startup window — keep polling.
+      // Connection refused / network errors are expected during the startup
+      // window — keep polling.
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   return null;
 }
 
-// Maps a CDP ws://host:port/... URL onto its sibling http://host:port form
-// for the /json/version probe. Falls back to the raw input if the URL
-// parser rejects it (the caller will already have surfaced a validation
-// error in that case).
+// Maps a CDP ws://host:port/... URL onto its sibling http://host:port form for
+// the /json/version probe. Falls back to the raw input if the URL parser
+// rejects it (the caller will already have surfaced a validation error then).
 function cdpHttpForm(cdpUrl: string): string {
   try {
     const parsed = new URL(cdpUrl);
@@ -186,84 +121,75 @@ function validateCdpUrl(raw: string): { ok: true; url: string } | { ok: false; e
   return { ok: true, url: parsed.toString() };
 }
 
-// PUBLIC input shape — accepted directly from authenticated callers (HTTP
-// POST /api/browser/connect body, CLI). Keep this surface minimal and
-// auditable. Fields that affect audit / trust semantics MUST NOT live here,
-// because the HTTP route hands the parsed body straight to connectBrowser
-// without filtering — declaring those fields on this type would let an
-// authenticated client suppress its own audit trail by setting them in the
-// POST body. Such fields belong in `InternalConnectOptions` (third arg),
-// reachable only from in-process call sites.
-export interface ConnectInput {
-  cdpUrl?: unknown;
-  // When set to "managed", an existing record that is NOT managed (i.e. a
-  // `cdp`-mode record that may be headless or owned by a different Chrome)
-  // is torn down and replaced with a fresh managed launch instead of being
-  // returned as-is. The default behavior (no `mode`) preserves the existing
-  // "vanilla reconnect" semantics used by the CLI and HTTP endpoint —
-  // empty input means "reconnect to whatever exists." The `browser_connect`
-  // tool dispatch sets `mode: "managed"` because its contract (and the
-  // approval card the user just consented to) promises a visible Chrome
-  // window; silently handing back a stale CDP session would violate that.
-  mode?: "managed";
-  // When true AND mode === "managed", the managed Chrome is launched with
-  // headless: true so no window appears. The per-instance profile dir is
-  // unchanged from the headed launch, so cookies from a prior visible
-  // sign-in replay — the headless session is already signed in. Use this
-  // AFTER sign-in to continue Cloud Console / OAuth work invisibly. Only
-  // takes effect on managed mode; cdp mode is unaffected (the user owns
-  // that Chrome's visibility).
-  headless?: boolean;
+// Strip embedded `user:pass@` credentials before persisting a redacted form for
+// audit / event logs. We never want a basic-auth-bearing ws:// URL to leak
+// through the activity stream.
+function redactUrlCredentials(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+      return parsed.toString();
+    }
+    return url;
+  } catch {
+    return "<redacted>";
+  }
 }
 
-// INTERNAL options — never plumbed from network input. Lives as a separate
-// third argument to `connectBrowser` so it can't be smuggled in through
-// `POST /api/browser/connect`'s JSON body. The HTTP route omits this arg,
-// so `skipAudit` always defaults to false on that path and the capability
-// always writes its `browser.connect` audit row. Only the in-process
-// tool-dispatch caller (which writes its own richer audit row with the
-// approval `reason` + `approvalId`) sets `skipAudit: true` to avoid a
-// duplicate, reasonless row.
+// Same shape, but at the storage boundary (state.json, GET /api/browser, the
+// webapp) we actually drop the credentials rather than redacting to a sentinel.
+function stripUrlCredentials(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+      return parsed.toString();
+    }
+    return url;
+  } catch {
+    return url;
+  }
+}
+
+// PUBLIC input shape — accepted directly from authenticated callers (HTTP POST
+// /api/browser/connect body, CLI). Keep this surface minimal: the HTTP route
+// hands the parsed body straight to connectBrowser, so any field that affects
+// audit/trust semantics belongs in InternalConnectOptions instead, reachable
+// only from in-process call sites.
+export interface ConnectInput {
+  cdpUrl?: unknown;
+}
+
+// INTERNAL options — never plumbed from network input. The HTTP route omits
+// this arg, so `skipAudit` always defaults to false on that path and the
+// capability always writes its `browser.connect` audit row. Test-only probe
+// overrides keep the unreachable-endpoint failure path fast without burning the
+// full 15s real deadline.
 interface InternalConnectOptions {
   skipAudit?: boolean;
-  // Test-only override for the CDP probe deadline / poll interval. NEVER
-  // plumbed from network input (this whole arg is in-process-only — the HTTP
-  // route omits it), so an authenticated client cannot shorten the probe to
-  // race the capability. Defaults to the production PROBE_TIMEOUT_MS /
-  // PROBE_INTERVAL_MS, so every non-test caller behaves byte-for-byte as
-  // before. Used by the unit tests to exercise the unreachable-endpoint
-  // failure path without burning the full 15s real-world deadline.
   probeTimeoutMs?: number;
   probeIntervalMs?: number;
 }
 
-// Serializes concurrent /api/browser/connect calls. The browser-connect
-// lifecycle is full of "is there already a state record?" checks; without
-// this, two parallel callers each read empty state, each spawn Chrome,
-// and the second writer wins — leaking the first child as a zombie. Pattern
-// mirrors `pendingBrowser` in src/tools/browser.ts.
+// Serializes concurrent /api/browser/connect calls so two parallel attaches
+// can't both write a record and leak a handle.
 let pendingConnect: Promise<Status> | null = null;
-
-// Same idea, but for /api/browser/disconnect. Without this, a second
-// concurrent caller reads still-set state, calls disconnectSharedBrowser
-// (which early-returns because the first caller already flipped its
-// teardown flag), then proceeds to killManagedChrome before the first
-// drain finishes. Folding both calls into the same promise keeps the
-// teardown sequence atomic from the caller's perspective.
+// Same idea for /api/browser/disconnect.
 let pendingDisconnect: Promise<Status> | null = null;
 
-// Idempotent connect. Mode is decided by whether the caller supplied a
-// cdpUrl. We re-probe an existing record before returning it so a crashed
-// Chrome doesn't appear as still-connected.
+// Connect. With no `cdpUrl` this is a no-op acknowledgement — the default
+// transport is the spawned Chrome, launched lazily by the next browser tool
+// call, which carries no record. With a `cdpUrl` it probes the user's external
+// Chrome and attaches over CDP, persisting the `state.browser` record.
 //
 // The third `internal` argument is OFF-LIMITS to network callers (the HTTP
-// route omits it). It carries flags that affect audit / trust semantics
-// (`skipAudit`); putting them on `ConnectInput` would let any authenticated
-// HTTP client set `{"skipAudit": true}` in the POST body and suppress the
-// capability's own audit row, breaking the tamper-resistance contract.
+// route omits it); it carries flags that affect audit/trust semantics.
 export function connectBrowser(
   config: RuntimeConfig,
-  input: ConnectInput,
+  input: ConnectInput = {},
   internal: InternalConnectOptions = {}
 ): Promise<Status> {
   if (pendingConnect) return pendingConnect;
@@ -280,35 +206,42 @@ async function connectBrowserInner(
   input: ConnectInput,
   internal: InternalConnectOptions
 ): Promise<Status> {
-  // Validate caller input BEFORE we touch any existing state. A bad cdpUrl
-  // (malformed, blocked SSRF target, unsupported protocol) must surface as
-  // a 400 to the caller without tearing down the user's already-managed
-  // Chrome. Previously the mismatch check used the raw input string,
-  // triggered tearDownExistingConnection (killing the user's Chrome), and
-  // only THEN ran validation — see round-3 review.
-  let validatedCallerCdp: string | undefined;
-  if (typeof input.cdpUrl === "string" && input.cdpUrl.length > 0) {
-    const validated = validateCdpUrl(input.cdpUrl);
-    if (!validated.ok) throw new Error(validated.error);
-    const httpForm = cdpHttpForm(validated.url);
-    // CDP endpoints are always loopback (127.0.0.1:9222 / localhost
-    // typically) — that's the whole point of CDP. Pass allowLoopback
-    // so the navigation-SSRF block on loopback doesn't refuse a
-    // legitimate CDP attach. SSRF concerns for the controlled-browser
-    // navigation surface still apply via the default safetyCheck()
-    // path that browserNavigate hits.
-    const blocked = safetyCheck(httpForm, { allowLoopback: true });
-    if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
-    validatedCallerCdp = validated.url;
+  // ABSENT cdpUrl (undefined / null) → the default spawned transport. A bare
+  // connect means "use the default": if a cdp record is still persisted,
+  // leaving it would let the next tool call keep attaching to the user's
+  // external Chrome, contradicting the {connected:false} we return here. Drop
+  // it (and the in-process handle, and write the disconnect audit row) so the
+  // next call relaunches spawned. Otherwise it's a pure no-op acknowledgement —
+  // the spawned Chrome launches lazily on the first browser_* tool call.
+  if (input.cdpUrl === undefined || input.cdpUrl === null) {
+    // Route through the public disconnectBrowser so the teardown shares the
+    // pendingDisconnect single-flight (a concurrent /api/browser/disconnect
+    // folds into the same promise rather than double-tearing-down + writing a
+    // duplicate audit row).
+    if (readState(config.instance).browser) return await disconnectBrowser(config);
+    return { connected: false };
+  }
+  // PRESENT but not a non-empty string → malformed input. Reject it as a 400
+  // (the route maps "Invalid cdpUrl" → 400) WITHOUT touching existing state — a
+  // {cdpUrl: 123} or {cdpUrl: ""} must not silently disconnect an active cdp
+  // attach the way an absent cdpUrl does.
+  if (typeof input.cdpUrl !== "string" || input.cdpUrl.length === 0) {
+    throw new Error(`Invalid cdpUrl: ${JSON.stringify(input.cdpUrl)}`);
   }
 
-  // Probe tuning resolves from the in-process `internal` arg first, then a
-  // server-side env override, then the module constants. Neither source is
-  // reachable from `input` (the network POST body), so an authenticated HTTP
-  // client still cannot shorten the probe to race the capability — only the
-  // operator (process env) or the in-process tool-dispatch caller can.
-  // Production callers set neither, so the effective values are the module
-  // constants and behavior is unchanged at the real deadline.
+  // Validate caller input BEFORE touching any existing state.
+  const validated = validateCdpUrl(input.cdpUrl);
+  if (!validated.ok) throw new Error(validated.error);
+  const httpForm = cdpHttpForm(validated.url);
+  // CDP endpoints are always loopback (127.0.0.1:9222 / localhost typically) —
+  // that's the whole point of CDP. Pass allowLoopback so the navigation-SSRF
+  // block on loopback doesn't refuse a legitimate CDP attach. The agent's own
+  // navigation surface still hits the default safetyCheck() (no allowLoopback).
+  const blocked = safetyCheck(httpForm, { allowLoopback: true });
+  if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
+
+  // Probe tuning resolves from the in-process `internal` arg, then a server-side
+  // env override, then the module constants. None is reachable from `input`.
   const envInterval = Number(process.env.GINI_CDP_PROBE_INTERVAL_MS);
   const envTimeout = Number(process.env.GINI_CDP_PROBE_TIMEOUT_MS);
   const probeIntervalMs =
@@ -316,162 +249,59 @@ async function connectBrowserInner(
   const probeTimeoutMs =
     internal.probeTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : PROBE_TIMEOUT_MS);
 
-  const wantHeadless = input.headless === true;
   const existing = readState(config.instance).browser ?? null;
-  if (existing) {
-    // If the caller explicitly asked for a *different* endpoint than what's
-    // stored, don't short-circuit on the old record — fall through to the
-    // teardown + fresh attach path.
-    const callerCdp = validatedCallerCdp;
-    // Strict-managed mode: if the caller demands a managed Chrome and the
-    // existing record isn't managed (e.g. it's a `cdp`-mode record left
-    // over from a prior /api/browser/connect with a custom endpoint), the
-    // existing record cannot satisfy the contract. Treat it as a mismatch
-    // so we fall through to teardown + fresh managed launch rather than
-    // silently returning a stale CDP session that may be headless.
-    const strictManagedMismatch =
-      input.mode === "managed" && existing.mode !== "managed";
-    // Visibility mismatch: caller asked for headless when current is
-    // headed (or vice versa). Even if the mode matches, the launch
-    // option differs so we cannot short-circuit — Chromium must be
-    // relaunched with the new headless flag against the same profile
-    // dir. Only relevant when both sides are managed.
-    const headlessMismatch =
-      input.mode === "managed" &&
-      existing.mode === "managed" &&
-      (existing.headless === true) !== wantHeadless;
-    const targetsSameEndpoint =
-      !strictManagedMismatch && !headlessMismatch && targetsExistingRecord(existing, callerCdp);
-
-    if (targetsSameEndpoint) {
-      if (existing.mode === "managed") {
-        // Managed mode: the session manager holds the live BrowserContext
-        // in-process. If that handle is still alive we're already
-        // connected — return the stored record without re-launching.
-        // (disconnectSharedBrowser drops the handle, so a stale state
-        // record without a matching handle is treated as dead and falls
-        // through to teardown + relaunch.)
-        return { connected: true, record: existing };
+  if (existing && targetsExistingRecord(existing, validated.url)) {
+    // Same host:port already recorded — re-probe its liveness in one short poll
+    // window rather than waiting out a cold start.
+    const probe = await probeCdp(cdpHttpForm(existing.cdpUrl), probeIntervalMs * 2, probeIntervalMs);
+    if (probe) {
+      // Chrome regenerates its browser-level ws path (/devtools/browser/<guid>)
+      // on every restart, and playwright's connectOverCDP uses a ws URL
+      // VERBATIM (no /json/version re-resolution). So the host:port probe can
+      // succeed against a restarted Chrome while the stored ws path is stale —
+      // refresh the record from the probe's fresh webSocketDebuggerUrl before
+      // returning, or the next tool call would attach to a dead guid.
+      const freshWs = probe.webSocketDebuggerUrl ? stripUrlCredentials(probe.webSocketDebuggerUrl) : existing.cdpUrl;
+      const record: BrowserConnectionRecord = freshWs === existing.cdpUrl ? existing : { ...existing, cdpUrl: freshWs };
+      if (record !== existing) {
+        await mutateState(config.instance, (state) => {
+          state.browser = record;
+        });
       }
-      const httpForm = cdpHttpForm(existing.cdpUrl);
-      // Existing-record liveness re-probe: a single poll window (interval * 2)
-      // is enough — we're checking whether the recorded endpoint is still up,
-      // not waiting out a cold start. Production keeps the 1s budget
-      // (PROBE_INTERVAL_MS * 2); tests shrink it via the effective interval.
-      const probe = await probeCdp(httpForm, probeIntervalMs * 2, probeIntervalMs);
-      if (probe) {
-        // Chrome may have restarted on the same port with a fresh UUID
-        // suffix on its webSocketDebuggerUrl — refresh the stored value so
-        // tools don't try to use a dead URL.
-        const refreshed: BrowserConnectionRecord = {
-          ...existing,
-          cdpUrl: stripUrlCredentials(probe.webSocketDebuggerUrl ?? existing.cdpUrl)
-        };
-        if (refreshed.cdpUrl !== existing.cdpUrl) {
-          await mutateState(config.instance, (state) => {
-            state.browser = refreshed;
-          });
-        }
-        return { connected: true, record: refreshed };
-      }
+      // Drop any cached in-process handle (e.g. a previously-spawned Chrome)
+      // so the NEXT browser tool call re-reads this cdp record and attaches via
+      // the cdp branch rather than reusing the stale spawned handle.
+      await disconnectSharedBrowser();
+      return { connected: true, record };
     }
-    // The previous endpoint is dead (or the caller asked for a different
-    // one) — tear it down fully before falling through to a fresh launch.
-    // For a same-endpoint stale record we only need to clear state (the
-    // probe just showed the remote is gone). For a mismatched endpoint
-    // (caller asked for a *different* URL) we additionally drop the
-    // in-process Playwright handle via disconnectSharedBrowser so the
-    // managed BrowserContext (and the Chromium it owns) shuts down before
-    // we try to launch a fresh one.
-    if (!targetsSameEndpoint) {
-      await tearDownExistingConnection(config, existing);
-    } else {
-      await mutateState(config.instance, (state) => {
-        state.browser = null;
-      });
-    }
-  }
-
-  // If the fresh connect below throws, state was already cleared above
-  // (either by tearDownExistingConnection on the mismatch path or the
-  // mutateState block on the same-endpoint dead path), so the user is
-  // left in a clean disconnected state rather than half-leaked. The
-  // thrown error propagates up to the HTTP handler, which maps it to the
-  // appropriate status code.
-  // launchManaged installs the freshly-built BrowserContext directly into
-  // the session manager (via materializeManagedForConnect) so there's no
-  // headless-handle ambiguity — the next browser_* call reuses the live
-  // managed context. For the cdp path we still drop any cached headless
-  // handle so ensureShared rebuilds via the CDP branch on the next call.
-  // `skipAudit` is read from the in-process `internal` arg ONLY. Reading it
-  // from `input` (which we hand the HTTP body to verbatim) would let any
-  // authenticated caller post `{"skipAudit": true}` and silence their own
-  // audit row.
-  const skipAudit = internal.skipAudit === true;
-  if (validatedCallerCdp) {
-    const result = await connectExisting(config, validatedCallerCdp, {
-      skipAudit,
-      probeTimeoutMs,
-      probeIntervalMs
+    // Stale record (the user's Chrome went away) — clear it BEFORE the fresh
+    // attach so that if the fresh attach also fails (endpoint truly gone),
+    // state is left cleanly disconnected rather than holding a dead record that
+    // GET /api/browser still reports as connected and that the next tool call
+    // wastes a 60s connectOverCDP timeout on. The liveness probe above already
+    // ran a short window and returned null, so we've decided this endpoint is
+    // dead — clearing here matches the pre-rewrite contract.
+    await mutateState(config.instance, (state) => {
+      state.browser = null;
     });
-    await disconnectSharedBrowser();
-    return result;
   }
-  return await launchManaged(config, { skipAudit, headless: wantHeadless });
-}
 
-// Full teardown of an existing connection record. Sends SIGTERM to the
-// recorded managed Chrome (if any), drops the in-process Playwright handle,
-// and clears state — same sequence disconnectBrowser uses. Pulled out so
-// the mismatch-reconnect path in connectBrowserInner can reuse it without
-// re-entering disconnectBrowser (which would be coalesced through
-// pendingDisconnect from a different call site).
-async function tearDownExistingConnection(
-  config: RuntimeConfig,
-  existing: BrowserConnectionRecord
-): Promise<void> {
-  // Clear state FIRST so any concurrent ensureShared() callers that
-  // re-enter during teardown see fresh state and don't reattach to the
-  // soon-to-be-dead endpoint. Emit the same browser.disconnect audit row
-  // disconnectBrowserInner writes so a mismatch-reconnect leaves the
-  // activity log indistinguishable from a user-initiated disconnect.
-  await mutateState(config.instance, (state) => {
-    state.browser = null;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.disconnect",
-        target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
-        risk: "medium",
-        evidence: { mode: existing.mode, pid: existing.pid }
-      },
-      // Browser is an instance-shared resource — not bound to any one agent.
-      { system: true }
-    );
+  const result = await connectExisting(config, validated.url, {
+    skipAudit: internal.skipAudit,
+    probeTimeoutMs,
+    probeIntervalMs
   });
-  // disconnectSharedBrowser handles every mode correctly: closing the
-  // managed BrowserContext terminates the Chromium child Playwright
-  // launched, disconnect()ing the cdp Browser leaves the user's Chrome
-  // alone, and closing the headless Browser exits Chromium. No separate
-  // PID kill needed — Playwright owns the lifecycle.
+  // The cdp record is now persisted; drop the cached in-process handle so
+  // ensureShared rebuilds via the cdp branch (connectOverCDP) on the next tool
+  // call instead of reusing a previously-spawned headless Chrome.
   await disconnectSharedBrowser();
+  return result;
 }
 
-// Compare the caller's requested endpoint against the existing record.
-// Returns true when the caller didn't specify anything (a vanilla
-// "reconnect") or when their cdpUrl matches what we already have stored.
-// False means the caller explicitly wants somewhere else — we should tear
-// down and re-attach rather than handing back the stale record.
-function targetsExistingRecord(
-  existing: BrowserConnectionRecord,
-  callerCdp: string | undefined
-): boolean {
-  // No explicit endpoint requested → managed reconnect → matches anything.
-  if (callerCdp === undefined) return true;
-  // Caller asked for cdp mode but existing is managed (or vice versa) →
-  // always a mismatch.
-  if (existing.mode === "managed") return false;
+// Compare the caller's requested endpoint against the existing record. True
+// when the hosts match (a reconnect to the same Chrome); false means the caller
+// wants a different endpoint and we should re-attach.
+function targetsExistingRecord(existing: BrowserConnectionRecord, callerCdp: string): boolean {
   try {
     const wanted = new URL(callerCdp);
     const have = new URL(existing.cdpUrl);
@@ -482,18 +312,14 @@ function targetsExistingRecord(
 }
 
 // `validatedUrl` is the WHATWG-normalized form already vetted by
-// connectBrowserInner (validateCdpUrl + safetyCheck against the http
-// form). We re-derive the http form here for the probe rather than
-// threading both representations through the call site.
+// connectBrowserInner (validateCdpUrl + safetyCheck on the http form). We
+// re-derive the http form here for the probe.
 async function connectExisting(
   config: RuntimeConfig,
   validatedUrl: string,
   opts: { skipAudit?: boolean; probeTimeoutMs?: number; probeIntervalMs?: number } = {}
 ): Promise<Status> {
   const httpForm = cdpHttpForm(validatedUrl);
-  // Defaults preserve the production 15s deadline / 500ms interval; the
-  // connectBrowserInner caller forwards its already-resolved effective
-  // values, and any other (hypothetical) caller falls back to the constants.
   const probe = await probeCdp(
     httpForm,
     opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
@@ -505,21 +331,16 @@ async function connectExisting(
   const probeUrl = probe.webSocketDebuggerUrl ?? validatedUrl;
   const record: BrowserConnectionRecord = {
     mode: "cdp",
-    // Strip embedded credentials before persisting. The audit row used
-    // its own redactor; here we want the long-lived state record to be
-    // free of secrets too, since it's surfaced by GET /api/browser.
+    // Strip embedded credentials before persisting — this record is surfaced
+    // by GET /api/browser.
     cdpUrl: stripUrlCredentials(probeUrl),
-    pid: null,
-    dataDir: null,
-    chromePath: null,
     startedAt: now()
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    // When the caller is the runtime's tool-dispatch path (skipAudit), it
-    // already writes a richer browser.connect audit row carrying the
-    // approval reason and approvalId — emitting a second row here would
-    // double-count the action.
+    // The in-process tool-dispatch path (skipAudit) writes its own richer
+    // browser.connect row carrying the approval reason + approvalId; emitting a
+    // second row here would double-count.
     if (!opts.skipAudit) {
       addAudit(
         state,
@@ -529,144 +350,6 @@ async function connectExisting(
           target: redactUrlCredentials(record.cdpUrl),
           risk: "medium",
           evidence: { mode: "cdp", browser: probe.Browser ?? null }
-        },
-        { system: true }
-      );
-    }
-  });
-  return { connected: true, record };
-}
-
-async function launchManaged(
-  config: RuntimeConfig,
-  opts: { skipAudit?: boolean; headless?: boolean } = {}
-): Promise<Status> {
-  // Headless-after-signin support: when the caller asks for a headless
-  // managed launch, Playwright is invoked with `headless: true` against
-  // the SAME per-instance profile dir as the visible launch would use.
-  // Cookies + storage persisted by the prior visible session replay, so
-  // the headless context is already signed in. Falls back to visible
-  // (`headless: false`) for any other value.
-  const wantHeadless = opts.headless === true;
-  // launchPersistentChrome picks the launch binary: GINI_CHROME_PATH
-  // override, the detected branded Chrome, or the bundled-first fallback. It
-  // returns the binary that actually backed the context so the UI shows a
-  // meaningful path. Either way, the lifecycle is owned by Playwright — no
-  // separate spawn() / CDP probe / PID tracking.
-  const dataDir = profileDirFor(config);
-  mkdirSync(dataDir, { recursive: true });
-
-  // Route downloads from the managed Chrome into a directory Gini can
-  // read. macOS sandboxes ~/Downloads so the agent (running as a Bun
-  // process without Files-and-Folders entitlement) can't open files
-  // saved there — the Workspace setup skill in particular was getting
-  // stuck because the OAuth client_secret.json landed in ~/Downloads and
-  // had to be moved by a manual terminal command. Saving under the
-  // per-instance state dir (which Gini already owns) makes any download
-  // immediately readable. CDP mode (existing user Chrome) is unaffected:
-  // Playwright cannot override a remote Chrome's user-configured
-  // downloads dir; the setup skill explains that fallback.
-  const downloadsPath = join(instanceRoot(config.instance), "downloads");
-  mkdirSync(downloadsPath, { recursive: true });
-
-  // CRITICAL: tear down any existing shared handle BEFORE we attempt to
-  // launch the visible Chrome. The headless persistent context the agent
-  // may already be using is rooted at the same profile dir, and Chromium
-  // locks the dir while a context is open — a second
-  // launchPersistentContext against the same dir would fail with "user
-  // data directory is already in use". This is the pivot's central
-  // ordering rule: only one Chromium process can have the profile open at
-  // a time, so visibility transitions go teardown-then-launch.
-  //
-  // Dynamically import playwright-core so tests can mock it via
-  // mock.module without forcing every test that imports this module to
-  // pull in the full browser SDK at module-init time. Catch the
-  // module-not-found case explicitly so users see a friendly install
-  // hint instead of the bare Node module-resolution error — this
-  // happens when the runtime was started before `bun install` resolved
-  // the dep, or in a slim install that intentionally omitted browser
-  // tooling.
-  let playwright: typeof import("playwright-core");
-  try {
-    playwright = (await import("playwright-core")) as typeof import("playwright-core");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const isMissing =
-      (error as { code?: string } | undefined)?.code === "MODULE_NOT_FOUND" ||
-      (error as { code?: string } | undefined)?.code === "ERR_MODULE_NOT_FOUND" ||
-      message.includes("Cannot find package 'playwright-core'") ||
-      message.includes("Cannot find module 'playwright-core'");
-    if (isMissing) {
-      throw new Error(
-        "Browser runtime is missing. Run `bun install` in the gini-agent checkout, then restart the runtime."
-      );
-    }
-    throw error;
-  }
-  const chromium = playwright.chromium;
-
-  // withTeardownLock holds the admission gate CLOSED for the entire
-  // disconnect-then-launch sequence. Without it, a new agent tool call
-  // could land between disconnectSharedBrowser returning and the headed
-  // launchPersistentContext starting — re-acquiring the profile lock with
-  // a headless persistent context and forcing this launch to fail with
-  // "user data directory is already in use".
-  const { context, chromePath: usedPath } = await withTeardownLock(async () => {
-    await disconnectSharedBrowser();
-
-    try {
-      return await launchPersistentChrome(chromium, dataDir, {
-        headless: wantHeadless,
-        extraOptions: { acceptDownloads: true, downloadsPath }
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Failed to launch managed Chrome: ${message}. ` +
-          "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH), or run " +
-          "`bunx playwright install chromium` to install Playwright's bundled Chromium."
-      );
-    }
-  });
-
-  // Hand the live BrowserContext to the session manager so the next
-  // browser_* tool call can reuse it directly without re-launching.
-  await materializeManagedForConnect(context as import("playwright-core").BrowserContext);
-
-  // Best-effort PID extraction for UI display. Playwright exposes the
-  // child via context.browser()?.process(); the .process() method is on
-  // playwright-core's Node-side Browser but isn't in the public typing,
-  // so we duck-type it. Returns null on any failure — Playwright owns the
-  // lifecycle so the PID is purely cosmetic.
-  const browserAny = (context as import("playwright-core").BrowserContext).browser() as unknown as
-    | { process?: () => { pid?: number } | undefined }
-    | null;
-  const pid = browserAny?.process?.()?.pid ?? null;
-
-  const record: BrowserConnectionRecord = {
-    mode: "managed",
-    cdpUrl: MANAGED_CDP_SENTINEL,
-    pid,
-    dataDir,
-    chromePath: usedPath ?? null,
-    startedAt: now(),
-    headless: wantHeadless
-  };
-  await mutateState(config.instance, (state) => {
-    state.browser = record;
-    // When the caller is the runtime's tool-dispatch path (skipAudit), it
-    // already writes a richer browser.connect audit row carrying the
-    // approval reason and approvalId — emitting a second row here would
-    // double-count the action.
-    if (!opts.skipAudit) {
-      addAudit(
-        state,
-        {
-          actor: "user",
-          action: "browser.connect",
-          target: dataDir,
-          risk: "medium",
-          evidence: { mode: "managed", pid, headless: wantHeadless }
         },
         { system: true }
       );
@@ -687,47 +370,47 @@ export function disconnectBrowser(config: RuntimeConfig): Promise<Status> {
 
 async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   const existing = readState(config.instance).browser ?? null;
-  if (!existing) return { connected: false };
-
-  // Clear state FIRST so any concurrent ensureShared() callers that
-  // re-enter during teardown see fresh state and take the headless
-  // persistent branch (managed -> headless visibility toggle) rather than
-  // reattaching to the soon-to-be-closed visible window.
-  await mutateState(config.instance, (state) => {
-    state.browser = null;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.disconnect",
-        target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
-        risk: "medium",
-        evidence: { mode: existing.mode, pid: existing.pid }
-      },
-      // Browser is an instance-shared resource — not bound to any one agent.
-      { system: true }
-    );
-  });
-
-  // For managed (visible) records: closing the BrowserContext terminates
-  // the Chromium child. The next agent tool call relaunches the SAME
-  // profile dir with headless: true, so the user's sign-ins remain
-  // accessible. For cdp records: disconnect()ing leaves the user's
-  // Chrome alone — they own that process.
+  // Drop the in-process handle regardless: for a cdp record this detaches from
+  // the user's Chrome (never killing it); for the default spawned Chrome it
+  // tears the spawned handle down and the next tool call relaunches the same
+  // profile dir. The on-disk profile is untouched either way.
+  //
+  // We write a `browser.disconnect` audit row ONLY when a cdp record exists:
+  // that is a user-meaningful transport change (the user detaches the runtime
+  // from their own external Chrome and reverts to the spawned default). A
+  // spawned-handle drop with no record is an internal lifecycle reset — the
+  // same per-instance Chrome relaunches on the next tool call — so auditing it
+  // would be noise, not a security-relevant event. (The asymmetry is by design,
+  // not a missing audit row.)
+  if (existing) {
+    await mutateState(config.instance, (state) => {
+      state.browser = null;
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "browser.disconnect",
+          target: redactUrlCredentials(existing.cdpUrl),
+          risk: "medium",
+          evidence: { mode: existing.mode }
+        },
+        // Browser is an instance-shared resource — not bound to any one agent.
+        { system: true }
+      );
+    });
+  }
   await disconnectSharedBrowser();
-
   return { connected: false };
 }
 
-// Drives the user-side completion of a `browser.connect` SetupRequest:
-//   1. Switch the per-instance profile to managed mode (headless if the
-//      stage-1 /open-browser already ran the visible sign-in flow).
-//   2. Write the rich `browser.connect` audit row carrying the originating
-//      setup id and user-facing reason (the connectBrowser call uses
-//      skipAudit so this is the only row, success OR failure).
-//   3. Return the JSON tool-result string the chat-task loop expects.
-// The caller (HTTP /complete handler or test) hands the result to
-// `resolveSetupRequest` to flip status and resume the chat loop.
+// Drives the user-side completion of a `browser.connect` SetupRequest's
+// non-screencast path. Sign-in normally happens in-place via the screencast
+// bridge (handled directly in the /complete HTTP route), so this is the
+// degenerate fallback: the user has finished acting in the agent's spawned
+// Chrome and cookies are already in the shared profile — there is nothing to
+// relaunch. We write the rich `browser.connect` audit row carrying the
+// originating setup id and user-facing reason and return the JSON tool-result
+// string the chat-task loop expects.
 export async function completeBrowserConnectSetup(
   config: RuntimeConfig,
   setup: {
@@ -738,27 +421,6 @@ export async function completeBrowserConnectSetup(
     payload: Record<string, unknown>;
   }
 ): Promise<{ ok: boolean; result: string }> {
-  const signInStarted = setup.payload.signInStarted === true;
-  const explicitHeadless = setup.payload.headless === true;
-  const headless = signInStarted ? true : explicitHeadless;
-  let succeeded = false;
-  let result: string;
-  let connectStatus: Status | undefined;
-  let errorMessage: string | undefined;
-  try {
-    connectStatus = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
-    succeeded = connectStatus.connected;
-    result = JSON.stringify({
-      success: succeeded,
-      connected: connectStatus.connected,
-      mode: connectStatus.record?.mode,
-      dataDir: connectStatus.record?.dataDir,
-      headless: connectStatus.record?.headless
-    });
-  } catch (error) {
-    errorMessage = error instanceof Error ? error.message : String(error);
-    result = JSON.stringify({ success: false, error: errorMessage });
-  }
   const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
     ? setup.payload.reason
     : setup.target;
@@ -773,19 +435,12 @@ export async function completeBrowserConnectSetup(
         taskId: setup.taskId,
         runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
         approvalId: setup.id,
-        evidence: succeeded && connectStatus
-          ? {
-              success: true,
-              mode: connectStatus.record?.mode,
-              headless: connectStatus.record?.headless ?? false,
-              pid: connectStatus.record?.pid ?? null
-            }
-          : { success: false, error: errorMessage ?? "Browser failed to launch." }
+        evidence: { success: true, mode: "spawned" }
       },
       setupAuditContext(setup)
     );
   });
-  return { ok: succeeded, result };
+  return { ok: true, result: BROWSER_CONNECT_SPAWNED_RESULT };
 }
 
 // Inlined here (rather than importing approvalAgentContext from src/agent.ts)
@@ -801,20 +456,25 @@ function setupAuditContext(setup: {
   return { system: true };
 }
 
+// Thin alias kept for back-compat with the test helpers. The spawned launch
+// uses this per-instance profile dir; ensuring it exists keeps the first
+// tool-call launch from racing directory creation.
+function profileDirFor(config: RuntimeConfig): string {
+  return chromeProfileDirFor(config.instance);
+}
+
 // Internal helpers exported only for unit tests.
 export const __test = {
+  profileDirFor,
+  validateCdpUrl,
+  cdpHttpForm,
   redactUrlCredentials,
   stripUrlCredentials,
-  cdpHttpForm,
-  validateCdpUrl,
-  profileDirFor,
-  MANAGED_CDP_SENTINEL,
-  // Verifying the existsSync side effect of mkdirSync in tests would
-  // require touching the real filesystem; the helper makes that observable.
+  // Verifying the existsSync side effect of mkdirSync in tests would require
+  // touching the real filesystem; the helper makes that observable.
   ensureProfileDir(config: RuntimeConfig): string {
     const dir = profileDirFor(config);
     mkdirSync(dir, { recursive: true });
     return dir;
-  },
-  exists: existsSync
+  }
 };

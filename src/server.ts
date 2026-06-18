@@ -118,40 +118,15 @@ try {
   });
 }
 
-// Inform the browser session manager which instance to consult for the
-// optional CDP connection record. Without this the manager falls back to
-// the headless launch path (which is fine for unit tests that import the
-// tools directly).
+// Tell the browser session manager which instance this is. The instance scopes
+// the spawned Chrome's per-instance profile dir and the lookup of the optional
+// CDP connection record. Without this the manager has no instance to consult
+// (which is fine for unit tests that import the tools directly and never launch
+// or attach a real browser).
 setBrowserInstance(config.instance);
 // Opt-in browser session trace recording (OFF unless the config flag is
 // explicitly true). Read once at boot, like the instance registration.
 setBrowserRecording(config.browserRecording === true);
-
-// Clear any stale browser connection record on startup. A managed record
-// only describes a Chrome window the runtime previously opened — that
-// window is gone after a restart, so the record is misleading: GET
-// /api/browser would report `connected: true` and the next agent tool call
-// would relaunch a visible Chrome window unprompted (because the session
-// manager reads state.browser and takes the headed persistent branch).
-// The on-disk persistent profile is independent of this record and stays
-// put — only the "user wants a visible window NOW" signal resets. The user
-// hits Connect again when they want the window back.
-{
-  const existing = readState(config.instance).browser ?? null;
-  if (existing) {
-    void mutateState(config.instance, (state) => {
-      state.browser = null;
-    })
-      .then(() => {
-        appendLog(config.instance, "browser.stale-record-cleared", { mode: existing.mode });
-      })
-      .catch((error) => {
-        appendLog(config.instance, "browser.stale-record-clear-error", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-  }
-}
 
 // Reconcile + resume the tunnel singleton on startup. The frpc child the runtime
 // spawned before this restart is gone, so the live status is stale. The tunnel

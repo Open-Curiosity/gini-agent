@@ -6,12 +6,15 @@
 //
 // Transport: a single RAW CDP WebSocket to the spawned Chrome's debug port
 // (Page.startScreencast → screencastFrame → ack), exactly the technique the
-// standalone control panel uses. Raw CDP is used — NOT playwright
-// connectOverCDP — because connectOverCDP hangs on the WebSocket handshake
-// under playwright-core 1.60 + Bun, whereas a raw WebSocket to the same debug
-// endpoint works. The agent's automation keeps driving the SAME Chrome over
-// its pipe transport; this screencast is a SEPARATE read/drive channel on the
-// same process, so the two never conflict.
+// standalone control panel uses. Raw CDP is the right tool here regardless of
+// Playwright: the screencast (Page.startScreencast + Input.* relay) is its own
+// purpose-built channel, not a Playwright session. The raw WebSocket uses Bun's
+// native WebSocket, which is why this path always worked under Bun even when
+// playwright's connectOverCDP did not (that hang — playwright-core's bundled
+// `ws` — is fixed separately by patches/playwright-core@1.60.0.patch). The
+// agent's automation keeps driving the SAME Chrome over its pipe transport;
+// this screencast is a SEPARATE read/drive channel on the same process, so the
+// two never conflict.
 //
 // Security: the bridge dials ONLY a loopback debug port supplied by the
 // browser manager (getScreencastPort → the spawned handle's port, always
@@ -528,6 +531,22 @@ export class ScreencastBridge {
     onClose?: () => void,
     onUrl?: (url: string) => void
   ): () => void {
+    // If the bridge already closed between the caller acquiring it and this
+    // subscribe (e.g. the CDP socket dropped in the await gap before the SSE
+    // ReadableStream's start() ran), handleClosed already fired and cleared
+    // closeSubscribers — a callback registered now would never fire and the
+    // SSE stream would dangle on keepalives. Fire onClose synchronously and
+    // hand back a no-op unsubscribe so the caller tears its stream down at once.
+    if (this.closed) {
+      if (onClose) {
+        try {
+          onClose();
+        } catch {
+          // ignore
+        }
+      }
+      return () => undefined;
+    }
     this.subscribers.add(onFrame);
     if (onClose) this.closeSubscribers.add(onClose);
     if (onUrl) {
@@ -699,6 +718,11 @@ let startingOwner: string | undefined;
 // instead of each launching a CDP socket and leaking the loser's. Cleared once
 // the start settles.
 let startingBridge: Promise<ScreencastBridge> | undefined;
+// Identity of the in-flight start that owns startingBridge/startingOwner. The
+// settling start clears the slot only if this still matches its own token, so
+// a stale start that resolves after a newer start took over doesn't wipe the
+// newer start's slot. Bumped to undefined by stopActiveBridge.
+let startingToken: symbol | undefined;
 // Monotonic teardown counter. Bumped by stopActiveBridge so a start() that is
 // in flight when teardown fires doesn't install (and orphan) a now-unwanted
 // bridge: the start captures the generation up front and, if it changed by the
@@ -714,6 +738,17 @@ export class ScreencastBusyError extends Error {
   constructor() {
     super("Another sign-in is using the agent's browser screencast.");
     this.name = "ScreencastBusyError";
+  }
+}
+
+// Raised when a bridge start resolves AFTER a teardown bumped the generation:
+// the freshly-built bridge was stopped instead of installed, so the caller must
+// not receive it. The HTTP layer maps this to a 409 (the modal reconnects and
+// re-hits the now-non-pending gate).
+export class ScreencastStaleStartError extends Error {
+  constructor() {
+    super("The sign-in screencast was torn down while connecting.");
+    this.name = "ScreencastStaleStartError";
   }
 }
 
@@ -738,25 +773,54 @@ export async function getOrStartBridge(
   }
   const bridge = factory();
   const startedAtGeneration = bridgeGeneration;
+  // Per-start token. The .finally() below must clear the module slot ONLY if
+  // it still belongs to THIS start: after a teardown bumps the generation and
+  // a LATER start re-populates startingBridge/startingOwner, this start's
+  // settle would otherwise wipe the newer start's slot and break the
+  // single-flight guard (a third caller would launch a concurrent bridge).
+  const startToken = Symbol("screencast-start");
+  startingToken = startToken;
   startingOwner = owner;
   startingBridge = bridge
     .start(prefer?.preferUrl, prefer?.preferTargetId)
     .then(() => {
       // A teardown landed while we were starting — don't install this bridge;
-      // stop it so its CDP socket isn't orphaned.
+      // stop it so its CDP socket isn't orphaned, and REJECT rather than handing
+      // back the now-dead bridge. Returning it would let the frames/input
+      // handler subscribe to a closed bridge (its onClose already fired and
+      // cleared subscribers), leaving the SSE stream dangling on keepalives and
+      // input calls silently no-op'ing. The reject surfaces as a 409 so the
+      // modal's EventSource reconnects and re-hits the now-non-pending gate.
       if (bridgeGeneration !== startedAtGeneration) {
         void bridge.stop();
-        return bridge;
+        throw new ScreencastStaleStartError();
       }
       activeBridge = bridge;
       activeOwner = owner;
       return bridge;
     })
     .finally(() => {
-      startingBridge = undefined;
-      startingOwner = undefined;
+      // Only clear if a newer start (or a teardown) hasn't already taken over
+      // the slot — otherwise we'd forget the in-flight newer start.
+      if (startingToken === startToken) {
+        startingBridge = undefined;
+        startingOwner = undefined;
+        startingToken = undefined;
+      }
     });
   return startingBridge;
+}
+
+// True when a live (or still-starting) bridge is already held by `owner`. Lets
+// the HTTP layer skip the relaunch-the-spawned-Chrome step when a reusable
+// bridge already exists for this setup — a getScreencastPort() null reading is
+// only a "no browser, must relaunch" signal when there's also no active bridge
+// to reuse (e.g. a test that installs a fake bridge without a spawned handle,
+// or a bridge that outlived a transient port blip).
+export function hasLiveBridgeForOwner(owner: string): boolean {
+  if (activeBridge && !activeBridge.isClosed() && activeOwner === owner) return true;
+  if (startingBridge && startingOwner === owner) return true;
+  return false;
 }
 
 // Tear down the active bridge (sign-in completed / cancelled / shutdown). Bumps
@@ -784,6 +848,10 @@ export async function stopActiveBridge(owner?: string): Promise<void> {
   activeOwner = undefined;
   startingBridge = undefined;
   startingOwner = undefined;
+  // Bump the token so an in-flight start's .finally() (which checks
+  // startingToken === its own) becomes a no-op and can't clear a slot a newer
+  // start later installs.
+  startingToken = undefined;
   if (bridge) await bridge.stop();
 }
 
@@ -795,6 +863,7 @@ export function __setActiveBridgeForTest(bridge: ScreencastBridge, owner?: strin
   activeOwner = owner;
   startingBridge = undefined;
   startingOwner = undefined;
+  startingToken = undefined;
 }
 
 // Test-only reset so a suite doesn't leak the module-level bridge.
@@ -803,4 +872,5 @@ export function __resetActiveBridgeForTest(): void {
   activeOwner = undefined;
   startingBridge = undefined;
   startingOwner = undefined;
+  startingToken = undefined;
 }

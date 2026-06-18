@@ -1032,3 +1032,53 @@ describe("writeState atomic temp files", () => {
     expect(readState(instance).tasks[0]?.title).toBe("write-4");
   });
 });
+
+// The runtime drives a single spawned per-instance Chrome that carries no
+// state record (issue #420). normalizeState always coerces state.browser to
+// null on load, so a legacy or hand-edited state file holding a stale
+// managed/cdp record can't resurrect a removed transport or crash a consumer.
+describe("normalizeState browser connection record", () => {
+  test("a well-formed cdp-mode record is kept (the user's external-Chrome attach)", () => {
+    const state = createEmptyState("keep-cdp");
+    (state as unknown as Record<string, unknown>).browser = {
+      mode: "cdp",
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      startedAt: "2026-01-01T00:00:00.000Z"
+    };
+    const normalized = normalizeState("keep-cdp", state);
+    expect(normalized.browser?.mode).toBe("cdp");
+    expect(normalized.browser?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/abc");
+  });
+
+  test("a stale managed-mode record loads as browser: null without crashing (removed transport)", () => {
+    const state = createEmptyState("stale-managed");
+    // The visible-window "managed" mode was removed (issue #420). A legacy
+    // state file that still holds one must coerce to null on load rather than
+    // resurrect a removed transport — write it through a loose record to
+    // simulate the on-disk shape.
+    (state as unknown as Record<string, unknown>).browser = {
+      mode: "managed",
+      cdpUrl: "internal:managed",
+      pid: 4242,
+      dataDir: "/tmp/some-profile",
+      chromePath: "/fake/chrome",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      headless: false
+    };
+    const normalized = normalizeState("stale-managed", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+
+  test("a malformed record (missing cdpUrl) loads as browser: null", () => {
+    const state = createEmptyState("malformed-browser");
+    (state as unknown as Record<string, unknown>).browser = { mode: "cdp" };
+    const normalized = normalizeState("malformed-browser", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+
+  test("an already-null record stays null (idempotent)", () => {
+    const state = createEmptyState("already-null");
+    const normalized = normalizeState("already-null", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+});

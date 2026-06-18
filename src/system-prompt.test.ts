@@ -306,17 +306,17 @@ describe("renderEphemeralContext", () => {
 });
 
 describe("buildClientSurfaceBlock", () => {
-  test("desktop surfaces say a visible browser window would be visible", () => {
+  test("screencast-capable surfaces say a browser handoff can reach the user", () => {
     for (const surface of ["web", "cli"] as const) {
       const out = buildClientSurfaceBlock(surface);
-      expect(out).toContain("would be visible to them");
-      expect(out).not.toContain("NOT at the gateway machine");
+      expect(out).toContain("a browser handoff can reach them");
+      expect(out).not.toContain("can't reach them");
     }
     expect(buildClientSurfaceBlock("web")).toContain("web app");
     expect(buildClientSurfaceBlock("cli")).toContain("CLI");
   });
 
-  test("mobile and bridge surfaces say the user is not at the gateway machine", () => {
+  test("mobile and bridge surfaces say a browser handoff can't reach the user", () => {
     const expectations = [
       ["mobile", "mobile app"],
       ["telegram", "Telegram"],
@@ -326,7 +326,7 @@ describe("buildClientSurfaceBlock", () => {
     for (const [surface, name] of expectations) {
       const out = buildClientSurfaceBlock(surface);
       expect(out).toContain(name);
-      expect(out).toContain("NOT at the gateway machine");
+      expect(out).toContain("a browser handoff can't reach them");
     }
   });
 

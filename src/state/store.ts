@@ -1438,17 +1438,16 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       job.intervalSeconds = undefined;
     }
   }
-  // Browser connection record is purely opt-in — feature added after the
-  // initial state shape. Normalize obviously bad shapes to null so a
-  // hand-edited state file can't crash downstream consumers; valid records
-  // pass through untouched.
+  // Browser connection slot. The only persisted mode is `cdp` (the user
+  // attached the runtime to their own external Chrome); the default spawned
+  // transport carries no record. Keep a well-formed cdp record; coerce anything
+  // else to null so a legacy/hand-edited state file holding a stale
+  // `{mode:"managed",...}` record (the removed visible-window transport — issue
+  // #420) or a malformed shape can't resurrect a removed transport or crash a
+  // downstream consumer.
   if (state.browser !== undefined && state.browser !== null) {
-    const candidate = state.browser as Partial<typeof state.browser> & { cdpUrl?: unknown; mode?: unknown };
-    if (
-      typeof candidate !== "object" ||
-      typeof candidate.cdpUrl !== "string" ||
-      (candidate.mode !== "managed" && candidate.mode !== "cdp")
-    ) {
+    const candidate = state.browser as { cdpUrl?: unknown; mode?: unknown };
+    if (typeof candidate !== "object" || candidate.mode !== "cdp" || typeof candidate.cdpUrl !== "string") {
       state.browser = null;
     }
   }

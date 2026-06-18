@@ -254,26 +254,28 @@ export function buildCurrentDateBlock(now: Date, timeZone: string): string {
 
 // Per-turn client-surface line for the ephemeral role:"user" tail. Names
 // the surface the CURRENT inbound message was sent from and what that
-// implies for a visible-browser handoff: a window opened by the browser
-// tools appears on the gateway machine, so it only helps a user sitting at
-// that computer. Per-message (NOT in the byte-stable system prefix, and
-// never cached per-session) because the same session can alternate between
-// phone and desktop. Returns "" for an unknown surface so the prompt makes
-// no claim rather than guessing. See ADR client-surface-context.md.
+// implies for a browser sign-in / handoff: the agent's browser is headless,
+// and a sign-in or handoff surfaces as a LIVE IN-CHAT SCREENCAST of it that
+// only the web app renders — so it reaches a user on the web app (or one at
+// the gateway machine who can open it), but not a mobile or messaging-bridge
+// user. Per-message (NOT in the byte-stable system prefix, and never cached
+// per-session) because the same session can alternate between phone and
+// desktop. Returns "" for an unknown surface so the prompt makes no claim
+// rather than guessing. See ADR client-surface-context.md.
 export function buildClientSurfaceBlock(surface: ChatClientSurface | undefined): string {
   switch (surface) {
     case "web":
-      return "The user is messaging from the web app on a computer — likely at the gateway machine, where a visible browser window opened by the browser tools would be visible to them.";
+      return "The user is messaging from the web app on a computer — the in-chat sign-in / handoff screencast of the agent's browser renders right here, so a browser handoff can reach them.";
     case "cli":
-      return "The user is messaging from the CLI on the gateway machine — a visible browser window opened by the browser tools would be visible to them.";
+      return "The user is messaging from the CLI on the gateway machine — they can open the web app there to use the in-chat sign-in / handoff screencast, so a browser handoff can reach them.";
     case "mobile":
-      return "The user is messaging from the mobile app on their phone — they are NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+      return "The user is messaging from the mobile app on their phone — the in-chat browser screencast used for a sign-in / handoff isn't available there, so a browser handoff can't reach them.";
     case "telegram":
-      return "The user is messaging from Telegram — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+      return "The user is messaging from Telegram — the in-chat browser screencast used for a sign-in / handoff isn't available there, so a browser handoff can't reach them.";
     case "discord":
-      return "The user is messaging from Discord — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+      return "The user is messaging from Discord — the in-chat browser screencast used for a sign-in / handoff isn't available there, so a browser handoff can't reach them.";
     case "openclaw":
-      return "The user is messaging through an OpenClaw bridge — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+      return "The user is messaging through an OpenClaw bridge — the in-chat browser screencast used for a sign-in / handoff isn't available there, so a browser handoff can't reach them.";
     default:
       return "";
   }

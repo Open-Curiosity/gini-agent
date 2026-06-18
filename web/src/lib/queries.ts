@@ -929,23 +929,17 @@ export function useRenameChatSession() {
 }
 
 // Browser-connect status. Shape mirrors the gateway response from
-// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
-// Polled every 5s when idle, and every 1s while a connect/disconnect
-// mutation is in flight, so the status card reflects an external `gini
-// browser connect/disconnect` without a manual refresh.
+// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }. The
+// record is present only when the user attached the runtime to their own
+// external Chrome over CDP; the default spawned browser carries no record.
 export interface BrowserConnectionStatus {
   connected: boolean;
   record?: BrowserConnectionRecord;
 }
 
-// Polls `GET /api/browser` to keep the Settings browser panel in sync with the
-// runtime. The default cadence is 5s when nothing's happening — that's
-// well below the 3-minute Chrome dev-tools cookie lifetime and noticeably
-// less chatter than the previous 3s. Pass `isActive: true` while a
-// connect / disconnect mutation is in flight to drop to 1s; once
-// settled the caller flips the flag back. We deliberately do NOT switch
-// to SSE — the cost of holding an EventSource open across every chat
-// session that lands the Settings panel outweighs the gain.
+// Polls GET /api/browser so the Settings browser panel reflects an external
+// `gini browser connect/disconnect` without a manual refresh. 5s when idle,
+// 1s while a connect/disconnect mutation is in flight.
 export function useBrowserConnection(options?: { isActive?: boolean }) {
   const isActive = options?.isActive ?? false;
   return useQuery<BrowserConnectionStatus>({
@@ -955,9 +949,12 @@ export function useBrowserConnection(options?: { isActive?: boolean }) {
   });
 }
 
+// Attach the runtime to the user's own external Chrome over a CDP URL. With no
+// cdpUrl the gateway returns a stable disconnected status (the default spawned
+// browser needs no explicit connect).
 export function useConnectBrowser() {
   const qc = useQueryClient();
-  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string; port?: number }>({
+  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string }>({
     mutationFn: (input) =>
       api<BrowserConnectionStatus>("/browser/connect", {
         method: "POST",
