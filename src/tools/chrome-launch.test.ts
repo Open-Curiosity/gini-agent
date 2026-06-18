@@ -32,6 +32,9 @@ function fakeDeps(over: Partial<ChromeLaunchDeps> = {}): {
     resolveLaunchTarget: async () => ({ executablePath: "/fake/chrome", branded: true }),
     cleanUserAgent: async () => "UA/1.0",
     findChromePath: async () => "/fake/bundled-chromium",
+    // Default: install is never needed (a binary already resolves). Tests that
+    // exercise the no-binary path override this.
+    ensureChromiumInstalled: async () => false,
     ...over
   };
   return { deps, launchArgs };
@@ -181,13 +184,68 @@ describe("launchSpawnedChrome", () => {
     }
   });
 
-  test("throws when no Chrome binary is found", async () => {
+  test("throws when no Chrome binary is found and auto-install fails", async () => {
     const profileDir = tempProfile();
     try {
       const { deps } = fakeDeps({
-        resolveLaunchTarget: async () => ({ executablePath: null, branded: false })
+        resolveLaunchTarget: async () => ({ executablePath: null, branded: false }),
+        ensureChromiumInstalled: async () => false // download failed / unavailable
       });
-      await expect(launchSpawnedChrome({ profileDir, deps })).rejects.toThrow(/No Chrome binary/);
+      await expect(launchSpawnedChrome({ profileDir, deps })).rejects.toThrow(
+        /automatic Chromium download failed/
+      );
+    } finally {
+      rmSync(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("downloads Chromium on demand when no binary is present, then launches", async () => {
+    const profileDir = tempProfile();
+    try {
+      let installed = false;
+      let resolveCalls = 0;
+      const launchArgs: { dataDir: string; options: Record<string, unknown> }[] = [];
+      const deps: Partial<ChromeLaunchDeps> = {
+        launchPersistentContext: async (dataDir, options) => {
+          launchArgs.push({ dataDir, options });
+          return { marker: "ctx" } as never;
+        },
+        findFreePort: async () => 9333,
+        cleanUserAgent: async () => "UA/1.0",
+        findChromePath: async () => "/fake/bundled-chromium",
+        // First resolve: nothing on disk. After install: the bundled Chromium.
+        resolveLaunchTarget: async () => {
+          resolveCalls += 1;
+          return installed
+            ? { executablePath: "/fake/bundled-chromium", branded: false }
+            : { executablePath: null, branded: false };
+        },
+        ensureChromiumInstalled: async () => {
+          installed = true;
+          return true;
+        }
+      };
+      const result = await launchSpawnedChrome({ profileDir, deps });
+      expect(result.chromePath).toBe("/fake/bundled-chromium");
+      expect(resolveCalls).toBe(2); // resolved, installed, re-resolved
+      expect((launchArgs[0].options.executablePath as string)).toBe("/fake/bundled-chromium");
+    } finally {
+      rmSync(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not attempt install when a binary already resolves", async () => {
+    const profileDir = tempProfile();
+    try {
+      let installCalled = false;
+      const { deps } = fakeDeps({
+        ensureChromiumInstalled: async () => {
+          installCalled = true;
+          return true;
+        }
+      });
+      await launchSpawnedChrome({ profileDir, deps });
+      expect(installCalled).toBe(false);
     } finally {
       rmSync(profileDir, { recursive: true, force: true });
     }
@@ -257,13 +315,17 @@ describe("launchSpawnedChrome", () => {
 describe("default deps wiring", () => {
   test("launch uses real resolution when deps are omitted (binary-absent path)", async () => {
     // With no deps override and no Chrome resolvable via the real resolver in a
-    // clean env, the launch should fail fast at binary resolution — exercising
-    // the production defaultDeps() construction without launching anything.
+    // clean env, the launch should fail at binary resolution — exercising the
+    // production defaultDeps() construction without launching anything. Stub
+    // ONLY the installer so the test never triggers a real Chromium download
+    // (the GINI_CHROME_PATH override already guarantees no binary resolves).
     const profileDir = tempProfile();
     const original = process.env["GINI_CHROME_PATH"];
     process.env["GINI_CHROME_PATH"] = join(profileDir, "does-not-exist");
     try {
-      await expect(launchSpawnedChrome({ profileDir })).rejects.toThrow(/No Chrome binary/);
+      await expect(
+        launchSpawnedChrome({ profileDir, deps: { ensureChromiumInstalled: async () => false } })
+      ).rejects.toThrow(/automatic Chromium download failed/);
     } finally {
       if (original === undefined) delete process.env["GINI_CHROME_PATH"];
       else process.env["GINI_CHROME_PATH"] = original;
@@ -280,6 +342,7 @@ describe("default deps wiring", () => {
     expect(typeof deps.resolveLaunchTarget).toBe("function");
     expect(typeof deps.cleanUserAgent).toBe("function");
     expect(typeof deps.findChromePath).toBe("function");
+    expect(typeof deps.ensureChromiumInstalled).toBe("function");
     // The real launchPersistentContext resolves through the lazy playwright-core
     // import; invoking it against a bogus binary drives that import path. We
     // accept either outcome (a real playwright-core rejects; a sibling test's

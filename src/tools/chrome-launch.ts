@@ -32,6 +32,7 @@ import {
   findChromePath,
   resolveBrowserLaunchTarget
 } from "./chrome-discovery";
+import { ensureChromiumInstalled } from "./chrome-install";
 
 // First port we probe for the spawned Chrome's debug endpoint. Deliberately well
 // above 9222 so we never probe (let alone bind) the port a user's personal
@@ -56,6 +57,9 @@ export interface ChromeLaunchDeps {
   cleanUserAgent: typeof cleanChromeUserAgent;
   // Bundled-first fallback chain, used only when a BRANDED launch fails.
   findChromePath: typeof findChromePath;
+  // Download Playwright's Chromium when no binary is present at all. Returns
+  // true when a browser is now installed. Single-flight + bounded internally.
+  ensureChromiumInstalled: typeof ensureChromiumInstalled;
 }
 
 async function loadLaunchPersistentContext(): Promise<LaunchPersistentContextFn> {
@@ -73,7 +77,8 @@ export function defaultDeps(): ChromeLaunchDeps {
     findFreePort,
     resolveLaunchTarget: resolveBrowserLaunchTarget,
     cleanUserAgent: cleanChromeUserAgent,
-    findChromePath
+    findChromePath,
+    ensureChromiumInstalled
   };
 }
 
@@ -147,11 +152,20 @@ export async function launchSpawnedChrome(options: LaunchSpawnedChromeOptions): 
 
   mkdirSync(options.profileDir, { recursive: true });
 
-  const target = await deps.resolveLaunchTarget();
+  let target = await deps.resolveLaunchTarget();
+  if (!target.executablePath) {
+    // No branded Chrome AND no bundled Chromium on disk (a fresh machine that
+    // never ran `playwright install`). Download Playwright's Chromium on demand
+    // and re-resolve, so the browser feature self-provisions instead of dead-
+    // ending. The install is single-flight and bounded; on failure we fall
+    // through to the original error.
+    const installed = await deps.ensureChromiumInstalled();
+    if (installed) target = await deps.resolveLaunchTarget();
+  }
   if (!target.executablePath) {
     throw new Error(
-      "No Chrome binary found to launch. Install Google Chrome, set GINI_CHROME_PATH, " +
-        "or run `bunx playwright install chromium`."
+      "No Chrome binary found to launch, and automatic Chromium download failed. " +
+        "Install Google Chrome, set GINI_CHROME_PATH, or run `bunx playwright install chromium`."
     );
   }
   const port = options.port ?? (await deps.findFreePort(DEFAULT_CDP_PORT_BASE));
