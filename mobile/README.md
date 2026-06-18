@@ -200,7 +200,10 @@ notification. The NSE does two things:
 
 When the user taps an Approve / Deny button, `mobile/src/push-dispatch.ts`
 posts directly to `/api/authorizations/:id/approve` or `/deny` without
-foregrounding the app. The user can act without unlocking the device.
+foregrounding the app. Approve is registered with `isAuthenticationRequired`,
+so iOS requires an unlock (Face ID / Touch ID / passcode) before the approve
+action runs — a locked phone can't authorize a high-risk action on its own.
+Deny is fail-safe and needs no unlock.
 
 The action handler runs only if the app is at least suspended; if the
 user has fully killed the app from the app switcher, iOS records the

@@ -58,7 +58,8 @@ The chosen design uses two transports in concert:
   watching a chat. See ADR [Chat Block Protocol](./chat-block-protocol.md).
 - **APNs** for wake-ups: `authorization_requested` / `setup_requested`
   (always) and `phase: Completed | Failed` (only when no active SSE
-  subscription for the credential). A `Completed` turn that produced a
+  subscription for the device — see the per-device suppression note under
+  Trigger policy). A `Completed` turn that produced a
   user-visible message fires a visible alert; a `Completed` with no
   message and `Failed` fire as `content-available: 1` silent pushes that
   update the badge without surfacing a banner. Authorization pushes carry
@@ -182,15 +183,23 @@ lock-screen entry always reflects the newest assistant reply.
   be mutated before display, and the category id never attaches.
 - The main app calls `Notifications.setNotificationCategoryAsync` on
   every push registration, registering the `APPROVAL_REQUEST` category
-  with two actions:
-  - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: false`
-  - `DENY` — `opensAppToForeground: false`, `isDestructive: true`
+  with two actions (specs live in `mobile/src/push-dispatch.ts` as
+  `APPROVAL_CATEGORY_ACTIONS` so the invariant below is unit-testable):
+  - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: true`.
+    Approving grants the high-risk action the agent paused on, so iOS must
+    require Face ID / Touch ID / passcode (an unlock) before the handler
+    runs — otherwise anyone holding the locked phone could authorize a
+    dangerous operation from the lock screen. The unlock requirement does
+    not foreground the app; the gateway POST still runs in the background.
+  - `DENY` — `opensAppToForeground: false`, `isDestructive: true`. No auth
+    gate: denying is fail-safe (it cancels the pending action, never
+    grants), and the destructive flag gives it the red lock-screen styling.
 - When the user taps an action, `mobile/src/push-dispatch.ts` extracts
   `approvalId` (the authorization id) from the payload and POSTs to the
   existing `/api/authorizations/:id/approve|deny` route. The app never
-  foregrounds. Failures schedule a follow-up local notification ("Failed
-  to approve — open the app to retry") so a network blip doesn't silently
-  lose the action.
+  foregrounds (Approve runs only after the OS-required unlock). Failures
+  schedule a follow-up local notification ("Failed to approve — open the
+  app to retry") so a network blip doesn't silently lose the action.
 - iOS only invokes the response listener if the app is at least
   suspended. If the user has killed the app from the app switcher,
   iOS doesn't run JS — the user must open the app and approve from
