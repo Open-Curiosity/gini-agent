@@ -148,6 +148,26 @@ describe("browser safetyCheck", () => {
     expect(blocked2).toContain("loopback");
   });
 
+  test("allowLoopback opts out of the loopback block for CDP-attach callers", () => {
+    // The cdp-attach path validates a user-supplied CDP endpoint, which is
+    // always loopback by design (127.0.0.1:9222 / localhost). allowLoopback
+    // lets that legitimate attach through while agent navigation (no opt-out)
+    // still refuses loopback, and the OTHER blocks (metadata, link-local) still
+    // fire even under the opt-out.
+    expect(safetyCheck("http://127.0.0.1:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://localhost:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Metadata IP is NOT loopback — still blocked even with the opt-out.
+    expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
+  });
+
+  test("IPv4-mapped IPv6 loopback respects allowLoopback (CDP attach)", () => {
+    // The mapped IPv6 loopback forms go through the same allowLoopback opt-out
+    // as the bare IPv4 form once decoded.
+    expect(safetyCheck("http://[::ffff:127.0.0.1]:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::ffff:7f00:1]:9222/", { allowLoopback: true })).toBeUndefined();
+  });
+
   test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
     // The BFF's catch-all /api/runtime/* proxy injects the runtime
     // bearer for safe-method loopback requests, so an agent that
@@ -433,10 +453,10 @@ describe("browser session manager state lookup", () => {
   });
 });
 
-// Spawn-only transport (issue #420): the single SharedHandle variant is
-// `spawned`. Disconnect closes the spawned persistent BrowserContext, which
-// terminates the Chrome Playwright launched; the profile dir stays put so
-// sign-ins persist for the next-call relaunch.
+// Spawned transport (the default): disconnect closes the spawned persistent
+// BrowserContext, which terminates the Chrome Playwright launched; the profile
+// dir stays put so sign-ins persist for the next-call relaunch. (The cdp
+// transport's disconnect is covered in the cdp-provider tests.)
 describe("browser disconnect lifecycle", () => {
   afterEach(() => {
     // Clean up any synthetic state the previous test installed so
@@ -3178,6 +3198,126 @@ describe("spawned provider no-instance refusal", () => {
     await expect(browserTest.connectProviderForTest("spawned")).rejects.toThrow(
       /No instance registered/
     );
+  });
+});
+
+// CDP provider body: a persisted cdp record makes ensureShared attach to the
+// user's external Chrome over connectOverCDP instead of spawning. We stub
+// playwright-core so no real Chrome is needed; the attach URL + the friendly
+// hang hint on failure are what's pinned.
+describe("cdp provider body", () => {
+  const CDP_TEST_ROOT = "/tmp/gini-browser-cdp-tests";
+
+  afterEach(async () => {
+    await disconnectSharedBrowser().catch(() => undefined);
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.resetChromiumImportForTest();
+    browserTest.resetBrowserInstanceForTest();
+    mock.restore();
+  });
+
+  test("a cdp record attaches via connectOverCDP and reuses the first context", async () => {
+    process.env["GINI_STATE_ROOT"] = CDP_TEST_ROOT;
+    const instance = `cdp-${process.pid}`;
+    rmSync(`${CDP_TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    await mutateState(instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:9322/devtools/browser/abc",
+        startedAt: new Date().toISOString()
+      };
+    });
+
+    let connectUrl: string | undefined;
+    const reusedContext = {
+      pages: () => [],
+      newPage: async () => ({
+        on: () => undefined,
+        close: () => Promise.resolve(),
+        goto: () => Promise.resolve(null),
+        url: () => "about:blank",
+        title: () => Promise.resolve(""),
+        evaluate: () => Promise.resolve([])
+      }),
+      close: async () => undefined,
+      browser: () => ({ isConnected: () => true })
+    };
+    mock.module("playwright-core", () => ({
+      chromium: {
+        connectOverCDP: async (url: string) => {
+          connectUrl = url;
+          return {
+            isConnected: () => true,
+            contexts: () => [reusedContext],
+            disconnect: async () => undefined
+          };
+        }
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("cdp-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw on the fake context; the attach is pinned.
+    }
+    expect(connectUrl).toBe("ws://127.0.0.1:9322/devtools/browser/abc");
+  });
+
+  test("a cdp attach failure surfaces the friendly hang hint", async () => {
+    process.env["GINI_STATE_ROOT"] = CDP_TEST_ROOT;
+    const instance = `cdp-fail-${process.pid}`;
+    rmSync(`${CDP_TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    await mutateState(instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:9323/devtools/browser/def",
+        startedAt: new Date().toISOString()
+      };
+    });
+    mock.module("playwright-core", () => ({
+      chromium: {
+        connectOverCDP: async () => {
+          throw new Error("websocket connection closed");
+        }
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    const result = await browserNavigate("cdp-fail-task", { url: "https://example.com/" });
+    const parsed = JSON.parse(result) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/attach over CDP/i);
+  });
+
+  test("connectProviderForTest('cdp') with no cdpUrl throws the reconnect hint", async () => {
+    mock.module("playwright-core", () => ({
+      chromium: { connectOverCDP: async () => ({ isConnected: () => true, contexts: () => [], disconnect: async () => undefined }) }
+    }));
+    browserTest.resetChromiumImportForTest();
+    await expect(browserTest.connectProviderForTest("cdp", undefined)).rejects.toThrow(/missing cdpUrl/);
+  });
+
+  test("isHandleAlive probes the remote Browser.isConnected() for a cdp handle", () => {
+    // A live cdp attach reports alive; an externally-disconnected one reports
+    // dead so ensureShared re-attaches instead of reusing a dead handle.
+    browserTest.installFakeCdpHandleForTest({ isConnected: () => true }, { pages: () => [], close: async () => undefined });
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(true);
+    browserTest.installFakeCdpHandleForTest({ isConnected: () => false }, { pages: () => [], close: async () => undefined });
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(false);
+  });
+
+  test("getScreencastPort returns null for a cdp handle (no port we own)", () => {
+    // The sign-in screencast only applies to the SPAWNED Chrome's debug port;
+    // a cdp-attached handle is the user's own Chrome, so there's no port to
+    // screencast — getScreencastPort must report null.
+    browserTest.installFakeCdpHandleForTest({ isConnected: () => true }, { pages: () => [], close: async () => undefined });
+    expect(getScreencastPort()).toBeNull();
   });
 });
 
@@ -6281,8 +6421,9 @@ describe("dispatchToolCall(browser_connect)", () => {
   // End-to-end coverage of the dispatch → approval → completion path. The
   // dispatch must surface a pending approval; completing it (the same path the
   // /complete HTTP route's non-screencast fallback takes) returns success with
-  // mode "spawned" and writes exactly one rich browser.connect audit row. There
-  // is no managed/cdp record (issue #420): completion never persists a record.
+  // mode "spawned" and writes exactly one rich browser.connect audit row. The
+  // screencast sign-in completes against the spawned Chrome and persists no
+  // state.browser record (only an explicit cdp attach writes one).
   test("completing the dispatched approval returns mode spawned and writes one audit row", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });

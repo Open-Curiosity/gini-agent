@@ -1205,11 +1205,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:
     //   1. Validate the setup-request is browser.connect and pending.
-    //   2. Confirm the agent's spawned headless Chrome is live (it always is
+    //   2. Confirm the agent's spawned headless Chrome is live (it usually is
     //      by this point — the agent asks to sign in only after hitting a wall
-    //      while browsing). Open an in-chat screencast of that same headless
-    //      Chrome over its CDP debug port. There is NO visible-window fallback:
-    //      the spawned Chrome is the only transport (issue #420).
+    //      while browsing; if not, the relaunch path below revives it). Open an
+    //      in-chat screencast of that headless Chrome over its CDP debug port.
+    //      There is NO visible-window fallback (the managed-window mode was
+    //      removed — issue #420). This screencast path is for the SPAWNED
+    //      browser; a user on the cdp transport signs in on their own Chrome.
     //   3. Mark payload.signInStarted = true while keeping the row pending. The
     //      UI re-renders with "I've signed in" / "Cancel" buttons; "I've signed
     //      in" POSTs to /complete which tears the screencast bridge down and
@@ -2109,7 +2111,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
     ["GET", /^\/api\/browser$/, () => json(getBrowserConnection(config))],
-    ["POST", /^\/api\/browser\/connect$/, async () => json(await connectBrowser(config), 201)],
+    ["POST", /^\/api\/browser\/connect$/, async (request) => {
+      const payload = await body(request);
+      return json(await connectBrowser(config, payload), 201);
+    }],
     ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
@@ -3463,6 +3468,13 @@ function statusFromErrorMessage(message: string): number {
   // agent is active. Map to 400 so callers see a clean user-input error
   // rather than a 500.
   if (message.includes("no active agent")) return 400;
+  // Browser-connect user-input failures: a bad cdpUrl (malformed, unsupported
+  // protocol, blocked SSRF target) and an unreachable CDP endpoint are all
+  // user-correctable, so forward them to 400 with the original text rather than
+  // a generic "internal error".
+  if (message.startsWith("Invalid cdpUrl")) return 400;
+  if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
+  if (message.startsWith("Could not reach CDP endpoint")) return 400;
   // Browser discovery failures (no Chrome and no bundled Chromium to fall
   // back to) are user-correctable, so forward them to 400 with the original
   // text rather than a generic "internal error".

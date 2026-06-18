@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { openResilientEventSource } from "@/lib/resilient-event-source";
 import type {
   Authorization,
+  BrowserConnectionRecord,
   ChatBlock,
   ConnectorRecord,
   EmailWatcherRecord,
@@ -920,6 +921,59 @@ export function useRenameChatSession() {
       api<ChatSession>(`/chat/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
+    }
+  });
+}
+
+// Browser-connect status. Shape mirrors the gateway response from
+// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }. The
+// record is present only when the user attached the runtime to their own
+// external Chrome over CDP; the default spawned browser carries no record.
+export interface BrowserConnectionStatus {
+  connected: boolean;
+  record?: BrowserConnectionRecord;
+}
+
+// Polls GET /api/browser so the Settings browser panel reflects an external
+// `gini browser connect/disconnect` without a manual refresh. 5s when idle,
+// 1s while a connect/disconnect mutation is in flight.
+export function useBrowserConnection(options?: { isActive?: boolean }) {
+  const isActive = options?.isActive ?? false;
+  return useQuery<BrowserConnectionStatus>({
+    queryKey: ["browser"],
+    queryFn: () => api<BrowserConnectionStatus>("/browser"),
+    refetchInterval: isActive ? 1000 : 5000
+  });
+}
+
+// Attach the runtime to the user's own external Chrome over a CDP URL. With no
+// cdpUrl the gateway returns a stable disconnected status (the default spawned
+// browser needs no explicit connect).
+export function useConnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string }>({
+    mutationFn: (input) =>
+      api<BrowserConnectionStatus>("/browser/connect", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
+    }
+  });
+}
+
+export function useDisconnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, void>({
+    mutationFn: () =>
+      api<BrowserConnectionStatus>("/browser/disconnect", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
     }
   });
 }

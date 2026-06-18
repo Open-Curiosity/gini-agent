@@ -1,8 +1,9 @@
 // Unit tests for the `gini browser` subcommands — dispatch + the path/method
-// each subcommand sends. The spawn-only transport (issue #420) takes no
-// connection arguments, so connect posts an empty body and there is no --url
-// plumbing. The command talks to the local gateway over HTTP, so we stub
-// globalThis.fetch (same pattern as the connector/provider CLI tests).
+// each subcommand sends. The default transport is the spawned per-instance
+// Chrome, so a bare `connect` posts an empty body; `connect --url <ws>` attaches
+// to the user's own external Chrome over CDP (issue #420 kept cdp, removed the
+// managed/visible-window mode). The command talks to the local gateway over
+// HTTP, so we stub globalThis.fetch (same pattern as the connector CLI tests).
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -57,13 +58,22 @@ describe("browser CLI", () => {
     expect(calls[0].url).toContain("/api/browser");
   });
 
-  test("connect POSTs an empty body (no connection arguments)", async () => {
+  test("bare connect POSTs an empty body (default spawned transport)", async () => {
     const calls = stubFetch();
     await browser(makeCtx(["browser", "connect"]));
     expect(calls).toHaveLength(1);
     expect(calls[0].method).toBe("POST");
     expect(calls[0].url).toContain("/api/browser/connect");
     expect(JSON.parse(calls[0].body!)).toEqual({});
+  });
+
+  test("connect --url POSTs the cdpUrl for an external-Chrome attach", async () => {
+    const calls = stubFetch();
+    await browser(makeCtx(["browser", "connect", "--url", "ws://127.0.0.1:9222/devtools/browser/abc"]));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("POST");
+    expect(calls[0].url).toContain("/api/browser/connect");
+    expect(JSON.parse(calls[0].body!)).toEqual({ cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc" });
   });
 
   test("disconnect POSTs to the disconnect route", async () => {
@@ -77,7 +87,7 @@ describe("browser CLI", () => {
   test("an unknown subcommand rejects with usage", async () => {
     stubFetch();
     await expect(browser(makeCtx(["browser", "bogus"]))).rejects.toThrow(
-      /Usage: gini browser status \| connect \| disconnect/
+      /Usage: gini browser status \| connect \[--url WSURL\] \| disconnect/
     );
   });
 });

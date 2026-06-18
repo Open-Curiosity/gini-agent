@@ -49,6 +49,22 @@ export type ImportSource = "hermes" | "openclaw";
 
 export type AgentStatus = "active" | "inactive";
 
+// Headed-browser connection mode. `cdp` is the only persisted mode: the user
+// pointed the runtime at an existing external Chrome's CDP endpoint (e.g. their
+// own already-running Chrome) and we never spawn or signal that process. (The
+// old `managed` visible-window mode was removed — see issue #420; the default
+// no-record path is the runtime's own spawned Chrome.)
+export type BrowserConnectionMode = "cdp";
+
+export interface BrowserConnectionRecord {
+  mode: BrowserConnectionMode;
+  // ws:// CDP debugger URL the user supplied. Stored normalized (no
+  // credentials in the path).
+  cdpUrl: string;
+  // ISO timestamp of when the connection record was created/updated.
+  startedAt: string;
+}
+
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 // Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
@@ -694,13 +710,12 @@ export interface RuntimeState {
   messagingMessages: MessagingMessageRecord[];
   runs: RunRecord[];
   planSteps: PlanStepRecord[];
-  // Legacy headed-browser connection slot. The runtime now drives a single
-  // spawned per-instance Chrome (src/tools/browser.ts) that carries no state
-  // record — there is no managed/cdp record-bearing mode anymore (see issue
-  // #420). normalizeState always coerces this to null on load, so the only
-  // value a fresh state ever holds here is null; the field is kept (null-only)
-  // so a hand-edited or legacy state file with a stale record still parses.
-  browser?: null;
+  // Headed-browser connection slot. null (the default) means the runtime drives
+  // its own spawned per-instance Chrome (src/tools/browser.ts). A non-null
+  // record means the user attached the runtime to their OWN external Chrome
+  // over CDP via /api/browser/connect — the only persisted connection mode.
+  // (The old managed/visible-window mode was removed — see issue #420.)
+  browser?: BrowserConnectionRecord | null;
   // Optional tunnel selection singleton (see ADR tunnel-connectivity.md).
   // Populated by the tunnel integration when the user selects/connects a
   // provider; null until then. Mirrors the `browser` opt-in field above.

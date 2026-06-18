@@ -3717,26 +3717,73 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  // Spawn-only transport (issue #420): /api/browser/connect takes no
-  // connection parameters. A legacy body (cdpUrl, mode, headless) is ignored
-  // and the route returns the stable disconnected status — the spawned Chrome
-  // is launched lazily on the first browser tool call, not at connect time.
-  test("browser connect ignores a legacy cdpUrl body and returns disconnected", async () => {
-    const config = testConfig("browser-connect-ignores-body");
+  // Default transport (issue #420): /api/browser/connect with NO cdpUrl is a
+  // no-op acknowledgement — the spawned Chrome launches lazily on the first
+  // browser tool call, not at connect time, and carries no record.
+  test("browser connect with no cdpUrl returns the stable disconnected status", async () => {
+    const config = testConfig("browser-connect-empty-body");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
       config,
       "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "file:///etc/passwd" })
-      },
+      { method: "POST", body: JSON.stringify({}) },
       config.token
     );
     expect(response.status).toBe(201);
     const body = await response.json();
     expect(body.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
+  });
+
+  // A cdpUrl with an unsupported protocol is user-input error → 400, and no
+  // record is written. (Validation happens before any probe/attach.)
+  test("browser connect rejects an unsupported cdpUrl protocol with 400", async () => {
+    const config = testConfig("browser-connect-bad-protocol");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      { method: "POST", body: JSON.stringify({ cdpUrl: "file:///etc/passwd" }) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(String(body.error ?? body.message)).toContain("Unsupported cdpUrl protocol");
+    expect(readState(config.instance).browser ?? null).toBeNull();
+  });
+
+  // An unreachable (but well-formed) loopback CDP endpoint surfaces as 400 with
+  // a clear "Could not reach CDP endpoint" message, and writes no record. The
+  // server-side env knobs shrink the probe deadline so the test doesn't burn
+  // the full 15s budget (they are NOT plumbed from the POST body).
+  test("browser connect surfaces an unreachable cdp endpoint as 400", async () => {
+    const config = testConfig("browser-connect-unreachable-cdp");
+    const handler = createHandler(config);
+    const prevTimeout = process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+    const prevInterval = process.env.GINI_CDP_PROBE_INTERVAL_MS;
+    process.env.GINI_CDP_PROBE_TIMEOUT_MS = "40";
+    process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+    try {
+      const response = await rawCall(
+        handler,
+        config,
+        "/api/browser/connect",
+        // Port 1 is reserved and never listening, so the probe always fails.
+        { method: "POST", body: JSON.stringify({ cdpUrl: "ws://127.0.0.1:1/devtools/browser/abc" }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(String(body.error ?? body.message)).toContain("Could not reach CDP endpoint");
+      expect(readState(config.instance).browser ?? null).toBeNull();
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+      else process.env.GINI_CDP_PROBE_TIMEOUT_MS = prevTimeout;
+      if (prevInterval === undefined) delete process.env.GINI_CDP_PROBE_INTERVAL_MS;
+      else process.env.GINI_CDP_PROBE_INTERVAL_MS = prevInterval;
+    }
   });
 
   test("PATCH /api/settings/auto-approve rejects out-of-union approvalMode with 400", async () => {

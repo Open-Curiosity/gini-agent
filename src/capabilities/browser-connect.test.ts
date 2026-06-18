@@ -34,10 +34,10 @@ afterAll(() => {
   rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-// The runtime drives a single spawned per-instance Chrome (issue #420): there
-// is no managed-window or cdp-attach transport and no state.browser record.
-// connect/disconnect are thin status acknowledgements; sign-in happens via the
-// in-chat screencast (exercised through the HTTP route in src/http.test.ts).
+// Two transports (issue #420): the DEFAULT spawned per-instance Chrome (no
+// record; sign-in via the in-chat screencast, exercised through the HTTP route
+// in src/http.test.ts) and `cdp` attach to the user's own external Chrome (a
+// persisted state.browser record). The managed/visible-window mode was removed.
 describe("browser-connect helpers", () => {
   test("profileDirFor lives under the instance root", () => {
     const config = testConfig("profile-dir");
@@ -61,11 +61,11 @@ describe("browser-connect API surface", () => {
     expect(status.connected).toBe(false);
   });
 
-  test("connect is a no-op acknowledgement that writes no record", async () => {
+  test("connect with no cdpUrl is a no-op acknowledgement that writes no record", async () => {
     const config = testConfig("connect-noop");
-    const status = await connectBrowser(config);
+    const status = await connectBrowser(config, {});
     expect(status.connected).toBe(false);
-    // No state record is ever written — the spawned Chrome carries no record.
+    // No state record for the default spawned transport.
     expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
@@ -104,6 +104,202 @@ describe("browser-connect API surface", () => {
       // sibling tests that import the browser module and read it.
       browserMod.__test.resetBrowserInstanceForTest();
     }
+  });
+});
+
+// CDP attach: the user points the runtime at their OWN external Chrome over a
+// CDP websocket URL. Validation + redaction are pure; the connect path probes
+// /json/version (we stub fetch / shrink the deadline so tests stay fast).
+describe("cdp attach", () => {
+  test("validateCdpUrl accepts ws/wss/http/https and rejects junk + bad protocols", () => {
+    expect(__test.validateCdpUrl("ws://127.0.0.1:9222/devtools/browser/abc")).toEqual({
+      ok: true,
+      url: "ws://127.0.0.1:9222/devtools/browser/abc"
+    });
+    const bad = __test.validateCdpUrl("not a url");
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.error).toContain("Invalid cdpUrl");
+    const proto = __test.validateCdpUrl("file:///etc/passwd");
+    expect(proto.ok).toBe(false);
+    if (!proto.ok) expect(proto.error).toContain("Unsupported cdpUrl protocol");
+  });
+
+  test("cdpHttpForm maps ws->http and wss->https for the probe; falls back on garbage", () => {
+    expect(__test.cdpHttpForm("ws://127.0.0.1:9222/devtools/browser/abc")).toBe("http://127.0.0.1:9222");
+    expect(__test.cdpHttpForm("wss://example.test:9333/x")).toBe("https://example.test:9333");
+    // Unparseable input falls back to the raw string (caller already validated).
+    expect(__test.cdpHttpForm("::: not a url :::")).toBe("::: not a url :::");
+  });
+
+  test("stripUrlCredentials / redactUrlCredentials drop embedded basic-auth and survive garbage", () => {
+    expect(__test.stripUrlCredentials("ws://alice:secret@127.0.0.1:9222/x")).toBe("ws://127.0.0.1:9222/x");
+    expect(__test.redactUrlCredentials("ws://alice:secret@127.0.0.1:9222/x")).toBe("ws://127.0.0.1:9222/x");
+    expect(__test.redactUrlCredentials("not a url")).toBe("<redacted>");
+    // No credentials → unchanged; unparseable → strip returns the raw input.
+    expect(__test.stripUrlCredentials("ws://127.0.0.1:9222/x")).toBe("ws://127.0.0.1:9222/x");
+    expect(__test.stripUrlCredentials("::: bad :::")).toBe("::: bad :::");
+  });
+
+  test("connect short-circuits to the live existing record when the same endpoint is still reachable", async () => {
+    const config = testConfig("cdp-reconnect-live");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/existing", startedAt: now() };
+    });
+    const originalFetch = globalThis.fetch;
+    let probes = 0;
+    globalThis.fetch = (async () => {
+      probes++;
+      return new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/existing" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as unknown as typeof fetch;
+    try {
+      // Same host as the persisted record → re-probe once and return the
+      // existing record without re-writing it.
+      const status = await connectBrowser(config, { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/different-path" });
+      expect(status.connected).toBe(true);
+      expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/existing");
+      // No second browser.connect audit row — the existing record was reused.
+      const rows = readState(config.instance).audit.filter((r) => r.action === "browser.connect");
+      expect(rows.length).toBe(0);
+      expect(probes).toBeGreaterThanOrEqual(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connect re-attaches when the existing record's endpoint is no longer reachable", async () => {
+    const config = testConfig("cdp-reconnect-stale");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/old", startedAt: now() };
+    });
+    const originalFetch = globalThis.fetch;
+    // The liveness re-probe of the existing record runs first with a SHORT
+    // deadline (probeIntervalMs * 2); we fail every fetch until that window has
+    // elapsed, then succeed so the subsequent fresh-attach probe lands the new
+    // endpoint. Gating on elapsed time (not call count) is robust to however
+    // many polls each window makes.
+    const livenessFailsUntil = Date.now() + 60;
+    globalThis.fetch = (async () => {
+      if (Date.now() < livenessFailsUntil) throw new Error("ECONNREFUSED");
+      return new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/fresh" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const status = await connectBrowser(
+        config,
+        { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/anything" },
+        { probeIntervalMs: 20, probeTimeoutMs: 2000 }
+      );
+      expect(status.connected).toBe(true);
+      expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/fresh");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connect attaches to a reachable CDP endpoint, persisting a stripped cdp record + audit", async () => {
+    const config = testConfig("cdp-attach-ok");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/real", Browser: "Chrome/142" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    try {
+      const status = await connectBrowser(config, { cdpUrl: "ws://alice:pw@127.0.0.1:9222/devtools/browser/abc" });
+      expect(status.connected).toBe(true);
+      expect(status.record?.mode).toBe("cdp");
+      // The persisted record strips embedded credentials.
+      expect(status.record?.cdpUrl.includes("alice")).toBe(false);
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("cdp");
+      const rows = readState(config.instance).audit.filter((r) => r.action === "browser.connect");
+      expect(rows.length).toBe(1);
+      expect(rows[0]!.evidence).toMatchObject({ mode: "cdp" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connect surfaces an unreachable CDP endpoint as a clear error (no record written)", async () => {
+    const config = testConfig("cdp-attach-unreachable");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    try {
+      await expect(
+        // Shrink the probe deadline via the in-process internal arg so the
+        // unreachable path returns fast instead of burning the 15s budget.
+        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:9999/devtools/browser/x" }, { probeTimeoutMs: 30, probeIntervalMs: 10 })
+      ).rejects.toThrow(/Could not reach CDP endpoint/);
+      expect(readState(config.instance).browser ?? null).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connect treats a malformed existing record as a non-match and re-attaches", async () => {
+    const config = testConfig("cdp-existing-malformed");
+    const { mutateState } = await import("../state");
+    // A hand-edited/corrupt record whose cdpUrl can't be URL-parsed: the
+    // host-match comparison throws and is treated as 'not the same endpoint',
+    // so we fall through to a fresh attach rather than reusing garbage.
+    await mutateState(config.instance, (state) => {
+      (state as unknown as Record<string, unknown>).browser = { mode: "cdp", cdpUrl: "::: not a url :::", startedAt: "2026-01-01T00:00:00.000Z" };
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/fresh" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    try {
+      const status = await connectBrowser(config, { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc" });
+      expect(status.connected).toBe(true);
+      expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/fresh");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connect rejects a loopback-but-malformed protocol before probing", async () => {
+    const config = testConfig("cdp-attach-bad-proto");
+    await expect(connectBrowser(config, { cdpUrl: "file:///etc/passwd" })).rejects.toThrow(
+      /Unsupported cdpUrl protocol/
+    );
+    expect(readState(config.instance).browser ?? null).toBeNull();
+  });
+
+  test("status reports connected with the record once a cdp attach is persisted", async () => {
+    const config = testConfig("cdp-status");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+    });
+    const status = getBrowserConnection(config);
+    expect(status.connected).toBe(true);
+    expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/abc");
+  });
+
+  test("disconnect clears a cdp record, writes a disconnect audit row, and detaches", async () => {
+    const config = testConfig("cdp-disconnect");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+    });
+    const status = await disconnectBrowser(config);
+    expect(status.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
+    const rows = readState(config.instance).audit.filter((r) => r.action === "browser.disconnect");
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.evidence).toMatchObject({ mode: "cdp" });
   });
 });
 

@@ -1,18 +1,21 @@
 // CLI surface for the browser-connect capability:
 //   gini browser status
-//   gini browser connect
+//   gini browser connect [--url ws://127.0.0.1:9222/devtools/browser/abc]
 //   gini browser disconnect
 //
-// Thin client over /api/browser*. All subcommands print the JSON response
-// so users can pipe it into jq / scripts; the underlying capability
-// already shapes the response with a `connected` boolean for quick checks.
+// Thin client over /api/browser*. All subcommands print the JSON response so
+// users can pipe it into jq / scripts; the underlying capability shapes the
+// response with a `connected` boolean for quick checks.
 //
-// Transport (issue #420): the runtime drives a single spawned per-instance
-// Chrome. There is no managed-window or cdp-attach mode, so connect takes no
-// arguments — the agent's headless Chrome is launched lazily on the first
-// browser tool call. Sign-in happens through the in-chat screencast modal, not
-// the CLI. To clear saved logins, rm -rf the per-instance profile dir manually.
+// Transport (issue #420): with no `--url`, the runtime drives its own spawned
+// per-instance Chrome — `connect` is a no-op acknowledgement and sign-in
+// happens through the in-chat screencast modal, not the CLI. Passing `--url`
+// attaches the runtime to your OWN already-running external Chrome over that
+// CDP websocket URL (a power-user option; CDP attach is flaky under the current
+// Playwright + Bun stack). To clear saved logins from the spawned profile,
+// rm -rf the per-instance profile dir manually.
 import type { CliContext } from "../context";
+import { flagValue, restAfter } from "../args";
 import { api } from "../api";
 import { print } from "../output";
 
@@ -26,10 +29,14 @@ export async function browser(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "connect") {
+    const rest = restAfter(cliArgs, "connect");
+    const url = flagValue(rest, "--url");
+    const requestBody: Record<string, unknown> = {};
+    if (url) requestBody.cdpUrl = url;
     print(
       await api(config, "/api/browser/connect", {
         method: "POST",
-        body: JSON.stringify({})
+        body: JSON.stringify(requestBody)
       })
     );
     return;
@@ -44,5 +51,5 @@ export async function browser(ctx: CliContext): Promise<void> {
     return;
   }
 
-  throw new Error("Usage: gini browser status | connect | disconnect");
+  throw new Error("Usage: gini browser status | connect [--url WSURL] | disconnect");
 }

@@ -1,18 +1,21 @@
-// Browser automation tools. Drives a single spawned per-instance Chrome via
-// playwright-core:
+// Browser automation tools. Drives a single per-instance Chrome via
+// playwright-core, via one of two transports:
 //
-//   - "spawned" (the only transport): a per-instance branded Chrome the runtime
+//   - "spawned" (the DEFAULT): a per-instance branded Chrome the runtime
 //     launches itself (launchSpawnedChrome) over the pipe transport, with a
 //     free-picked --remote-debugging-port for the sign-in screencast. Backed by
 //     the per-instance profile dir at ~/.gini/instances/<inst>/chrome-profile/.
-//     There is no state.browser record — the spawned Chrome is the agent's
-//     browser at all times (see issue #420; the previous managed-window and
-//     cdp-attach transports were removed).
+//     Carries NO state.browser record — it's the agent's browser whenever the
+//     user hasn't attached their own.
+//   - "cdp": attach to the user's OWN already-running external Chrome over a CDP
+//     websocket URL they supply via /api/browser/connect (chromium.connectOverCDP).
+//     Persisted as the state.browser record; we never spawn or kill that
+//     process. (The previous managed-window transport was removed — issue #420.)
 //
-// The per-instance profile dir persists every sign-in: cookies survive runtime
-// restarts and Chrome process restarts. All tasks share the single context
-// (cookies bleed across tasks within an instance, per the explicit product
-// decision).
+// The per-instance profile dir persists every spawned-Chrome sign-in: cookies
+// survive runtime restarts and Chrome process restarts. All tasks share the
+// single active context (cookies bleed across tasks within an instance, per the
+// explicit product decision).
 //
 // Sign-in happens in-place: the browser_connect SetupRequest opens an in-chat
 // screencast of the already-running headless Chrome (over its CDP debug port)
@@ -36,7 +39,7 @@ import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { resolveImageByteLimit, resolveProviderModality } from "../provider-capabilities";
 import { addAudit, assertInsideWorkspace, mutateState, readState, recordUsage } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
-import type { BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
+import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives runtime restarts and spawned
@@ -186,7 +189,9 @@ interface Session {
 // PER INSTANCE: there is one shared browser per instance, stored in the single
 // `shared` slot below, and tasks share its context (cookies bleed across tasks
 // within an instance, per the explicit product decision).
-type SharedHandle = { kind: "spawned"; context: BrowserContext; port: number; profileDir: string };
+type SharedHandle =
+  | { kind: "spawned"; context: BrowserContext; port: number; profileDir: string }
+  | { kind: "cdp"; browser: Browser; context: BrowserContext };
 
 // The single instance-level handle the spawned launch installs into.
 let shared: SharedHandle | null = null;
@@ -229,6 +234,36 @@ const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
 // flow for minutes. Overridable via __test.setTeardownCloseTimeoutForTest
 // so close-path tests don't have to wait the full budget.
 let teardownCloseTimeoutMs = 5_000;
+// Memoized playwright-core chromium import, used by the cdp provider to
+// connectOverCDP to a user's external Chrome. The spawned provider goes
+// through chrome-launch.ts directly; only the cdp attach needs the bare
+// chromium namespace here.
+let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefined;
+function loadChromium(): Promise<typeof import("playwright-core").chromium> {
+  if (!chromiumImport) {
+    // Surface a friendlier error than the bare Node module-resolution string
+    // when playwright-core isn't installed. Matches the defensive wrapper in
+    // src/capabilities/browser-connect.ts so both code paths emit the same hint.
+    chromiumImport = import("playwright-core").then(
+      (mod) => mod.chromium,
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const isMissing =
+          (error as { code?: string } | undefined)?.code === "MODULE_NOT_FOUND" ||
+          (error as { code?: string } | undefined)?.code === "ERR_MODULE_NOT_FOUND" ||
+          message.includes("Cannot find package 'playwright-core'") ||
+          message.includes("Cannot find module 'playwright-core'");
+        if (isMissing) {
+          throw new Error(
+            "Browser runtime is missing. Run `bun install` in the gini-agent checkout, then restart the runtime."
+          );
+        }
+        throw error;
+      }
+    );
+  }
+  return chromiumImport;
+}
 const sessions = new Map<string, Session>();
 // Per-task registry of literal secret values that browserFillByLocator
 // has typed into the page. Populated BEFORE the .fill() call so a
@@ -314,10 +349,31 @@ export function setBrowserInstance(instance: Instance): void {
   runtimeInstance = instance;
 }
 
-// The single transport kind. Kept as a one-member type so the provider seam
-// (BrowserSessionProvider / sessionProviders registry / __test override) reads
-// the same as before; a future remote provider re-introduces additional kinds.
-type Mode = "spawned";
+// The transport kind. `spawned` is the DEFAULT (a per-instance branded Chrome
+// the runtime launches itself); `cdp` attaches to a user's OWN external Chrome
+// over a CDP websocket URL they supply. (The old `persistent` / visible
+// managed-window transport was removed — issue #420.)
+type Mode = "spawned" | "cdp";
+
+// Mode decided from state.browser. No record → the default spawned launch; a
+// persisted cdp record → attach to the user's external Chrome. We resolve the
+// record before the launch await so two concurrent cold-start callers see the
+// same decision.
+function activeBrowserRecord(): BrowserConnectionRecord | undefined {
+  if (!runtimeInstance) return undefined;
+  try {
+    const state = readState(runtimeInstance);
+    return state.browser ?? undefined;
+  } catch {
+    // readState can throw on a state-file corruption — better to fall back to
+    // the spawned launch than to wedge every browser tool call.
+    return undefined;
+  }
+}
+
+function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
+  return record ? "cdp" : "spawned";
+}
 
 // ---------------- Session providers ----------------
 //
@@ -332,20 +388,23 @@ type Mode = "spawned";
 // browser-automation-engine.md, "Remote session provider seam") and it
 // must hold for any future provider.
 //
-// Today there is one provider: `spawned` (a per-instance branded Chrome the
-// runtime launches itself over the pipe transport). The one capability the
-// local engine cannot fake is IP reputation (datacenter-IP blocks, geo walls);
-// a future remote/cloud-browser provider would slot in as a second entry that
-// resolves its remote endpoint (provision a cloud session, then attach over
-// CDP/WebSocket) and adds its own SharedHandle variant when its teardown needs
-// extra release work (e.g. an API call ending the cloud session). The
-// disconnect-generation choreography stays in ensureShared / teardown call
-// sites; it is transport-agnostic.
+// Today's providers are two: `spawned` (the DEFAULT — a per-instance branded
+// Chrome the runtime launches itself over the pipe transport) and `cdp` (attach
+// to the user's own external Chrome over a CDP URL they supply). The one
+// capability the local engine cannot fake is IP reputation (datacenter-IP
+// blocks, geo walls); a future remote/cloud-browser provider would slot in as a
+// third entry that resolves its remote endpoint (provision a cloud session,
+// then attach over CDP/WebSocket) and returns a cdp-shaped SharedHandle — or
+// adds its own SharedHandle variant when its teardown needs extra release work
+// (e.g. an API call ending the cloud session). The disconnect-generation
+// choreography stays in ensureShared / teardown call sites; it is
+// transport-agnostic.
 interface BrowserSessionProvider {
   kind: Mode;
-  // Establish the transport and return the live handle. Called by
-  // ensureShared under the single-flight pendingShared promise.
-  connect(): Promise<SharedHandle>;
+  // Establish the transport and return the live handle. Called by ensureShared
+  // under the single-flight pendingShared promise. The cdp provider reads
+  // `record.cdpUrl`; the spawned provider ignores the record.
+  connect(record: BrowserConnectionRecord | undefined): Promise<SharedHandle>;
   // Release the handle this provider built. Must never throw — teardown
   // runs on paths (disconnect, exit hooks) that cannot surface errors.
   disconnect(handle: SharedHandle): Promise<void>;
@@ -370,7 +429,7 @@ let spawnChrome: typeof launchSpawnedChrome = launchSpawnedChrome;
 
 const spawnedSessionProvider: BrowserSessionProvider = {
   kind: "spawned",
-  async connect() {
+  async connect(_record) {
     // Launch our OWN branded Chrome (headless) against the per-instance profile
     // dir on a free debug port, over Playwright's pipe transport. The user's
     // :9222 is never touched; the debug port is free-picked above it (and is
@@ -380,6 +439,7 @@ const spawnedSessionProvider: BrowserSessionProvider = {
     return { kind: "spawned", context, port, profileDir };
   },
   async disconnect(handle) {
+    if (handle.kind !== "spawned") return;
     // Close the persistent context, which terminates the Chrome Playwright
     // launched. Bound it so a wedged Chrome can't hang teardown; on timeout,
     // reap by the instance profile dir (so the scan SIGKILLs only this
@@ -397,12 +457,60 @@ const spawnedSessionProvider: BrowserSessionProvider = {
   }
 };
 
+// Attach to the user's OWN external Chrome over a CDP websocket URL they
+// supplied via /api/browser/connect. We NEVER spawn or kill this process — the
+// user owns it. CDP attach is known-flaky under playwright-core 1.60 + Bun; we
+// keep it for users who explicitly point us at their own Chrome.
+const cdpSessionProvider: BrowserSessionProvider = {
+  kind: "cdp",
+  async connect(record) {
+    const chromium = await loadChromium();
+    if (!record?.cdpUrl) {
+      throw new Error(
+        "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
+      );
+    }
+    // connectOverCDP returns a Browser handle scoped to the remote process.
+    // The remote Chrome's default BrowserContext shows up under
+    // browser.contexts() — we reuse it so signed-in cookies are visible.
+    let browser: Browser;
+    try {
+      browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timeout|websocket|protocol/i.test(message)) {
+        throw new Error(
+          `Failed to attach over CDP: ${message}. ` +
+            "CDP attach can hang under the current Playwright + Bun stack. " +
+            "Disconnect and let the agent use its own spawned browser instead."
+        );
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
+    const ctx = browser.contexts()[0] ?? (await browser.newContext());
+    return { kind: "cdp", browser, context: ctx };
+  },
+  async disconnect(handle) {
+    if (handle.kind !== "cdp") return;
+    const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
+    if (typeof candidate.disconnect === "function") {
+      // Bound the disconnect, but NEVER kill — the remote Chrome is the user's
+      // own process.
+      await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
+    }
+    // If disconnect() isn't available on this CDP-attached Browser, do NOT fall
+    // back to close() — close() over CDP terminates the user's Chrome. Leaking
+    // the in-process handle is strictly better than killing the user's browser.
+  }
+};
+
 // Registry keyed by Mode. A future remote provider adds its entry here (plus
 // its Mode mapping); ensureShared and teardownHandle dispatch through this
 // table and need no changes.
 // Mutable only via __test.setSessionProviderForTest.
 const sessionProviders: Record<Mode, BrowserSessionProvider> = {
-  spawned: spawnedSessionProvider
+  spawned: spawnedSessionProvider,
+  cdp: cdpSessionProvider
 };
 
 // Is the spawned BrowserContext still backed by a live browser? After an
@@ -429,12 +537,13 @@ function isContextConnected(context: BrowserContext): boolean {
 
 // Cheap "is this handle still alive?" probe used to short-circuit
 // ensureShared when the previously-installed handle survives, and to force a
-// relaunch when the underlying Chrome died. The spawned handle is a persistent
-// context (pipe transport) — probe the context's Browser via
-// isContextConnected, which returns false on an external kill and true
-// otherwise.
+// relaunch/reattach when the underlying Chrome died. The cdp handle exposes the
+// remote Browser directly (probe isConnected()); the spawned handle is a
+// persistent context (pipe transport) probed via isContextConnected, which
+// returns false on an external kill and true otherwise.
 function isHandleAlive(handle: SharedHandle): boolean {
   try {
+    if (handle.kind === "cdp") return handle.browser.isConnected();
     return isContextConnected(handle.context);
   } catch {
     return false;
@@ -456,14 +565,21 @@ export function currentDisconnectGeneration(): number {
 // client. Returns null rather than launching: the bridge is a read/drive channel
 // over an ALREADY-running headless Chrome, not a reason to spawn one.
 export function getScreencastPort(): number | null {
-  if (shared && isHandleAlive(shared)) return shared.port;
+  // Only the spawned handle exposes a debug port we own and may screencast; a
+  // cdp-attached handle is the user's own Chrome (no port we control), so the
+  // sign-in screencast doesn't apply.
+  if (shared && shared.kind === "spawned" && isHandleAlive(shared)) return shared.port;
   return null;
 }
 
 async function ensureShared(): Promise<SharedHandle> {
   if (shared && isHandleAlive(shared)) return shared;
   if (pendingShared) return pendingShared;
-  const mode: Mode = "spawned";
+  // Resolve the persisted record (if any) BEFORE the launch await so two
+  // concurrent cold-start callers see the same transport decision: no record →
+  // the default spawned launch; a cdp record → attach to the user's Chrome.
+  const record = activeBrowserRecord();
+  const mode: Mode = modeFromRecord(record);
   // Capture the current disconnect generation at the START of the launch.
   // If a disconnect bumps the counter while launchSpawnedChrome is in flight,
   // we don't want to install the resulting handle on the shared slot —
@@ -475,7 +591,7 @@ async function ensureShared(): Promise<SharedHandle> {
   pendingShared = (async () => {
     // Transport acquisition is fully delegated to the session provider —
     // the generation choreography around it is transport-agnostic.
-    const built: SharedHandle = await sessionProviders[mode].connect();
+    const built: SharedHandle = await sessionProviders[mode].connect(record);
     if (disconnectGeneration !== launchGeneration) {
       // Disconnect bumped the generation while we were launching. Clean
       // up the freshly-built handle and surface a clear error to the
@@ -1156,11 +1272,13 @@ export function hostnameIsLoopback(hostname: string): boolean {
 
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
-// reason starting with "Blocked:" or "Invalid URL:". Loopback is always
-// refused — the spawned transport never navigates the agent to a local
-// address, and the sign-in screencast dials the spawned Chrome's debug port
-// directly without going through this gate.
-export function safetyCheck(rawUrl: string): string | undefined {
+// reason starting with "Blocked:" or "Invalid URL:". `allowLoopback` opts out
+// of the loopback block for callers that LEGITIMATELY need loopback access:
+// the cdp-attach path validates a user-supplied CDP URL that is always loopback
+// (127.0.0.1:9222 or similar), which is exactly the target the SSRF block
+// refuses for agent navigation. Two intents, one validator. Agent navigation
+// never passes allowLoopback, so a loopback URL stays refused there.
+export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean } = {}): string | undefined {
   // Run the secret-pattern scan against the raw input *before* attempting
   // to parse the URL. A malformed-but-secret-bearing input would otherwise
   // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
@@ -1225,6 +1343,7 @@ export function safetyCheck(rawUrl: string): string | undefined {
   const host = decodeIpv4Mapped(rawHost) ?? rawHost;
   const loopbackHosts = new Set(LOOPBACK_HOSTS);
   if (hostnameIsLoopback(host)) {
+    if (options.allowLoopback) return undefined;
     return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
   }
   if (BLOCKED_HOSTNAMES.has(host)) {
@@ -1257,6 +1376,7 @@ export function safetyCheck(rawUrl: string): string | undefined {
     const low = parseInt(compatHex[2]!, 16);
     const ipv4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
     if (loopbackHosts.has(ipv4) || /^127\./.test(ipv4)) {
+      if (options.allowLoopback) return undefined;
       return `Blocked: ${host} maps to ${ipv4}, a loopback address.`;
     }
   }
@@ -4884,7 +5004,8 @@ export const __test = {
   // playwright-core. Pass null to restore the built-in provider.
   setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
     const builtIn: Record<Mode, BrowserSessionProvider> = {
-      spawned: spawnedSessionProvider
+      spawned: spawnedSessionProvider,
+      cdp: cdpSessionProvider
     };
     sessionProviders[kind] = provider ?? builtIn[kind];
   },
@@ -4901,8 +5022,13 @@ export const __test = {
   },
   // Drive the provider's connect() directly so the spawned body (no-instance
   // refusal) can be exercised without routing a whole tool call.
-  connectProviderForTest(kind: Mode): Promise<SharedHandle> {
-    return sessionProviders[kind].connect();
+  connectProviderForTest(kind: Mode, record?: BrowserConnectionRecord): Promise<SharedHandle> {
+    return sessionProviders[kind].connect(record);
+  },
+  // Reset the memoized chromium import so a test that stubs the cdp connect
+  // path doesn't leak the real (or a faked) playwright-core namespace.
+  resetChromiumImportForTest(): void {
+    chromiumImport = undefined;
   },
   // Reset the opt-in recording flag and any active trace claim so
   // recording tests don't leak state into siblings.
@@ -4928,6 +5054,15 @@ export const __test = {
     profileDir = "/tmp/fake-spawn-profile"
   ): void {
     shared = { kind: "spawned", context: context as BrowserContext, port, profileDir };
+  },
+  // Install a fake cdp handle so the cdp liveness probe (isHandleAlive checks
+  // the remote Browser's isConnected()) and getScreencastPort's cdp guard
+  // (returns null — no port we own) can be exercised without a real attach.
+  installFakeCdpHandleForTest(
+    browser: Pick<Browser, "isConnected">,
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
+  ): void {
+    shared = { kind: "cdp", browser: browser as Browser, context: context as BrowserContext };
   },
   // Liveness probe over the currently-installed shared handle. Null when no
   // handle is installed. Lets tests assert that an externally-killed Chrome

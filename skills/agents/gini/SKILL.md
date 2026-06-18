@@ -246,14 +246,16 @@ persist, where a skill ends up).
 
 ## Browser
 
-The runtime drives a single per-instance headless Chrome it spawns itself,
-against a per-instance profile at `~/.gini/instances/<inst>/chrome-profile/`.
+By DEFAULT the runtime drives a single per-instance headless Chrome it spawns
+itself, against a per-instance profile at `~/.gini/instances/<inst>/chrome-profile/`.
 It launches lazily on the first browser tool call. Sign-ins land on disk and
-survive runtime restarts. There is no visible-window or external-CDP-attach
-mode — the headless spawned Chrome is the agent's browser at all times (issue
-#420). When a site needs a sign-in, the user signs in through a live in-chat
-screencast of that same headless Chrome (`browser_connect`), so the user and
-the agent act on one browser the whole time.
+survive runtime restarts. When a site needs a sign-in, the user signs in through
+a live in-chat screencast of that same headless Chrome (`browser_connect`), so
+the user and the agent act on one browser the whole time. As a power-user
+option the user can instead attach the runtime to their OWN already-running
+external Chrome over CDP (POST `/api/browser/connect` with `{cdpUrl}`); the
+runtime drives that Chrome but never starts or stops the process. (The old
+visible managed-window mode was removed — issue #420.)
 
 Tool surface, grouped by role:
 
@@ -285,9 +287,11 @@ When a site needs a sign-in the user hasn't completed:
    visible window. The sign-in survives later tasks and runtime restarts.
 
 Human-operator CLI mirror (the same calls a person might run from a
-terminal — not Gini's path): `gini browser {status|connect|disconnect}`.
-`connect`/`disconnect` take no arguments; sign-in is the in-chat screencast,
-not a CLI flow. To clear saved logins, `rm -rf` the per-instance profile dir.
+terminal — not Gini's path): `gini browser {status | connect [--url WSURL] |
+disconnect}`. A bare `connect` is a no-op for the default spawned browser
+(sign-in is the in-chat screencast, not a CLI flow); `connect --url ws://...`
+attaches to the user's own external Chrome over CDP. To clear saved logins from
+the spawned profile, `rm -rf` the per-instance profile dir.
 
 ## Scheduled Jobs
 
