@@ -109,6 +109,7 @@ import {
   raceWithAbort,
   releaseApproval
 } from "./execution/approval-execution";
+import { abortTurnForTask } from "./execution/turn-abort";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
@@ -289,6 +290,19 @@ export async function cancelTask(
   // omit the arg and keep their original behavior.
   parentTaskId?: string
 ): Promise<Task> {
+  // Tool-call ids of genuinely-pending gated calls when the cancel landed.
+  // Filled inside the mutateState callback (before toolCallState is cleared)
+  // and read by the post-mutation chat-block emit to settle their tool_call
+  // rows to `denied`. Calls whose approval already left `pending` are NOT
+  // collected — their row is owned by executeApprovedAction (skip → denied) or
+  // resumeChatTask (ran → ok), since only those sites know the real outcome.
+  let cancelledPendingToolCallIds: string[] = [];
+  // True only when THIS call performed the cancel (flipped a live task to
+  // cancelled). A duplicate / racing Stop on an already-terminal task is a
+  // no-op: the post-mutate side effects below (Cancelled block emission,
+  // descendant cascade, queue drain) must NOT re-run, or a second Stop would
+  // append a duplicate "Cancelled" system_note + phase.
+  let didCancel = false;
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -297,6 +311,7 @@ export async function cancelTask(
       );
     }
     if (isTerminalTaskStatus(task.status)) return task;
+    didCancel = true;
     task.status = "cancelled";
     task.currentStep = "Cancelled";
     task.updatedAt = now();
@@ -312,6 +327,68 @@ export async function cancelTask(
       },
       { taskId }
     );
+    // Settle the tool_call rows of GENUINELY-PENDING gated calls to `denied`.
+    // These are calls whose approval is still `pending` (never approved/run) —
+    // the real issue-#395 case: a task cancelled while a gate is live leaves
+    // the tool_call row spinning and the card interactive after "Cancelled".
+    //
+    // We deliberately do NOT try to settle calls whose approval has already
+    // left `pending` (approved / completed). `approved` is set BEFORE the side
+    // effect runs (resolveAuthorization), so it is NOT proof of execution — the
+    // side effect may run, or may be skipped because the task went terminal.
+    // Guessing the row's terminal status from approval state here is what
+    // produced a string of wrong labels (ok-on-a-skipped-action,
+    // denied-on-a-ran-action). Instead, the two sites that KNOW the real
+    // outcome own the settle: executeApprovedAction settles the row `denied`
+    // when it skips the side effect on a terminal task, and resumeChatTask
+    // settles it `ok` when the side effect ran (even if the task was cancelled
+    // before the loop re-entered). So cancelTask only touches still-pending
+    // gates. The snapshot's `pending` is persisted only once the loop pauses,
+    // so union the snapshot ids (filtered to entries with no result yet) with
+    // the tool-call ids on the durable pending authorization / setup-request
+    // rows, which exist as soon as dispatch creates the gate.
+    // The snapshot's `pending` is persisted only once the loop pauses, so it's
+    // the fallback source for callids when no durable gate row exists yet
+    // (the mid-dispatch window). Entries that already carry a result are done.
+    const snapshotCallIds = new Set<string>(
+      (task.toolCallState?.pending ?? [])
+        .filter((p) => typeof p.result !== "string")
+        .map((p) => p.toolCallId)
+    );
+    // A callId with a LIVE pending authorization/setup row for this task is a
+    // gate to deny unconditionally. A callId whose row has LEFT `pending`
+    // (approved / completed / denied / cancelled) is owned elsewhere
+    // (executeApprovedAction on a skip, resumeChatTask on a completed run), so
+    // it must NOT be denied via the snapshot path. These two sets are NOT
+    // mutually exclusive: callId is non-unique within a task (the codex
+    // text-backstop synthesizes a deterministic, content-derived id, so the
+    // same gated call re-emitted in a later iteration of the SAME task carries
+    // the same id), and a resolved row from the earlier emission persists
+    // alongside the new pending row. So a callId can be BOTH pending (now) and
+    // resolved (earlier). A live pending row always wins — subtract
+    // `resolvedCallIds` only from the SNAPSHOT-sourced ids, never from the
+    // ids that have a pending durable row, or the live gate is left spinning
+    // after "Cancelled" (issue #395).
+    const pendingCallIds = new Set<string>();
+    const resolvedCallIds = new Set<string>();
+    for (const auth of state.authorizations) {
+      if (auth.taskId !== taskId) continue;
+      const callId = approvalToolCallId(auth.payload);
+      if (!callId) continue;
+      if (auth.status === "pending") pendingCallIds.add(callId);
+      else resolvedCallIds.add(callId);
+    }
+    for (const setup of state.setupRequests) {
+      if (setup.taskId !== taskId) continue;
+      const callId = approvalToolCallId(setup.payload);
+      if (!callId) continue;
+      if (setup.status === "pending") pendingCallIds.add(callId);
+      else resolvedCallIds.add(callId);
+    }
+    const fromSnapshot = [...snapshotCallIds].filter(
+      (id) => !resolvedCallIds.has(id) && !pendingCallIds.has(id)
+    );
+    cancelledPendingToolCallIds = [...new Set([...pendingCallIds, ...fromSnapshot])];
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -336,6 +413,13 @@ export async function cancelTask(
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // A no-op cancel (the task was already terminal — a duplicate or racing
+  // Stop) stops here. The run/subagent syncs above are idempotent, but the
+  // cancellation SIDE EFFECTS below — the "Cancelled" block emission, the
+  // descendant cascade, and the queue drain — must fire exactly once, on the
+  // call that actually performed the cancel. Re-running them would append a
+  // duplicate "Cancelled" system_note + phase and re-drain the queue.
+  if (!didCancel) return task;
   // Chat-block emission for cancellation (ADR chat-block-protocol.md
   // risks §4). Flip any in-flight streaming assistant_text to
   // `streaming: false` while keeping the partial text the user already
@@ -348,6 +432,15 @@ export async function cancelTask(
       const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
       if (inFlight) {
         finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      // Settle the still-pending gated calls' tool_call rows to `denied` so
+      // they stop spinning and the gate card reads resolved rather than staying
+      // interactive after "Cancelled" (issue #395). Calls whose approval has
+      // already left `pending` are intentionally untouched here — their row is
+      // settled by the site that knows the outcome (executeApprovedAction on a
+      // skip, resumeChatTask on a completed run).
+      for (const callId of cancelledPendingToolCallIds) {
+        emitToolCallStatus(emitCtx, { callId, status: "denied" });
       }
       emitSystemNote(emitCtx, "Cancelled");
       emitPhase(emitCtx, "Cancelled");
@@ -373,11 +466,13 @@ export async function cancelTask(
   return task;
 }
 
-// Centralize the abortApprovalsForTask + authorization.in_flight_aborted
-// audit emission so cancelTask, failTask, and decideApproval-deny
-// share the same exact behavior. Runs INSIDE the caller's mutateState
-// callback so the abort fan-out and the audit row write happen under
-// the per-instance lock.
+// Centralize the in-flight abort fan-out + authorization.in_flight_aborted
+// audit emission so cancelTask, failTask, and decideApproval-deny share the
+// same exact behavior on every terminal-status flip: abort the in-flight MODEL
+// turn (turn-abort registry) AND any in-flight approved-action executors
+// (approval registry), then audit the latter. Runs INSIDE the caller's
+// mutateState callback so the abort fan-out and the audit row write happen
+// under the per-instance lock.
 type InFlightAbortReason = "task.cancelled" | "task.failed" | "sibling.denied";
 
 function recordInFlightAborted(
@@ -387,6 +482,17 @@ function recordInFlightAborted(
   reason: InFlightAbortReason,
   extraEvidence?: Record<string, unknown>
 ): void {
+  // Abort the in-flight MODEL call. The provider streaming call carries the
+  // turn AbortSignal (see src/execution/turn-abort.ts); aborting it here —
+  // inside the caller's mutateState that flips the task terminal — stops the
+  // fetch + SSE reader at the source, so a turn cancelled/failed/denied
+  // mid-stream halts immediately instead of running to the connection's
+  // natural end. The chat-task loop catches the AbortError and bails to the
+  // terminal status this mutation set. Idempotent + harmless when no model
+  // call is in flight (e.g. a task paused at waiting_approval). All three
+  // terminal-flip callers (cancel, fail, sibling-deny) share this path, so
+  // each gets source-level abort uniformly.
+  abortTurnForTask(instance, task.id, reason);
   const aborted = abortApprovalsForTask(instance, task.id, reason);
   if (aborted.length === 0) return;
   addAudit(
@@ -1738,6 +1844,28 @@ async function executeApprovedAction(
   // and feed the result back via resumeChatTask.
   const chatToolCallId = approvalToolCallId(approval.payload);
 
+  // Settle the gated tool_call row to `denied` when this approved action did
+  // NOT run to a successful completion — either it was SKIPPED (task went
+  // terminal before the guard) or it was ABORTED mid-run (its own verdict).
+  // Both cases must NOT route through resumeChatTask's terminal bail, which
+  // hard-codes `ok` and would paint a skipped/killed action as success (issue
+  // #395). cancelTask deliberately leaves approved-but-unrun rows to this site
+  // (it can't tell skipped from completed). The emit is scoped to this task by
+  // resolveEmitContext, so a stale callId reused by a later turn isn't touched.
+  // Best-effort: a chat-block failure must not break the lifecycle.
+  const settleChatRowDenied = (logEvent: string): void => {
+    if (!chatToolCallId || !approval.taskId) return;
+    try {
+      const emitCtx = resolveEmitContext(config, approval.taskId);
+      if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
+    } catch (error) {
+      appendLog(config.instance, logEvent, {
+        taskId: approval.taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+
   // Re-read the owning task and refuse to execute the side effect
   // if it has already reached a terminal state (failed via sibling
   // denial, cancelled, completed). The task-terminal check, the
@@ -1806,6 +1934,11 @@ async function executeApprovedAction(
           message: "Skipping approved action: task already terminal",
           data: { approvalId: approval.id, taskStatus: guard.taskStatus }
         });
+        // The task went terminal before this approved action could run, so the
+        // side effect is SKIPPED (the guard flipped the approval back to
+        // denied). Settle the gated row so it doesn't stay stuck `running`
+        // after "Cancelled" (issue #395).
+        settleChatRowDenied("chat.skip_block.emit_failed");
       }
       return undefined;
     }
@@ -1819,7 +1952,7 @@ async function executeApprovedAction(
     // effect that already wrote its normal audit row. Pass
     // `shouldResumeChat: false` to `runApprovedAction` and call
     // `resumeChatTask` AFTER releasing.
-    const rawResult = await runApprovedAction(config, approval, guardController!.signal, {
+    const { result: rawResult, aborted } = await runApprovedAction(config, approval, guardController!.signal, {
       shouldResumeChat: false,
       extraEvidence,
       chatToolCallId
@@ -1831,6 +1964,17 @@ async function executeApprovedAction(
     // cap. Apply the same universal per-tool ceiling here so a large
     // terminal/self-op result can't dominate the model context.
     const result = typeof rawResult === "string" ? capToolResultText(rawResult, approval.action) : rawResult;
+    if (aborted) {
+      // The side effect was aborted by a cancel/fail/sibling-deny (its OWN
+      // verdict, not the racy call-site signal). Settle the gated row to
+      // `denied` rather than routing the abort-result string through
+      // resumeChatTask, whose terminal bail hard-codes `ok` and would paint a
+      // killed terminal.exec (or any aborted action) as success (issue #395).
+      // The result string still returns to the HTTP/CLI caller for its own
+      // bookkeeping; we just don't re-enter the chat loop with it.
+      settleChatRowDenied("chat.abort_block.emit_failed");
+      return result;
+    }
     if (shouldResumeChat && chatToolCallId && approval.taskId && typeof result === "string") {
       await resumeChatTask(config, approval.taskId, chatToolCallId, result);
     }
@@ -1854,11 +1998,41 @@ interface RunApprovedActionContext {
 // wires the signal into `proc.kill`; an uncancellable native API
 // (browser.upload_file's setInputFiles) races the await against the
 // signal and reports the result as `_aborted` if the signal wins.
+interface ApprovedActionResult {
+  result: string | undefined;
+  // True when a cancel / fail / sibling-deny aborted the side effect — either
+  // before it started or mid-run. The caller settles the tool_call row
+  // `denied` on this verdict instead of routing the abort-result string
+  // through resumeChatTask's terminal bail, which hard-codes `ok` and would
+  // mislabel a killed terminal.exec (or any aborted action) as successful
+  // (issue #395 follow-up). The verdict is the side effect's OWN observation
+  // (`winner === "aborted"`, `outcome.kind === "aborted"`, the pre-spawn
+  // `signal.aborted` checks) — NOT the caller's `signal.aborted`, which is a
+  // false positive in the drain window where the side effect completes and the
+  // cancel fires before the caller reads the signal.
+  aborted: boolean;
+}
+
 async function runApprovedAction(
   config: RuntimeConfig,
   approval: Authorization,
   signal: AbortSignal,
   ctx: RunApprovedActionContext
+): Promise<ApprovedActionResult> {
+  // The verdict is flipped inside runApprovedActionImpl at each abort branch,
+  // co-located with the `_aborted` audit emission so a new action branch that
+  // adds an abort path sets it in the same place it writes its abort audit.
+  const verdict = { aborted: false };
+  const result = await runApprovedActionImpl(config, approval, signal, ctx, verdict);
+  return { result, aborted: verdict.aborted };
+}
+
+async function runApprovedActionImpl(
+  config: RuntimeConfig,
+  approval: Authorization,
+  signal: AbortSignal,
+  ctx: RunApprovedActionContext,
+  verdict: { aborted: boolean }
 ): Promise<string | undefined> {
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
@@ -1916,6 +2090,7 @@ async function runApprovedAction(
       };
     });
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
           type: "tool",
@@ -1972,6 +2147,7 @@ async function runApprovedAction(
       };
     });
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
           type: "tool",
@@ -2013,6 +2189,7 @@ async function runApprovedAction(
     // but honoring it here keeps audit semantics consistent with
     // the post-spawn abort path.
     if (signal.aborted) {
+      verdict.aborted = true;
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
     const proc = spawn(spawnArgs, {
@@ -2086,6 +2263,7 @@ async function runApprovedAction(
     // record reflects WHY the cancel happened, not just that one
     // happened.
     if (winner === "aborted") {
+      verdict.aborted = true;
       const task = await mutateState(config.instance, (state) => {
         addAudit(
           state,
@@ -2235,6 +2413,7 @@ async function runApprovedAction(
       signal
     );
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       const reason = readSignalReason(signal) ?? "task.cancelled";
       const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser upload aborted: task was cancelled." });
       const task = await mutateState(config.instance, (state) => {
@@ -2368,6 +2547,7 @@ async function runApprovedAction(
       signal
     );
     if (outcome.kind === "aborted") {
+      verdict.aborted = true;
       const reason = readSignalReason(signal) ?? "task.cancelled";
       const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser download aborted: task was cancelled." });
       const task = await mutateState(config.instance, (state) => {
@@ -2484,6 +2664,7 @@ async function runApprovedAction(
       ? approval.payload.scriptArgs as Record<string, unknown>
       : {};
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ ok: false, aborted: true, error: "skill.run aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
@@ -2510,8 +2691,18 @@ async function runApprovedAction(
     } else {
       // Same result mapping as skillRunTool so the model sees an
       // identical tool-result shape on both the gated and ungated paths.
-      const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId });
+      // Thread the signal so a cancel mid-run SIGTERMs the script's process
+      // (the immediate proc; detached grandchildren survive, same as
+      // terminal.exec — see docs/adr/approval-execution-abort.md).
+      const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId, signal });
       resultOk = result.ok;
+      // Settle the gated row `denied` ONLY when the abort actually won the race
+      // against the script's exit (result.aborted) — not on the caller-side
+      // `signal.aborted`, which is true even in the drain window where the
+      // script already completed and the cancel landed a tick later. Keying on
+      // result.aborted avoids mislabeling a successful script as denied while
+      // still settling a genuinely-killed one (issue #395 follow-up).
+      if (result.aborted) verdict.aborted = true;
       if (result.parsed !== null && result.parsed !== undefined) {
         resultStr = typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
       } else {
@@ -2554,6 +2745,7 @@ async function runApprovedAction(
     const text = String(approval.payload.text ?? "");
     const target = typeof approval.payload.target === "string" ? approval.payload.target : undefined;
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ success: false, aborted: true, error: "messaging.send aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {
@@ -2578,8 +2770,23 @@ async function runApprovedAction(
         { signal }
       );
       resultPayload = { ok: message.status === "sent", messageId: message.id, status: message.status, error: message.error ?? undefined };
+      // Unlike the other side-effecting branches (terminal.exec /
+      // file.* / browser.*), there is no structured `winner === "aborted"`
+      // here: the bridge's outbound path wires `signal` into fetch(), but
+      // sendMessagingOutput CATCHES the fetch AbortError internally and
+      // returns a `status: "failed"` record — the abort never throws out to
+      // our catch below. So a cancel landing mid-send would otherwise leave
+      // `verdict.aborted` false and let resumeChatTask's terminal bail paint
+      // the killed send `ok` (issue #395 follow-up). Detect it via the
+      // signal, gated on the send NOT having reached "sent": a message that
+      // genuinely egressed before the cancel landed (drain window) keeps
+      // status "sent" and stays a real success.
+      if (signal.aborted && message.status !== "sent") verdict.aborted = true;
     } catch (error) {
       resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      // The rare path where sendMessagingOutput itself rejects under
+      // cancellation (rather than normalizing to a failed record).
+      if (signal.aborted) verdict.aborted = true;
     }
     const task = await mutateState(config.instance, (state) => {
       addAudit(
@@ -2599,7 +2806,11 @@ async function runApprovedAction(
             textBytes: text.length,
             ok: resultPayload.ok,
             messageId: resultPayload.messageId ?? null,
-            error: resultPayload.error ?? null
+            error: resultPayload.error ?? null,
+            // Distinguish a cancel-killed send from an ordinary delivery failure
+            // so the audit trail is greppable for cancelled high-risk sends,
+            // matching terminal.exec_aborted / skill.run's aborted evidence.
+            ...(verdict.aborted ? { aborted: true } : {})
           }
         },
         approvalAgentContext(approval)
@@ -2632,6 +2843,7 @@ async function runApprovedAction(
       ? approval.payload.args as Record<string, unknown>
       : {};
     if (signal.aborted) {
+      verdict.aborted = true;
       const aborted = JSON.stringify({ ok: false, aborted: true, error: "self.config aborted: task was cancelled." });
       if (approval.taskId) {
         appendTrace(config.instance, approval.taskId, {

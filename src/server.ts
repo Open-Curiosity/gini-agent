@@ -13,7 +13,7 @@ import { install } from "./runtime";
 import { isRunning } from "./cli/process";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog, backfillEmailWatcherJobs, mutateState, now, readState } from "./state";
+import { appendLog, backfillEmailWatcherJobs, healOrphanedStreamingBlocks, isTerminalTaskStatus, mutateState, now, readState } from "./state";
 import { reconcileInFlightTasks } from "./agent";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
@@ -87,6 +87,36 @@ const installStartedMs = performance.now();
 await install(config);
 const installFinishedMs = performance.now();
 writePid(config);
+
+// Heal orphaned streaming "stuck cursor" blocks left by a prior process that
+// died mid-stream (issue #395). MUST run here — after install() (the memory.db
+// schema/partial-index is ready) and BEFORE Bun.serve binds the HTTP port and
+// before reconcileInFlightTasks re-dispatches resumed turns — so the finalize
+// can never race a live or resumed writer (the only quiescent window; the
+// mutateState lock does not cover chat_blocks). The cutoff (bootStartedAt)
+// excludes any block this process will touch. The safety predicate excludes
+// running/queued tasks: a running/queued orphan is RESUMED by reconcile, whose
+// resume path (runChatTask) settles its own stale block — this sweep must not
+// contend. A block whose task is terminal/waiting_approval/absent has no
+// resumable writer and is safe to settle. Best-effort: a failure here must not
+// block boot. See ADR chat-block-protocol.md.
+try {
+  const tasksAtBoot = new Map(readState(config.instance).tasks.map((t) => [t.id, t.status]));
+  const healed = healOrphanedStreamingBlocks(config.instance, bootStartedAt, (taskId) => {
+    if (taskId === null) return true; // no owning task (legacy/pruned) — no resumable writer.
+    const status = tasksAtBoot.get(taskId);
+    if (status === undefined) return true; // task pruned from state — orphan, safe.
+    if (status === "running" || status === "queued") return false; // reconcile resumes these.
+    return isTerminalTaskStatus(status) || status === "waiting_approval";
+  });
+  if (healed > 0) {
+    appendLog(config.instance, "chat.streaming.healed-orphans", { count: healed });
+  }
+} catch (error) {
+  appendLog(config.instance, "chat.streaming.heal-error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+}
 
 // Inform the browser session manager which instance to consult for the
 // optional CDP connection record. Without this the manager falls back to

@@ -112,6 +112,7 @@ export {
   deleteChatBlocksForSession,
   deleteChatBlock,
   findInFlightAssistantTextForTask,
+  healOrphanedStreamingBlocks,
   taskProducedAssistantText,
   latestAssistantTextForSession,
   latestAssistantTextForThread,

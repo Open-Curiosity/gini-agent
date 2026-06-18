@@ -513,6 +513,44 @@ export function isContextOverflowError(message: string | undefined): boolean {
   return CONTEXT_OVERFLOW_MARKERS.some((marker) => lower.includes(marker));
 }
 
+// True when an error is an AbortSignal-triggered abort, i.e. the in-flight
+// model call (fetch + stream reader) was cancelled via the turn AbortController
+// (see src/execution/turn-abort.ts). An aborted fetch rejects its `reader.read()`
+// with a DOMException named "AbortError"; our own abortable-sleep helper throws
+// the same shape via signal.reason. The chat-task loop classifies this distinctly
+// so a cancelled turn bails to the terminal "cancelled" path rather than being
+// misread as an auth failure (re-auth note) or a context overflow (compact +
+// retry). Pure inspection — never matches an ordinary provider error string.
+export function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  return error instanceof Error && error.name === "AbortError";
+}
+
+// Sleep that rejects promptly when `signal` aborts, instead of running the full
+// duration. Used by the echo provider's injected `delayMs` (so a test can abort
+// a turn mid-call and observe the same deterministic AbortError a real provider
+// fetch would raise) and by withCodexSessionRetry's pre-retry wait (so a cancel
+// during the 50 ms settle window skips the second attempt at the source).
+// Rejects with the signal's reason (an AbortError-shaped DOMException) so
+// isAbortError classifies it. Both branches go through setTimeout so the delay
+// stays observable to tests that spy on it.
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, ms);
+  const onAbort = (): void => {
+    clearTimeout(timer);
+    reject(signal!.reason ?? new DOMException("Aborted", "AbortError"));
+  };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await promise;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 // Mask credential-shaped substrings before a provider's raw error is stored or
 // rendered — some providers echo a partial key in their auth error. Conservative
 // on purpose: only well-known key/token shapes, so ordinary prose is untouched.
@@ -778,7 +816,7 @@ export interface ToolCallingResult {
 // loop calls the provider multiple times. A stub with `error` set makes
 // the echo call throw instead, exercising callers' provider-failure paths
 // (context-overflow retries, auth tagging, task failure).
-const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string; delayMs?: number }> = [];
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string; delayMs?: number; streamAfterAbort?: boolean }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
@@ -793,12 +831,26 @@ const echoToolCallingToolNames: string[][] = [];
 // provider that returns the whole string at once — callers' no-delta
 // paths (one-shot block emission, route finalization without a stream)
 // are unreachable otherwise, since echo streams every non-empty text.
+// `streamAfterAbort`: deliver this stub's text through onDelta and RETURN
+// normally even if the turn was aborted during its delayMs hold, instead of
+// the abortable sleep rejecting. This models a real provider that had already
+// buffered deltas on the wire when the abort fired — they arrive on a later
+// macrotask before the stream unwinds. It is the only way to exercise the
+// loop's defense-in-depth flush / route terminal-status guards (which drop
+// post-cancel deltas), since the normal abortable-sleep path rejects before
+// any delta and never reaches them. Has no effect when the turn isn't aborted.
 export function setEchoToolCallingResponse(
   result: ToolCallingResult,
   tag?: string,
-  opts?: { nonStreaming?: boolean; delayMs?: number }
+  opts?: { nonStreaming?: boolean; delayMs?: number; streamAfterAbort?: boolean }
 ): void {
-  echoToolCallingStubs.push({ tag, result, nonStreaming: opts?.nonStreaming, delayMs: opts?.delayMs });
+  echoToolCallingStubs.push({
+    tag,
+    result,
+    nonStreaming: opts?.nonStreaming,
+    delayMs: opts?.delayMs,
+    streamAfterAbort: opts?.streamAfterAbort
+  });
 }
 
 // Queue an echo tool-calling FAILURE: the next echo-backed
@@ -836,7 +888,7 @@ function nextEchoToolCallingResult(
   provider: ProviderConfig,
   lastUserText: string,
   onDelta?: (text: string) => void
-): { result: ToolCallingResult; nonStreaming: boolean; delayMs?: number } {
+): { result: ToolCallingResult; nonStreaming: boolean; delayMs?: number; streamAfterAbort: boolean } {
   const stub = echoToolCallingStubs.shift();
   if (stub?.error !== undefined) {
     if (stub.streamTextBeforeFailure && onDelta) {
@@ -848,7 +900,14 @@ function nextEchoToolCallingResult(
     }
     throw new Error(stub.error);
   }
-  if (stub?.result) return { result: stub.result, nonStreaming: Boolean(stub.nonStreaming), delayMs: stub.delayMs };
+  if (stub?.result) {
+    return {
+      result: stub.result,
+      nonStreaming: Boolean(stub.nonStreaming),
+      delayMs: stub.delayMs,
+      streamAfterAbort: Boolean(stub.streamAfterAbort)
+    };
+  }
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
   // a deterministic shape.
@@ -859,7 +918,8 @@ function nextEchoToolCallingResult(
       toolCalls: [],
       finishReason: "stop"
     },
-    nonStreaming: false
+    nonStreaming: false,
+    streamAfterAbort: false
   };
 }
 
@@ -882,7 +942,13 @@ export async function generateToolCallingResponse(
   // NOT mutate config.provider — embeddings and the reranker still read
   // from config and must not be retargeted by agent switches. When
   // omitted, behavior matches the legacy single-provider path.
-  providerOverride?: ProviderConfig
+  providerOverride?: ProviderConfig,
+  // Optional per-turn abort signal. Threaded into the underlying fetch + SSE
+  // stream reader so cancelTask can stop the in-flight model call at the
+  // source (see src/execution/turn-abort.ts). When the signal aborts mid-call
+  // the fetch body read rejects with an AbortError, surfaced to the caller for
+  // classification via isAbortError. Omitted callers (CLI/tests) are unaffected.
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   const provider = normalizeProvider(providerOverride ?? config.provider);
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
@@ -891,11 +957,23 @@ export async function generateToolCallingResponse(
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
     echoToolCallingToolNames.push(tools.map((t) => t.function.name));
-    const { result, nonStreaming, delayMs } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
+    const { result, nonStreaming, delayMs, streamAfterAbort } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
     // Optional injected latency so concurrency tests can measure overlap:
     // a serial dispatch of N delayed children costs ~N*delay wall time; a
-    // concurrent dispatch costs ~delay. Defaults to no delay (instant).
-    if (delayMs && delayMs > 0) await Bun.sleep(delayMs);
+    // concurrent dispatch costs ~delay. Defaults to no delay (instant). The
+    // sleep honors the abort signal so a test can cancel a turn mid-call and
+    // observe the same AbortError a real provider fetch would raise — UNLESS
+    // the stub set streamAfterAbort, which models a real provider that already
+    // had buffered deltas on the wire: it swallows the abort and still streams
+    // + returns, so the loop's defense-in-depth post-cancel flush/route guards
+    // are exercised (they're unreachable via the rejecting path).
+    if (delayMs && delayMs > 0) {
+      if (streamAfterAbort) {
+        await abortableSleep(delayMs, signal).catch(() => {});
+      } else {
+        await abortableSleep(delayMs, signal);
+      }
+    }
     if (result.text && onDelta && !nonStreaming) {
       // Synthesize a single streamed delta so callers exercise their
       // streaming pipelines in echo-backed tests.
@@ -918,11 +996,11 @@ export async function generateToolCallingResponse(
     // only `/responses` path here would strip that transcript.
     if (provider.name === "codex") {
       if (tools.length > 0 || messagesContainToolTraffic(messages)) {
-        return callToolCallingResponses(provider, messages, tools, onDelta);
+        return callToolCallingResponses(provider, messages, tools, onDelta, signal);
       }
       const systemContext = stitchSystemFromMessages(messages);
       const userInput = lastUserText || "";
-      const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
+      const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta, undefined, signal);
       return {
         provider: text.provider,
         text: text.text,
@@ -935,18 +1013,24 @@ export async function generateToolCallingResponse(
     }
 
     if (provider.name === "anthropic") {
-      return callAnthropicMessages(provider, messages, tools, onDelta);
+      return callAnthropicMessages(provider, messages, tools, onDelta, undefined, signal);
     }
 
     if (provider.name === "bedrock") {
-      return callBedrockConverse(provider, messages, tools, onDelta);
+      return callBedrockConverse(provider, messages, tools, onDelta, undefined, signal);
     }
 
-    return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+    return callToolCallingChatCompletions(provider, messages, tools, onDelta, signal);
   };
   try {
     return await dispatch();
   } catch (error) {
+    // A turn-abort (cancelTask aborted the in-flight call) must pass through
+    // untouched: it is neither an auth failure nor a context overflow, and the
+    // chat-task loop classifies it via isAbortError to bail to the cancelled
+    // terminal path. Re-tagging it as ProviderAuthError would falsely record a
+    // needs-reauth state on a perfectly healthy credential.
+    if (isAbortError(error)) throw error;
     // Pin auth attribution to the provider resolved at THIS call's entry.
     // The chat-task wraps tag with the loop's effective-context snapshot,
     // but an instance-sourced call late-binds config.provider above — a
@@ -991,7 +1075,8 @@ async function callToolCallingChatCompletions(
   provider: ProviderConfig,
   messages: ToolCallingMessage[],
   tools: ToolFunctionSpec[],
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
@@ -1024,11 +1109,12 @@ async function callToolCallingChatCompletions(
   const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    ...(signal ? { signal } : {})
   });
 
   if (wantStream) {
-    return readToolCallingStream(response, provider, onDelta);
+    return readToolCallingStream(response, provider, onDelta, signal);
   }
 
   const rawPayload = await response.text();
@@ -1123,7 +1209,8 @@ function normalizeFinishReason(value: string | undefined): ToolCallingResult["fi
 async function readToolCallingStream(
   response: Response,
   provider: ProviderConfig,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   if (!response.ok) {
     const raw = await response.text();
@@ -1188,38 +1275,49 @@ async function readToolCallingStream(
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (value) buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      if (block.trim().length > 0) handleEvent(block);
-      boundary = buffer.indexOf("\n\n");
+  // try/finally so an abort (reader.read() rejects with AbortError) or a throw
+  // from handleEvent releases the reader lock on the response body, matching
+  // the codex/anthropic/bedrock readers. The top-of-loop guard makes a
+  // pending abort deterministic; the finally covers the in-flight-read abort.
+  try {
+    while (true) {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (block.trim().length > 0) handleEvent(block);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
     }
-    if (done) break;
-  }
-  buffer += decoder.decode();
-  if (buffer.trim().length > 0) handleEvent(buffer);
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
 
-  const toolCalls: ToolCall[] = [];
-  // Preserve original index ordering.
-  const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
-  for (const idx of sortedIndices) {
-    const call = callsByIndex.get(idx)!;
-    if (call.id && call.function.name) toolCalls.push(call);
-  }
+    const toolCalls: ToolCall[] = [];
+    // Preserve original index ordering.
+    const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
+    for (const idx of sortedIndices) {
+      const call = callsByIndex.get(idx)!;
+      if (call.id && call.function.name) toolCalls.push(call);
+    }
 
-  return {
-    provider,
-    text: textParts.join("").trim(),
-    toolCalls,
-    finishReason,
-    responseId,
-    usage,
-    cost: estimateCost(provider, usage)
-  };
+    return {
+      provider,
+      text: textParts.join("").trim(),
+      toolCalls,
+      finishReason,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
 }
 
 // Codex/Responses-API tool-calling. Translates the chat-completions message
@@ -1236,7 +1334,8 @@ async function callToolCallingResponses(
   provider: ProviderConfig,
   messages: ToolCallingMessage[],
   tools: ToolFunctionSpec[],
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   // The retry closure re-reads the bearer on every attempt so a token
   // rotation between attempts (the codex CLI just wrote a new auth.json)
@@ -1271,11 +1370,12 @@ async function callToolCallingResponses(
         accept: "text/event-stream",
         ...codexHeaders(bearer)
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {})
     });
 
-    return readResponsesToolCallingStream(response, provider, onDelta);
-  });
+    return readResponsesToolCallingStream(response, provider, onDelta, signal);
+  }, signal);
 }
 
 interface ResponsesInputShape {
@@ -1376,7 +1476,8 @@ function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): Resp
 async function readResponsesToolCallingStream(
   response: Response,
   provider: ProviderConfig,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   if (!response.ok) {
     const raw = await response.text();
@@ -1549,6 +1650,10 @@ async function readResponsesToolCallingStream(
   // in flight.
   try {
     while (true) {
+      // Turn-abort: the fetch cancels and reader.read() rejects with an
+      // AbortError; this guard makes the stop deterministic and releases the
+      // reader (the finally below also cancels on throw).
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       const { value, done } = await reader.read();
       if (value) buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n\n");
@@ -1661,7 +1766,8 @@ async function callAnthropicMessages(
   onDelta?: (text: string) => void,
   // Per-call output-token override. Vision passes its small budget; the chat
   // loop omits it and the default (or extraBody.max_tokens) applies.
-  maxTokensOverride?: number
+  maxTokensOverride?: number,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   // The builder owns the /v1/messages path. Tolerate a baseUrl that already
@@ -1703,11 +1809,12 @@ async function callAnthropicMessages(
       ...(wantStream ? { accept: "text/event-stream" } : {}),
       ...anthropicAuthHeaders(provider)
     },
-    body: bodyJson
+    body: bodyJson,
+    ...(signal ? { signal } : {})
   });
 
   if (wantStream) {
-    return readAnthropicMessagesStream(response, provider, onDelta);
+    return readAnthropicMessagesStream(response, provider, onDelta, signal);
   }
 
   const rawPayload = await response.text();
@@ -1919,7 +2026,8 @@ function parseAnthropicMessage(payload: Record<string, unknown>, provider: Provi
 async function readAnthropicMessagesStream(
   response: Response,
   provider: ProviderConfig,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   if (!response.ok) {
     const raw = await response.text();
@@ -2011,6 +2119,10 @@ async function readAnthropicMessagesStream(
 
   try {
     while (true) {
+      // Turn-abort: the fetch cancels and reader.read() rejects with an
+      // AbortError; this guard makes the stop deterministic (the finally
+      // cancels the reader on the throw).
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       const { value, done } = await reader.read();
       if (value) buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n\n");
@@ -2307,7 +2419,8 @@ async function callBedrockConverse(
   messages: ToolCallingMessage[],
   tools: ToolFunctionSpec[],
   onDelta?: (text: string) => void,
-  maxTokensOverride?: number
+  maxTokensOverride?: number,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   const region = bedrockRegion(provider);
   // Omit toolConfig for models that reject it (e.g. DeepSeek R1) so a normal
@@ -2340,10 +2453,11 @@ async function callBedrockConverse(
       "content-type": "application/json",
       ...bedrockAuthHeaders(region, url, bodyJson)
     },
-    body: bodyJson
+    body: bodyJson,
+    ...(signal ? { signal } : {})
   });
 
-  if (wantStream) return readConverseStream(response, provider, onDelta);
+  if (wantStream) return readConverseStream(response, provider, onDelta, signal);
 
   const rawPayload = await response.text();
   const payload = parseJsonObject(rawPayload);
@@ -2447,7 +2561,8 @@ function parseEventStreamFrame(
 async function readConverseStream(
   response: Response,
   provider: ProviderConfig,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolCallingResult> {
   if (!response.ok) {
     const raw = await response.text();
@@ -2514,6 +2629,10 @@ async function readConverseStream(
 
   try {
     while (true) {
+      // Turn-abort: the fetch cancels and reader.read() rejects with an
+      // AbortError; this guard makes the stop deterministic (the finally
+      // cancels the reader on the throw).
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       const { value, done } = await reader.read();
       if (value) buf = bytesConcat(buf, value);
       while (buf.length >= 12) {
@@ -3342,7 +3461,8 @@ async function callOpenAIResponses(
   onDelta?: (text: string) => void,
   // Per-call output-token cap. Aux side-calls pass a small budget; the
   // chat paths omit it and the model default applies.
-  maxOutputTokens?: number
+  maxOutputTokens?: number,
+  signal?: AbortSignal
 ): Promise<ProviderResult> {
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const tokenCapField = maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {};
@@ -3378,10 +3498,11 @@ async function callOpenAIResponses(
             }
           ],
           ...tokenCapField
-        })
+        }),
+        ...(signal ? { signal } : {})
       });
-      return readCodexStream(response, provider, onDelta);
-    });
+      return readCodexStream(response, provider, onDelta, signal);
+    }, signal);
   }
 
   const bearer = readOpenAIBearer(provider);
@@ -3407,7 +3528,8 @@ async function callOpenAIResponses(
       ],
       ...tokenCapField,
       ...promptCacheRetentionBody(provider)
-    })
+    }),
+    ...(signal ? { signal } : {})
   });
 
   const rawPayload = await response.text();
@@ -3435,7 +3557,8 @@ async function callChatCompletions(
   // models whose newer o-series reject `max_tokens` and require
   // `max_completion_tokens`; other compat gateways keep the legacy field
   // (mirrors callVisionChatCompletions).
-  maxTokens?: number
+  maxTokens?: number,
+  signal?: AbortSignal
 ): Promise<ProviderResult> {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
@@ -3463,7 +3586,8 @@ async function callChatCompletions(
       stream: false,
       ...tokenCapField,
       ...promptCacheRetentionBody(provider)
-    })
+    }),
+    ...(signal ? { signal } : {})
   });
   const rawPayload = await response.text();
   const payload = parseJsonObject(rawPayload);
@@ -3483,7 +3607,8 @@ async function callChatCompletions(
 async function readCodexStream(
   response: Response,
   provider: ProviderConfig,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
 ): Promise<ProviderResult> {
   if (!response.ok) {
     // Error path: drain the body fully so we can surface the API's error
@@ -3587,6 +3712,10 @@ async function readCodexStream(
   // in flight.
   try {
     while (true) {
+      // Turn-abort: the fetch cancels and reader.read() rejects with an
+      // AbortError; this guard makes the stop deterministic (the finally
+      // cancels the reader on the throw).
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       const { value, done } = await reader.read();
       if (value) buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n\n");
@@ -3820,14 +3949,22 @@ export const CODEX_RETRY_REWRITE_DELAY_MS = 50;
 //     empty auth.json mid-rewrite. Without this branch the parse failure
 //     surfaces as a permanent generic Error and the user sees a hard
 //     failure from a transient mid-write read.
-async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
+async function withCodexSessionRetry<T>(make: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   try {
     return await make();
   } catch (err) {
     if (!(err instanceof CodexSessionExpiredError) && !(err instanceof CodexAuthRaceError)) {
       throw err;
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
+    // Honor the turn's cancellation during the pre-retry wait: abortableSleep
+    // rejects with the signal's reason (an AbortError) the moment the user
+    // cancels, so attempt 2 is never constructed. Without the signal the wait
+    // would run to its full 50 ms and then fire a fresh fetch whose
+    // already-aborted signal rejects it — correct outcome, but a wasted
+    // round-trip. The throw propagates as an abort, which isAbortError
+    // classifies upstream (it is not a session/auth error, so it bypasses the
+    // second-failure credential handling below).
+    await abortableSleep(CODEX_RETRY_REWRITE_DELAY_MS, signal);
     try {
       return await make();
     } catch (retryErr) {
@@ -4519,7 +4656,11 @@ export async function generateAuxText(
   // side-call (which can carry transcript content) goes to the provider that
   // serves the agent, not the global config provider. config.provider is
   // never mutated.
-  providerOverride?: ProviderConfig
+  providerOverride?: ProviderConfig,
+  // Optional per-turn abort signal, same contract as
+  // generateToolCallingResponse: cancelTask aborts the in-flight aux call (the
+  // in-turn compaction summary) at the source so a cancelled turn stops here too.
+  signal?: AbortSignal
 ): Promise<AuxTextResult> {
   const provider = normalizeProvider(providerOverride ?? config.provider);
   const maxTokens = request.maxTokens ?? 1024;
@@ -4536,15 +4677,15 @@ export async function generateAuxText(
       { role: "user", content: request.user }
     ];
     const result = provider.name === "bedrock"
-      ? await callBedrockConverse(provider, messages, [], undefined, maxTokens)
-      : await callAnthropicMessages(provider, messages, [], undefined, maxTokens);
+      ? await callBedrockConverse(provider, messages, [], undefined, maxTokens, signal)
+      : await callAnthropicMessages(provider, messages, [], undefined, maxTokens, signal);
     return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
   }
   if (provider.name === "codex" || provider.name === "openai") {
-    const result = await callOpenAIResponses(provider, request.user, request.system, undefined, maxTokens);
+    const result = await callOpenAIResponses(provider, request.user, request.system, undefined, maxTokens, signal);
     return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
   }
   // openrouter / local / deepseek / azure — OpenAI-compatible chat-completions.
-  const result = await callChatCompletions(provider, request.user, request.system, maxTokens);
+  const result = await callChatCompletions(provider, request.user, request.system, maxTokens, signal);
   return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
 }
