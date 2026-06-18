@@ -237,4 +237,3 @@ export function cleanChromeUserAgent(
   userAgentCache.set(execPath, computed);
   return computed;
 }
-

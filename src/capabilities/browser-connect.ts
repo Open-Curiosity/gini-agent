@@ -34,6 +34,12 @@ type Status = {
   connected: boolean;
 };
 
+// The tool-result JSON the chat-task loop receives when a browser.connect
+// completes via the non-screencast fallback. Shared with the HTTP /complete
+// handler (which needs it for the atomic claim's toolResult, BEFORE this
+// module's audit write runs) so the two paths can never drift.
+export const BROWSER_CONNECT_SPAWNED_RESULT = JSON.stringify({ success: true, connected: true, mode: "spawned" });
+
 // GET /api/browser status. The spawned Chrome carries no state record, so this
 // reports a stable disconnected/false shape: there is no long-lived "managed
 // window" the user explicitly connected. The agent's headless Chrome is an
@@ -86,7 +92,6 @@ export async function completeBrowserConnectSetup(
     payload: Record<string, unknown>;
   }
 ): Promise<{ ok: boolean; result: string }> {
-  const result = JSON.stringify({ success: true, connected: true, mode: "spawned" });
   const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
     ? setup.payload.reason
     : setup.target;
@@ -106,7 +111,7 @@ export async function completeBrowserConnectSetup(
       setupAuditContext(setup)
     );
   });
-  return { ok: true, result };
+  return { ok: true, result: BROWSER_CONNECT_SPAWNED_RESULT };
 }
 
 // Inlined here (rather than importing approvalAgentContext from src/agent.ts)

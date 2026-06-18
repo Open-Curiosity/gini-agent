@@ -38,7 +38,7 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import {
   getOrStartBridge,
   stopActiveBridge,
@@ -111,7 +111,7 @@ import {
 } from "./runtime/identity-files";
 import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
+import { BROWSER_CONNECT_SPAWNED_RESULT, completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAVAILABLE, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
@@ -997,9 +997,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // `browser.connect` audit row, mirroring the screencast path above and
         // the connector/skill branches: a double-submit's loser (or a complete
         // racing a cancel) throws ApprovalRaceLostError at the claim and writes
-        // ZERO side effects, so the audit row can't be duplicated.
-        const result = JSON.stringify({ success: true, connected: true, mode: "spawned" });
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+        // ZERO side effects, so the audit row can't be duplicated. The shared
+        // result constant is the claim's toolResult; completeBrowserConnectSetup
+        // writes the audit row (and returns the same constant, which we already
+        // staged here).
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: BROWSER_CONNECT_SPAWNED_RESULT, awaitResume: false });
         const { ok } = await completeBrowserConnectSetup(config, setup);
         return json({ ok });
       }
@@ -1154,18 +1156,38 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (blocked) return json({ error: blocked }, 400);
       }
       // Screencast is the ONLY sign-in path: the user signs in through the
-      // in-chat modal that screencasts the agent's already-running headless
-      // spawned Chrome over its CDP debug port. The agent and the user act on
-      // ONE browser the whole time — no teardown, no relaunch, no record. When
-      // no spawned Chrome is live (the agent hasn't browsed yet) there is
-      // nothing to screencast: reject with 409 rather than opening a visible
-      // window (the managed-window transport was removed — issue #420).
-      const screencastPort = getScreencastPort();
+      // in-chat modal that screencasts the agent's headless spawned Chrome over
+      // its CDP debug port. The agent and the user act on ONE browser the whole
+      // time. Usually the spawned Chrome is already live (the agent just hit a
+      // sign-in wall while browsing). But a gateway restart / Chrome crash /
+      // `gini browser disconnect` drops the in-process spawned handle while the
+      // setup request — being durable — survives, so getScreencastPort() can be
+      // null on a still-pending card. Rather than stranding the user on a card
+      // that can never open, relaunch the headless Chrome and navigate it to the
+      // target page (the spawn-only equivalent of the old managed relaunch — no
+      // visible window), then screencast that. The navigate lazily spawns Chrome
+      // via ensureShared and runs the same SSRF/domain-policy gate as any tool
+      // navigation.
+      let screencastPort = getScreencastPort();
       if (screencastPort === null) {
-        return json(
-          { ok: false, error: "The agent's browser isn't running; cannot start sign-in." },
-          409
-        );
+        if (!targetUrl) {
+          return json(
+            { ok: false, error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." },
+            409
+          );
+        }
+        const relaunchTaskId = setup.taskId ?? `browser-connect-${setupId}`;
+        const navResult = JSON.parse(await browserNavigate(relaunchTaskId, { url: targetUrl }, config)) as {
+          success?: boolean;
+          error?: string;
+        };
+        screencastPort = getScreencastPort();
+        if (!navResult.success || screencastPort === null) {
+          return json(
+            { ok: false, error: navResult.error ?? "Could not start the agent's browser for sign-in." },
+            409
+          );
+        }
       }
       let stamped = false;
       await mutateState(config.instance, (state) => {

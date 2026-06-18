@@ -295,11 +295,11 @@ function allRegisteredSecrets(): string[] {
   }
   return Array.from(out);
 }
-// Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
-// look up state.browser to decide between connectOverCDP() and launch().
-// Stays undefined in standalone test contexts that import the tools
-// directly without going through the runtime — the launch path then
-// behaves exactly as before.
+// Set at runtime startup via setBrowserInstance(). Scopes the spawned
+// Chrome's profile dir (chromeProfileDirFor) and the per-instance state reads
+// to this instance. Stays undefined in standalone test contexts that import
+// the tools directly without going through the runtime — the launch path then
+// falls back to a default profile dir.
 let runtimeInstance: Instance | undefined;
 // Same idea per task — concurrent getOrCreate() calls for the same taskId
 // share one Promise<Session> so we never create two contexts for one task.

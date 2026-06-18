@@ -454,8 +454,8 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 // chosen by `action`:
 //   - `browser.connect` → "Connect" button (POST /api/setup-requests/<id>/open-browser)
 //     that opens a live sign-in screencast modal over the agent's headless
-//     Chrome (falling back to a visible managed Chrome window when no spawned
-//     browser is running), then signals complete.
+//     spawned Chrome (relaunching it headless and navigating to the target page
+//     first if it isn't currently running), then signals complete.
 //   - `connector.request` → credential dialog. Submit POSTs the credential
 //     payload to /api/setup-requests/<id>/complete.
 //   - `browser.fill_secret` → inline credential inputs with destination URL

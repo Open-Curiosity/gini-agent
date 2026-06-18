@@ -2711,6 +2711,56 @@ describe("runtime api", () => {
     expect(input.status).toBe(409);
   });
 
+  test("open-browser 409s with the no-URL message when no browser is live and no page URL is recorded", async () => {
+    // A pending browser.connect with no live spawned Chrome AND no recorded url
+    // can't relaunch anything to screencast, so it 409s with the distinct
+    // no-URL message rather than attempting a blind navigate.
+    const config = testConfig("open-browser-no-url-no-browser");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_no_url" }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+    // The row stays pending so a later retry (once a browser is live) works.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("open-browser attempts a headless relaunch+navigate when a URL is recorded but no browser is live", async () => {
+    // Restart/crash/disconnect drops the in-process spawned handle while the
+    // durable card survives. With a recorded url, open-browser relaunches the
+    // headless Chrome and navigates to it (the spawn-only replacement for the
+    // removed managed relaunch) instead of stranding the user. In this unit
+    // context there's no real Chrome to launch, so the navigate fails and the
+    // endpoint surfaces the relaunch failure as 409 — but the recovery path was
+    // taken, and the row stays pending for a later real retry.
+    const config = testConfig("open-browser-relaunch-attempt");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_relaunch", url: "https://example.com/login" }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    // Distinct from the no-URL message: this 409 came from the relaunch attempt.
+    expect(body.error).not.toContain("no page URL is recorded");
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
   test("screencast endpoints reject a setup that isn't an active sign-in (lifecycle gate)", async () => {
     // A browser.connect setup that is NOT pending, OR not stamped screencast +
     // signInStarted, must be refused so a stale EventSource reconnect after

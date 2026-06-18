@@ -2,11 +2,11 @@
 
 ## Decision
 
-The agent's browser launches as a normal branded Google Chrome rather than Playwright's bundled Chromium. The same stealth identity is shared by two launch mechanisms:
+The agent's browser launches as a normal branded Google Chrome rather than Playwright's bundled Chromium. There is one launch mechanism, the spawned per-instance Chrome:
 
 - **The agent's browser is a spawned per-instance Chrome — the only transport.** `src/tools/chrome-launch.ts` (`launchSpawnedChrome`) drives a real branded Chrome via `chromium.launchPersistentContext` over Playwright's PIPE transport with `--headless=new`, the shared `CHROME_LAUNCH_ARGS`, the clean UA, the per-instance `--user-data-dir`, and a free-picked `--remote-debugging-port` in the launch args (the TCP debug port is an extra local-only endpoint used by the sign-in screencast bridge, not how the automation is driven — `connectOverCDP` over a TCP WebSocket hangs under playwright-core 1.60 + Bun, so the pipe is used instead). Teardown closes the persistent context; if that wedges, it reaps the Chrome bound to the instance's profile dir by scanning for the matching `--user-data-dir` (never `killall`, never the user's `:9222`). There is no visible managed window and no external-Chrome (CDP) attach — every agent tool call drives this one spawned Chrome (see [Browser Automation Engine](browser-automation-engine.md)).
 
-The identity choices are centralized in `src/tools/chrome-discovery.ts` and reused by both mechanisms (`launchSpawnedChrome` and `launchPersistentChrome`):
+The identity choices are centralized in `src/tools/chrome-discovery.ts` and used by `launchSpawnedChrome`:
 
 1. **Branded identity.** `resolveBrowserLaunchTarget` prefers the detected branded Google Chrome stable binary (launched via `executablePath`) over the bundled Chromium. The bundled Chromium remains the automatic fallback — used when no branded Chrome is installed, or when a branded launch fails to start/drive. `GINI_CHROME_PATH` still wins unconditionally (explicit binary). We launch by `executablePath` rather than Playwright's `channel: "chrome"` so the launch drives exactly the binary we already probe for the UA (`cleanChromeUserAgent`) and store in `record.chromePath` — a channel launch leans on Playwright's own separate channel detection, which can resolve a different binary than the one we discovered and divergence there would mislabel the UA and the recorded path.
 2. **Cleared `navigator.webdriver`.** The spawned launch carries `--disable-blink-features=AutomationControlled` (in the shared `CHROME_LAUNCH_ARGS`), which makes `navigator.webdriver` read `false`.
@@ -37,9 +37,9 @@ This deliberately reverses the prior "prefer bundled Chromium" default. That ear
 
 ## Consequences For Coding Agents
 
-- Launch identity and args are chosen in one place: `src/tools/chrome-discovery.ts`. New launch sites should call `launchPersistentChrome` rather than invoking `chromium.launchPersistentContext` with their own args, so the stealth args, the branded→bundled fallback, and the headless UA normalization stay consistent.
-- `CHROME_LAUNCH_ARGS` is the single source of shared launch args. Adding or changing a flag there propagates to both launch sites.
-- `record.chromePath` stores the binary that actually backed the context (`usedPath` from `launchPersistentChrome`). A branded launch records the branded path, and a fallback launch records the bundled one — don't reintroduce a `chromium.executablePath()` fallback that would mislabel the launched binary.
+- Launch identity and args are chosen in one place: `src/tools/chrome-discovery.ts`. New launch sites should call `launchSpawnedChrome` rather than invoking `chromium.launchPersistentContext` with their own args, so the stealth args, the branded→bundled fallback, and the headless UA normalization stay consistent.
+- `CHROME_LAUNCH_ARGS` is the single source of shared launch args. Adding or changing a flag there propagates to the spawned launch.
+- The launch records the binary that actually backed the context (the resolved `executablePath`). A branded launch records the branded path, and a fallback launch records the bundled one — don't reintroduce a `chromium.executablePath()` fallback that would mislabel the launched binary.
 - The headless UA override is best-effort. On platforms where `--version` doesn't print to stdout (Windows `chrome.exe`), `cleanChromeUserAgent` returns `undefined` and the launch proceeds with no override — same behavior as before, no regression.
 
 ## Acceptance Checks
