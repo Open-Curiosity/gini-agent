@@ -2160,20 +2160,22 @@ async function runLoop(
     return exhausted;
   };
 
-  // Bail-out for a turn aborted at the source by cancelTask (the in-flight
-  // model/aux call rejected with an AbortError because the turn AbortSignal
-  // fired). cancelTask already owns the terminal status flip and the
-  // "Cancelled" block emission (it ran the abort inside its mutateState), so
-  // this helper just reads the now-terminal task back and returns it —
+  // Bail-out for a turn whose in-flight model/aux call rejected with an
+  // AbortError because the turn AbortSignal fired. The abort is raised by
+  // recordInFlightAborted, shared by every terminal-status flip — cancel,
+  // failTask, and sibling-deny — so the bail is NOT cancel-specific. Whichever
+  // caller fired the abort already owns the terminal status flip and the
+  // terminal block emission (Cancelled / Failed) inside its own mutateState,
+  // so this helper just reads the now-terminal task back and returns it —
   // mirroring the loop's other terminal-status bail-outs. It never overwrites
   // status. If the task somehow isn't terminal yet (the abort raced ahead of
-  // cancelTask's commit), the row is still returned as-is; the caller's
-  // terminal guards and cancelTask's own emission converge on the same state.
+  // the commit), the row is still returned as-is; the caller's terminal guards
+  // and the caller's own emission converge on the same state.
   const bailOnTurnAbort = async (): Promise<Task> => {
     const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
     appendTrace(config.instance, taskId, {
       type: "task",
-      message: "Chat task bail-out: in-flight model call aborted (turn cancelled)",
+      message: `Chat task bail-out: in-flight model call aborted (task ${stale?.status ?? "terminal"})`,
       data: { iterations, status: stale?.status }
     });
     await syncSubagentFromTask(config, stale ?? ({ id: taskId, subagentId: undefined } as unknown as Task));

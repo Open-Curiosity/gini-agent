@@ -419,11 +419,13 @@ export async function cancelTask(
   return task;
 }
 
-// Centralize the abortApprovalsForTask + authorization.in_flight_aborted
-// audit emission so cancelTask, failTask, and decideApproval-deny
-// share the same exact behavior. Runs INSIDE the caller's mutateState
-// callback so the abort fan-out and the audit row write happen under
-// the per-instance lock.
+// Centralize the in-flight abort fan-out + authorization.in_flight_aborted
+// audit emission so cancelTask, failTask, and decideApproval-deny share the
+// same exact behavior on every terminal-status flip: abort the in-flight MODEL
+// turn (turn-abort registry) AND any in-flight approved-action executors
+// (approval registry), then audit the latter. Runs INSIDE the caller's
+// mutateState callback so the abort fan-out and the audit row write happen
+// under the per-instance lock.
 type InFlightAbortReason = "task.cancelled" | "task.failed" | "sibling.denied";
 
 function recordInFlightAborted(

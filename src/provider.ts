@@ -1172,45 +1172,49 @@ async function readToolCallingStream(
     }
   };
 
-  while (true) {
-    // A turn-abort cancels the underlying fetch, which rejects reader.read()
-    // with an AbortError; this top-of-loop guard makes the stop deterministic
-    // (and releases the reader) even if a chunk was already buffered.
-    if (signal?.aborted) {
-      await reader.cancel().catch(() => {});
-      throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  // try/finally so an abort (reader.read() rejects with AbortError) or a throw
+  // from handleEvent releases the reader lock on the response body, matching
+  // the codex/anthropic/bedrock readers. The top-of-loop guard makes a
+  // pending abort deterministic; the finally covers the in-flight-read abort.
+  try {
+    while (true) {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (block.trim().length > 0) handleEvent(block);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
     }
-    const { value, done } = await reader.read();
-    if (value) buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      if (block.trim().length > 0) handleEvent(block);
-      boundary = buffer.indexOf("\n\n");
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
+
+    const toolCalls: ToolCall[] = [];
+    // Preserve original index ordering.
+    const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
+    for (const idx of sortedIndices) {
+      const call = callsByIndex.get(idx)!;
+      if (call.id && call.function.name) toolCalls.push(call);
     }
-    if (done) break;
-  }
-  buffer += decoder.decode();
-  if (buffer.trim().length > 0) handleEvent(buffer);
 
-  const toolCalls: ToolCall[] = [];
-  // Preserve original index ordering.
-  const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
-  for (const idx of sortedIndices) {
-    const call = callsByIndex.get(idx)!;
-    if (call.id && call.function.name) toolCalls.push(call);
+    return {
+      provider,
+      text: textParts.join("").trim(),
+      toolCalls,
+      finishReason,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
   }
-
-  return {
-    provider,
-    text: textParts.join("").trim(),
-    toolCalls,
-    finishReason,
-    responseId,
-    usage,
-    cost: estimateCost(provider, usage)
-  };
 }
 
 // Codex/Responses-API tool-calling. Translates the chat-completions message
