@@ -13,7 +13,7 @@ import {
   normalizeProvider,
   setEchoToolCallingResponse
 } from "../provider";
-import { insertChatBlock, listThreadBlocks, mutateState, readState } from "../state";
+import { insertChatBlock, listChatBlocks, listThreadBlocks, mutateState, readState } from "../state";
 import {
   createChat,
   dispatchNextPendingChatMessage,
@@ -329,11 +329,16 @@ describe("chat message queue", () => {
       agentId: null
     });
     const inFlight = await seedInFlightTask(config, chat.id);
+    // alsoToMain asks the reply to mirror into the main transcript; the flag
+    // must survive the queue so the popped reply still inserts the mirror.
     await submitThreadReply(config, chat.id, "thread_dispatch", {
       content: "queued thread reply",
-      parentBlockId: parent.id
+      parentBlockId: parent.id,
+      alsoToMain: true
     });
-    expect((session(config, chat.id)?.pendingMessages ?? [])[0]?.threadId).toBe("thread_dispatch");
+    const queued = (session(config, chat.id)?.pendingMessages ?? [])[0];
+    expect(queued?.threadId).toBe("thread_dispatch");
+    expect(queued?.alsoToMain).toBe(true);
     const tasksBefore = readState(config.instance).tasks.length;
     // Settle the live turn so the guarded dispatch can pop.
     await settleTask(config, inFlight, "completed");
@@ -352,6 +357,12 @@ describe("chat message queue", () => {
     const userBlock = threadBlocks.find((b) => b.kind === "user_text" && b.text === "queued thread reply");
     expect(userBlock).toBeDefined();
     expect(userBlock?.threadId).toBe("thread_dispatch");
+    // alsoToMain survived the queue: an un-threaded mirror of the reply is
+    // also inserted into the main transcript.
+    const mainMirror = listChatBlocks(config.instance, chat.id).find(
+      (b) => b.kind === "user_text" && b.text === "queued thread reply" && !b.threadId
+    );
+    expect(mainMirror).toBeDefined();
   });
 
   test("a queued main-chat message still drains via the main path, with no thread membership", async () => {

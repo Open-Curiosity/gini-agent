@@ -1067,6 +1067,10 @@ export interface PendingChatMessage {
   // them stays valid.
   threadId?: string;
   parentBlockId?: string;
+  // Carries the thread reply's "also show in main chat" flag so the mirror
+  // block survives the queue (a popped reply that lost it would re-dispatch
+  // without the main-chat mirror).
+  alsoToMain?: boolean;
   createdAt: string;
 }
 

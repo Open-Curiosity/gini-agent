@@ -585,7 +585,9 @@ export async function dispatchNextPendingChatMessage(config: RuntimeConfig, sess
     // A queued thread reply re-dispatches back into its thread; a main-chat
     // message runs as a normal turn. popped.threadId distinguishes them.
     if (popped.threadId) {
-      await runThreadSubmission(config, sessionId, popped.threadId, popped.parentBlockId!, prepared);
+      await runThreadSubmission(config, sessionId, popped.threadId, popped.parentBlockId!, prepared, {
+        alsoToMain: popped.alsoToMain
+      });
     } else {
       await runChatSubmission(config, sessionId, prepared);
     }
@@ -678,7 +680,8 @@ export async function submitThreadReply(
         ...(images.length > 0 ? { images } : {}),
         ...(clientSurface ? { clientSurface } : {}),
         threadId,
-        parentBlockId
+        parentBlockId,
+        alsoToMain: Boolean(input.alsoToMain)
       })
     );
     const updated = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
