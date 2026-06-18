@@ -232,6 +232,36 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Skill-learning feedback capture (ADR skill-learning-from-outcomes.md).
+    // When the user answers a "Skill review" question about whether a recent
+    // action turned out right, the model records the verdict here so the next
+    // review reflects on it. Sync, low-risk: it only appends a SkillOutcome row.
+    toolset: "skills",
+    displayLabel: "Record skill feedback",
+    // Deferred: it's reachable on any turn (a Skill review question can land in
+    // any session) but is only needed when the user is answering one, so it
+    // surfaces by name + summary in the on-demand index and the model loads its
+    // schema via load_tools when it actually needs it. Keeping it out of the
+    // live tools array avoids adding a schema slot to every turn.
+    deferred: true,
+    indexSummary: "Record the user's verdict (right / wrong) on a recent action they were asked about in a Skill review.",
+    type: "function",
+    function: {
+      name: "record_skill_feedback",
+      description: "Record the user's verdict on whether a recent skill-driven action turned out right, in answer to a Skill review question. A negative verdict is attributed to the named skill so it can be improved. Only call this when the user is answering such a question.",
+      parameters: {
+        type: "object",
+        properties: {
+          skill_name: { type: "string", description: "The skill the question was about (e.g. 'apple-notes')." },
+          task_id: { type: "string", description: "The id of the task whose action the user is judging (from the review question)." },
+          ok: { type: "boolean", description: "true if the action turned out right, false if it was wrong." },
+          detail: { type: "string", description: "Optional: what went wrong, when ok is false." }
+        },
+        required: ["task_id", "ok"]
+      }
+    }
+  },
+  {
     // Subagent delegation. Spawns a constrained child task running the
     // chat-task agent loop with its own system prompt and toolset/skill
     // subsets. The dispatch waits for the child to reach a terminal state
@@ -819,6 +849,35 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           }
         },
         required: ["question", "options"]
+      }
+    }
+  },
+  {
+    // User-confirmation affordance. The agent calls this BEFORE an
+    // irreversible action that goes to another person (sending or replying
+    // to a message/email, posting a reply in a web app, submitting or
+    // purchasing on the user's behalf). It surfaces an inline Confirm/Cancel
+    // card in the web chat; the task pauses on a confirmation.request
+    // SetupRequest and resumes with the user's decision. Like ask_user it is
+    // a SetupRequest, so it pauses even under approvalMode "yolo" — yolo
+    // authorizes operational/reversible work, not speaking in the user's
+    // voice to others. Always-on (like request_connector / ask_user): the
+    // model needs this path even on a fresh instance with no toolsets toggled.
+    // See docs/adr/user-confirmation-primitive.md.
+    toolset: "core",
+    displayLabel: "Request confirmation",
+    type: "function",
+    function: {
+      name: "request_confirmation",
+      description: "Ask the user to confirm before an irreversible action that goes to another person — sending or replying to a message or email, posting a reply in a web app, submitting or purchasing on their behalf. The user sees an inline Confirm/Cancel card in chat; the task pauses until they decide, then resumes with { confirmed: true } (do the action) or { confirmed: false } (don't — ask what to change). This fires even when you are otherwise auto-approved (yolo): yolo authorizes operational, reversible work, NOT speaking in the user's voice to others. EXCEPTION: if the user already gave a clear, specific go-ahead for THIS action in the conversation (\"send it\", \"reply yes\", \"you can submit\"), do NOT call this — just execute. This is for consent to send content the user has ALREADY approved; it is never a license to fabricate what they would say — when you lack the substance, ask for it as a normal question instead. Do NOT use this for risk-gated operational actions (those already go through the authorization flow) or for picking between options (use ask_user).",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "One human-readable line stating what will happen if confirmed (e.g. \"Send this reply to Dana in the project thread\"). Shown as the card headline." },
+          details: { type: "string", description: "Optional — the actual content the user is consenting to (the message body, the recipient, the order summary), shown in an expandable section so they can review exactly what goes out." },
+          confirmLabel: { type: "string", description: "Optional label for the confirm button (e.g. \"Send\", \"Submit\", \"Purchase\"). Defaults to \"Confirm\"." }
+        },
+        required: ["summary"]
       }
     }
   },
@@ -2153,6 +2212,12 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // instance can't follow its own skill prompt without a toolset toggle.
     if (tool.function.name === "list_skills") return true;
     if (tool.function.name === "read_skill") return true;
+    // record_skill_feedback (ADR skill-learning-from-outcomes.md) — the model
+    // records the user's answer to a "Skill review" question. Always-on like
+    // read_skill: a review question can land in any session, and the agent must
+    // be able to capture the verdict regardless of toolset state. Low-risk: it
+    // only appends a SkillOutcome row.
+    if (tool.function.name === "record_skill_feedback") return true;
     // Always expose spawn_subagent. Like read_skill it's a runtime
     // capability not tied to a legacy default toolset row, and gating it
     // on enable would silently disable delegation on freshly cloned
@@ -2207,6 +2272,13 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // no toolsets toggled, and it's a meta-tool with no side effects
     // beyond pausing on a user-actor card.
     if (tool.function.name === "ask_user") return true;
+    // request_confirmation is the in-chat affordance for an inline
+    // Confirm/Cancel card before an irreversible third-party-facing
+    // action. Always-on for the same reason as ask_user: the agent must
+    // be able to ask for consent on a fresh instance with no toolsets
+    // toggled, and it's a meta-tool with no side effects beyond pausing
+    // on a user-actor card (it pauses even under approvalMode "yolo").
+    if (tool.function.name === "request_confirmation") return true;
     // browser_fill_secrets is the in-chat affordance for credential
     // entry on the agent's browser tab. Always-on for the same
     // reason as request_connector: a fresh instance with no toolsets
@@ -2622,6 +2694,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.provider));
     case "ask_user":
       return truncatePreview(previewValue(safe.question));
+    case "request_confirmation":
+      return truncatePreview(previewValue(safe.summary));
     case "request_messaging_bridge":
       return truncatePreview(previewValue(safe.kind));
     case "list_messaging_bridges":

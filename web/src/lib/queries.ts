@@ -13,6 +13,7 @@ import type {
   JobRecord,
   JobRunRecord,
   PendingChatMessage,
+  RunRecord,
   RuntimeEvent,
   RuntimeStatus,
   SetupRequest,
@@ -20,7 +21,8 @@ import type {
   SubagentRecord,
   Task,
   TraceRecord,
-  AuditEvent
+  AuditEvent,
+  UsageSource
 } from "@runtime/types";
 import type {
   ChatMessage,
@@ -60,6 +62,31 @@ function scopedPath(path: string, agentId: string | undefined): string {
   if (!agentId) return path;
   const separator = path.includes("?") ? "&" : "?";
   return `${path}${separator}agentId=${encodeURIComponent(agentId)}`;
+}
+
+// One day's token usage from GET /api/usage — the server-side rollup of the
+// durable usage ledger (chat, jobs, subagents, memory, titles, vision …),
+// scoped to the active agent. Mirrors DayUsage in src/state/usage.ts.
+export interface UsageDay {
+  day: string;
+  dayStart: number;
+  input: number;
+  output: number;
+  total: number;
+  estimatedUsd: number;
+  bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
+}
+
+export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
+  const agentId = useActiveAgentId();
+  const { enabled: callerEnabled, ...rest } = options ?? {};
+  return useQuery<UsageDay[]>({
+    queryKey: ["usage", agentId ?? null, days],
+    queryFn: () => api<UsageDay[]>(scopedPath(`/usage?days=${days}`, agentId)),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    ...rest
+  });
 }
 
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
@@ -346,7 +373,7 @@ export function useChatSessions() {
   });
 }
 
-export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
+export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[]; runs: RunRecord[] };
 
 // Statuses where a chat task is no longer producing partial text — used to
 // decide polling cadence below.
@@ -371,6 +398,22 @@ export function useChatSession(id: string | null) {
       const hasInflight = data.tasks?.some((t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status));
       return hasInflight ? 800 : 3000;
     }
+  });
+}
+
+// Run records for one session — used to mark job-delivered chat messages
+// with a "from <job name>" badge. GET /chat/:id returns the session's full
+// run list (incl. kind/jobId); we select just `runs` and join jobId → name
+// against the jobs list at the call site. Far leaner than useChatSession,
+// which polls the full detail at ~800ms while a task is in flight; the badge
+// name set only changes when a new run lands, so ~30s is ample.
+export function useChatRuns(id: string | null) {
+  return useQuery<ChatSessionDetail, Error, RunRecord[]>({
+    queryKey: ["chat-runs", id],
+    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
+    enabled: Boolean(id),
+    refetchInterval: 30_000,
+    select: (detail) => detail.runs ?? []
   });
 }
 

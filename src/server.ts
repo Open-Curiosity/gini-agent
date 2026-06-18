@@ -6,8 +6,10 @@ import "./hooks/builtins"; // registers trusted hook handlers (skill-script) bef
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
+import { runDailyReview } from "./learning/daily-review";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
+import { isRunning } from "./cli/process";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, backfillEmailWatcherJobs, mutateState, now, readState } from "./state";
@@ -47,6 +49,29 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
+
+// Singleton preflight. A gateway is a per-instance, per-port singleton. If a
+// healthy gateway for this instance is already listening on config.port, this
+// process is a duplicate spawn — a supervisor that respawned us while the
+// incumbent is still up, or two overlapping supervisors (launchd core service +
+// a foreground `gini run`). Without this guard the duplicate runs the whole
+// boot (install, writePid, mutateState reconciles) and then Bun.serve throws
+// "Failed to start server. Is port <port> in use?" as an uncaughtException; the
+// supervisor respawns it into a crash loop that floods identical crash reports
+// AND races the incumbent's state.json writes. Defer cleanly instead: log and
+// exit(0) before any boot work or state mutation runs. A free port (the probe's
+// fetch is refused) or a foreign non-gateway holder both fall through to the
+// real bind below, where a genuine conflict still surfaces as a clear error. A
+// legitimate restart frees the port before relaunch (autostart enable() awaits
+// waitForPortFree after bootout), so the probe only fires for a true duplicate.
+if (await isRunning(config)) {
+  appendLog(config.instance, "runtime.boot.incumbent", { port: config.port, pid: process.pid });
+  console.log(
+    `Gini gateway already listening on http://127.0.0.1:${config.port} instance=${config.instance}; duplicate boot exiting.`
+  );
+  process.exit(0);
+}
+
 // Install crash handlers before any runtime work so an uncaughtException or
 // unhandledRejection thrown during boot is still captured. The handler queues a
 // redacted report; nothing is filed here — the on-restart consent flow
@@ -438,6 +463,39 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
   }
 })();
 
+// Skill-learning daily review loop (ADR skill-learning-from-outcomes.md).
+// Modeled on the connector-reprobe loop: a slow, abortable loop that runs the
+// offline review pass (reflect over recent outcomes, propose bounded skill
+// edits, sample feedback questions, post a digest into the dedicated "Skill
+// review" channel) off the agent-turn path. Default 24h; GINI_SKILL_REVIEW_TICK_MS
+// overrides for testing. runDailyReview no-ops cleanly when there's nothing to
+// review, so a quiet instance just posts nothing.
+const SKILL_REVIEW_TICK_INTERVAL_MS = Number(process.env.GINI_SKILL_REVIEW_TICK_MS ?? 24 * 60 * 60 * 1000);
+let skillReviewStopped = false;
+const skillReviewDone: Promise<void> = (async function skillReviewLoop(): Promise<void> {
+  // Wait one interval before the first run so a fresh boot doesn't immediately
+  // post — the review is a slow background cadence, not a startup task.
+  await sleepUnlessStopping(SKILL_REVIEW_TICK_INTERVAL_MS);
+  while (!skillReviewStopped) {
+    try {
+      const report = await runDailyReview(config);
+      if (report.posted) {
+        appendLog(config.instance, "skill_review.posted", {
+          proposals: report.proposalsCreated,
+          findings: report.findingsCreated,
+          feedbackAsked: report.feedbackAsked
+        });
+      }
+    } catch (error) {
+      appendLog(config.instance, "skill_review.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (skillReviewStopped) break;
+    await sleepUnlessStopping(SKILL_REVIEW_TICK_INTERVAL_MS);
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -461,6 +519,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  skillReviewStopped = true;
   // Wake every loop out of its inter-tick sleep so it checks the flag and
   // unwinds now instead of sleeping out its full interval.
   beginShutdown();
@@ -511,6 +570,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
     Promise.all([
       schedulerDone.catch(() => {}),
       reprobeDone.catch(() => {}),
+      skillReviewDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),
       discordDone.catch(() => {}),

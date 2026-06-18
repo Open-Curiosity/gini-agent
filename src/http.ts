@@ -44,7 +44,7 @@ import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect"
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { buildNotificationPreview, type PreviewEvent } from "./integrations/apns/preview";
-import { mobileBootstrap, publicState } from "./runtime/views";
+import { dailyUsage, mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listAccountsWithStatus, registerAccount, removeAccount, retagAccount } from "./integrations/connectors/google-accounts";
@@ -58,6 +58,8 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
+import { runDailyReview } from "./learning/daily-review";
+import { computeSkillScores } from "./learning/score";
 import {
   approvePairing,
   authorizedBearer,
@@ -579,6 +581,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const tasks = readState(config.instance).tasks;
       return json(agentId ? tasks.filter((task) => task.agentId === agentId) : tasks);
     }],
+    ["GET", /^\/api\/usage$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const days = Number(new URL(request.url).searchParams.get("days") ?? 14);
+      return json(dailyUsage(config, { days: Number.isFinite(days) ? days : 14, agentId: agentId ?? undefined }));
+    }],
     ["POST", /^\/api\/tasks$/, async (request) => json(await submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
@@ -717,6 +724,27 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (setup.taskId && choiceToolCallId) {
           void safeResume(config, setup.taskId, choiceToolCallId, toolResult, {
             context: "chat.choice",
+            approvalId: setupId
+          });
+        }
+        return json({ ok: true });
+      }
+
+      if (setup.action === "confirmation.request") {
+        // request_confirmation's Confirm button. The body carries no fields —
+        // hitting /complete IS the confirmation (Cancel is the /cancel
+        // endpoint). Resume the chat-task loop with an unambiguous boolean tool
+        // result {confirmed:true} so the model performs the irreversible action
+        // itself. Same shape as the chat.choice winning path: atomically claim
+        // the row, persist a human-readable outcome (so the resolved card reads
+        // truthfully after reload), then resume detached. No side effects run
+        // here — the agent does the send on resume.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+        await persistConnectOutcome(config, setupId, { ok: true, message: "Confirmed" });
+        const confirmToolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
+        if (setup.taskId && confirmToolCallId) {
+          void safeResume(config, setup.taskId, confirmToolCallId, JSON.stringify({ confirmed: true }), {
+            context: "confirmation.request",
             approvalId: setupId
           });
         }
@@ -1645,6 +1673,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],
     ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, async (_request, params) => json(await reviewImprovement(config, params[0], "reject"))],
+    // Skill-learning read surfaces + manual review trigger (ADR
+    // skill-learning-from-outcomes.md). The review pass otherwise runs on the
+    // slow server loop; POST /review fires it on demand (for testing/dogfood).
+    ["GET", /^\/api\/learning\/outcomes$/, () => json(readState(config.instance).skillOutcomes)],
+    ["GET", /^\/api\/learning\/findings$/, () => json(readState(config.instance).learningFindings)],
+    // Read-only, observational skill reliability scores. Gates nothing — purely
+    // a human-facing indicator (ADR skill-learning-from-outcomes.md).
+    ["GET", /^\/api\/learning\/scores$/, () => json(computeSkillScores(config))],
+    ["POST", /^\/api\/learning\/review$/, async () => json(await runDailyReview(config))],
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],

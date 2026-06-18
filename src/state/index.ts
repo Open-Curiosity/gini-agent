@@ -16,6 +16,8 @@ export {
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
+export { recordUsage, applyUsage, localDayKey, buildDailyUsage, backfillUsageLedger, backfillUsageLedgerOnce } from "./usage";
+export type { DayUsage, DaySourceUsage } from "./usage";
 export { recordProviderAuthFailure, clearProviderAuthFailureIfPresent } from "./provider-auth";
 export {
   getMemoryDb,
@@ -170,6 +172,8 @@ export {
   createJob,
   createJobRun,
   createImprovementProposal,
+  createSkillOutcome,
+  createLearningFinding,
   createPairingCode,
   claimPairingCode,
   revokeDevice,

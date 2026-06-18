@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import type { Authorization, ConnectorRecord, Instance, PairingRequestStatus, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
@@ -45,6 +45,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
       }
     ],
     improvements: [],
+    skillOutcomes: [],
+    learningFindings: [],
     pairingCodes: [],
     pairingRequests: [],
     devices: [],
@@ -63,6 +65,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     emailWatchers: [],
     events: [],
     jobRuns: [],
+    usageLedger: [],
     chatSessions: [],
     chatMessages: [],
     messagingMessages: [],
@@ -84,13 +87,37 @@ export function readState(instance: Instance): RuntimeState {
   return normalizeState(instance, state);
 }
 
+// Monotonic per-process counter that keys each write's temp file. Combined
+// with the pid it makes the temp path unique to a single writeState call.
+let writeStateSeq = 0;
+
 export function writeState(instance: Instance, state: RuntimeState): void {
   ensureDir(instanceRoot(instance));
   state.updatedAt = now();
   const path = statePath(instance);
-  const tempPath = `${path}.tmp`;
+  // Per-write temp filename, NOT a shared `${path}.tmp`. The single-process
+  // model serializes intra-process writes (see mutateState below), but two
+  // processes can briefly overlap — a supervisor respawn racing a draining
+  // incumbent, or an update handoff. With a shared temp name, writer A's
+  // renameSync consumes the temp and writer B's renameSync then ENOENTs.
+  // pid + a monotonic counter keys the temp to this call so concurrent
+  // writers never touch each other's temp; renameSync stays atomic, so a
+  // reader still sees the prior or next state, never a torn write.
+  const tempPath = `${path}.${process.pid}.${(writeStateSeq += 1)}.tmp`;
   writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(tempPath, path);
+  try {
+    renameSync(tempPath, path);
+  } catch (error) {
+    // A unique temp name means a failed rename would otherwise leave the temp
+    // behind to accumulate; clean it up best-effort and surface the original
+    // error to the caller.
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {
+      // Cleanup is best-effort; the rename error is the one that matters.
+    }
+    throw error;
+  }
 }
 
 // Per-instance serialization queue. mutateState is async so concurrent callers
@@ -1156,6 +1183,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   migrateIdentitiesToConnectors(state);
   state.instance = instance;
   state.improvements ??= [];
+  // Skill-learning rows (ADR skill-learning-from-outcomes.md). Default to []
+  // so older state files predating the feature load.
+  state.skillOutcomes ??= [];
+  state.learningFindings ??= [];
   state.connectors ??= [];
   state.tasks ??= [];
   migrateApprovalsToAuthorizationsAndSetupRequests(state);
@@ -1302,6 +1333,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.emailWatchers ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
+  state.usageLedger ??= [];
   state.chatSessions ??= [];
   state.chatMessages ??= [];
   state.runs ??= [];

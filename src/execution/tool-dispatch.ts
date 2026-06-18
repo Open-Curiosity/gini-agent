@@ -24,7 +24,8 @@ import {
   isTerminalTaskStatus,
   mutateState,
   now,
-  readState
+  readState,
+  recordUsage
 } from "../state";
 import { accountSelectionNeeded, addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
@@ -60,6 +61,7 @@ import { dbExecute, dbListTables, dbQuery } from "../state";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
+import { recordFeedbackOutcome } from "../learning/outcomes";
 import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { resolveConnectorSecret } from "../integrations/connectors";
@@ -218,6 +220,8 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
+    case "record_skill_feedback":
+      return { kind: "sync", result: await recordSkillFeedbackTool(config, taskId, args) };
     case "spawn_subagent":
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
@@ -268,6 +272,8 @@ async function dispatchToolCallInner(
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "ask_user":
       return await askUserTool(config, taskId, toolCallId, args);
+    case "request_confirmation":
+      return await requestConfirmationTool(config, taskId, toolCallId, args);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "request_messaging_bridge":
@@ -400,8 +406,21 @@ async function dispatchToolCallInner(
       // and steer the agent to browse headless first; it then only escalates to
       // a Connect prompt when a navigation genuinely reaches such a step.
       // Validate the reason first so a missing reason fails identically
-      // regardless of browser state.
-      requireString(args, "reason");
+      // regardless of browser state. `reason` is schema-required, but a model
+      // can still omit it; surface a recoverable, actionable nudge (matching
+      // the other branches here) instead of a bare throw so the model simply
+      // retries WITH a reason rather than seeing a terse "Error:" line and
+      // stalling (issue #397).
+      if (typeof args.reason !== "string" || args.reason.length === 0) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "browser_connect requires a `reason`: one short user-facing sentence shown on the Connect card (e.g. 'Sign in to GitHub to continue'). Re-call browser_connect with that `reason` (keep the same `url`)."
+          })
+        };
+      }
       // Exempt an explicit headless:true reconnect: the setup skill re-opens
       // the browser invisibly AFTER browser_close (post sign-in), so it has no
       // live session by design. The cold-call misuse is always headless-unset.
@@ -725,8 +744,10 @@ async function accumulateBrowserVisionCost(
   ) {
     return;
   }
+  let visionAgentId: string | undefined;
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    visionAgentId = item.agentId;
     const sum = (a: number | undefined, b: number | undefined): number | undefined => {
       if (a === undefined && b === undefined) return undefined;
       return (a ?? 0) + (b ?? 0);
@@ -742,6 +763,22 @@ async function accumulateBrowserVisionCost(
     };
     item.updatedAt = now();
   });
+  // Also record this out-of-band vision spend into the durable usage ledger
+  // (the home chart's sole source). The same call folds into task.cost above
+  // for the live per-turn display; the chart never sums task.cost, so there is
+  // no double count.
+  void recordUsage(
+    config.instance,
+    { source: "vision", taskId, agentId: visionAgentId },
+    {
+      provider: increment.provider ?? "",
+      model: increment.model ?? "",
+      inputTokens: increment.inputTokens,
+      outputTokens: increment.outputTokens,
+      totalTokens: increment.totalTokens,
+      estimatedUsd: increment.estimatedUsd
+    }
+  ).catch(() => {});
 }
 
 // Classify a host string as one of: loopback (127/8, ::1, "localhost",
@@ -1036,6 +1073,36 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
+}
+
+// Skill-learning feedback capture (ADR skill-learning-from-outcomes.md). The
+// model calls this when the user answers a "Skill review" question about a
+// recent action. It records the verdict as a SkillOutcome with
+// source:"user_feedback" — a negative answer attributed to the named skill so
+// the next review reflects on it. Low-risk: appends one bounded row.
+async function recordSkillFeedbackTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const targetTaskId = requireString(args, "task_id");
+  const ok = args.ok;
+  if (typeof ok !== "boolean") throw new Error("Argument ok must be a boolean.");
+  const skillName = optionalString(args, "skill_name", "");
+  const detail = optionalString(args, "detail", "");
+  // Attribute the feedback row to the agent that ran the judged task when known.
+  const agentId = readState(config.instance).tasks.find((t) => t.id === targetTaskId)?.agentId;
+  const outcome = await recordFeedbackOutcome(config, {
+    skillName: skillName || undefined,
+    taskId: targetTaskId,
+    agentId,
+    ok,
+    detail: detail || undefined
+  });
+  await recordLowRiskAudit(config, taskId, "skill.feedback.recorded", outcome.skillId ?? outcome.id, {
+    taskId: targetTaskId,
+    signal: outcome.signal,
+    skillName: outcome.skillName
+  });
+  return ok
+    ? `Recorded: the action turned out right${outcome.skillName ? ` (${outcome.skillName})` : ""}.`
+    : `Recorded a problem${outcome.skillName ? ` with ${outcome.skillName}` : ""} — the next skill review will look at it.`;
 }
 
 // Generic MCP tool dispatch. Routes (server, tool, arguments) to the
@@ -4134,6 +4201,94 @@ async function askUserTool(
       type: "approval",
       message: "User choice requested (chat-task)",
       data: { approvalId: approval.id, question, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// request_confirmation tool. Mints a confirmation.request SetupRequest whose
+// payload carries the summary + optional details + confirm-button label. The
+// chat-task loop's pending handler emits a setup_requested block and the web
+// chat renders the inline Confirm/Cancel card. POST
+// /api/setup-requests/<id>/complete (Confirm) resumes the loop with tool
+// result {confirmed:true}; /cancel (Cancel) resumes with {confirmed:false} —
+// an unambiguous boolean, not a generic "skipped" string. Modeled on
+// askUserTool: same surface guard, no approval_reason bubble (the summary IS
+// the card content). Because it is a SetupRequest it pauses the task even
+// under approvalMode "yolo" — SetupRequests never call resolveApprovalPolicy.
+// See docs/adr/user-confirmation-primitive.md.
+async function requestConfirmationTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const summary = typeof args.summary === "string" ? args.summary.trim() : "";
+  if (!summary) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_confirmation needs a non-empty `summary` string describing what will happen if confirmed." })
+    };
+  }
+  const details = typeof args.details === "string" && args.details.trim().length > 0
+    ? args.details.trim()
+    : undefined;
+  const confirmLabel = typeof args.confirmLabel === "string" && args.confirmLabel.trim().length > 0
+    ? args.confirmLabel.trim()
+    : "Confirm";
+
+  // Surface guard — same rationale as askUserTool. The Confirm/Cancel card is
+  // React UI rendered only in the web chat; a task running over a messaging
+  // bridge or in a headless job session would park in waiting_approval with no
+  // way to confirm. Fail synchronously so the agent does NOT proceed with the
+  // irreversible action — it should ask for the go-ahead as a regular message
+  // instead and continue from the user's reply.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "The confirmation card only renders in a web chat session — this task isn't attached to one. Do NOT proceed with the irreversible action: ask the user for an explicit go-ahead as a regular message and continue from their reply."
+      })
+    };
+  }
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "confirmation.request",
+      // target = summary so the setup.requested / setup.completed audit rows
+      // (and the setup_requested block summary) record WHAT was confirmed. The
+      // full `details` the user consents to lives verbatim in payload (durable
+      // state), so the consent is auditable end-to-end; a short digest also
+      // rides in the trace below.
+      target: summary,
+      reason: summary,
+      payload: { summary, ...(details ? { details } : {}), confirmLabel, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "User confirmation requested (chat-task)",
+      data: {
+        approvalId: approval.id,
+        summary,
+        confirmLabel,
+        toolCallId,
+        ...(details ? { detailsDigest: details.slice(0, 200) } : {})
+      }
     });
     return approval.id;
   });
