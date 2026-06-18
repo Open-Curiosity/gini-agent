@@ -1,33 +1,14 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+// Importing the shared setup installs the (process-global) module mocks before
+// the component under test is imported. bun's mock.module is process-global, so
+// this file MUST reuse the same react-native/react/theme superset as the other
+// chat component tests (BlockAssistantText.test, linkContextMenu.test) — a
+// divergent narrow mock here clobbers theirs and breaks them when the suite
+// runs in one process (bun's --parallel does not isolate files into processes).
+import { Image, Pressable, Text } from "./chatMockSetup";
 
-// Identity-comparable stand-ins for the native primitives the bubble renders.
-// Tests never mount them; they invoke the component as a function and walk the
-// returned element tree, asserting on element.type and element.props.
-function makeStub(name: string) {
-  const C = () => null;
-  C.displayName = name;
-  return C;
-}
-const Image = makeStub("Image");
-const Pressable = makeStub("Pressable");
-const Text = makeStub("Text");
-const View = makeStub("View");
-
-mock.module("react-native", () => ({
-  Image,
-  Pressable,
-  Text,
-  View,
-  StyleSheet: { create: (s: unknown) => s }
-}));
-
-// Controllable expo-audio mock. The player records the ORDER of method calls so
-// a test can prove a rewind (seekTo) lands before play() on the replay path —
-// the exact ordering that, when violated, starts the AVQueuePlayer at the clip
-// end and is silently stopped (StopAtEnd). `playerStatus` is mutated per-test
-// before invoking the bubble; useAudioPlayerStatus returns it verbatim.
-const calls: string[] = [];
-let seekResolves: Array<() => void> = [];
+// Modules BlockUserText needs that the shared setup doesn't cover. None of the
+// sibling chat components import these, so registering them here can't collide.
 const player = {
   play: mock(() => {
     calls.push("play");
@@ -35,9 +16,10 @@ const player = {
   pause: mock(() => {
     calls.push("pause");
   }),
-  // seekTo is async (returns a Promise) exactly like the native module, so the
+  // seekTo is async (returns a Promise) exactly like the native module, so a
   // test can assert play() is chained AFTER the seek settles, not fired in the
-  // same tick.
+  // same tick — the ordering that, when violated, starts the AVQueuePlayer at
+  // the clip end and is silently stopped (StopAtEnd).
   seekTo: mock((_seconds: number) => {
     calls.push("seekTo");
     return new Promise<void>((resolve) => {
@@ -48,7 +30,8 @@ const player = {
     });
   })
 };
-
+const calls: string[] = [];
+let seekResolves: Array<() => void> = [];
 let playerStatus: {
   playing: boolean;
   currentTime: number;
@@ -61,28 +44,14 @@ mock.module("expo-audio", () => ({
   useAudioPlayerStatus: () => playerStatus
 }));
 
-mock.module("@expo/vector-icons", () => ({ Feather: makeStub("Feather") }));
-
+const openPreview = mock((_: { uri: string; headers: Record<string, string> }) => {});
 mock.module("@/src/api", () => ({
   uploadUrl: (id: string) => `http://gw.local/api/uploads/${id}`,
   authHeader: () => ({ Authorization: "Bearer t" })
 }));
-
-const openPreview = mock((_: { uri: string; headers: Record<string, string> }) => {});
 mock.module("@/src/components/ImagePreview", () => ({
   useImagePreview: () => ({ open: openPreview })
 }));
-
-mock.module("@/src/theme", () => ({
-  theme: {
-    userBubble: "#1A1A1A",
-    userBubbleText: "#FFFFFF",
-    codeChipBg: "#E8E8ED"
-  },
-  family: (name: string, weight = 400) => `${name}_${weight}`
-}));
-
-mock.module("./SelectableBlockText", () => ({ SelectableBlockText: makeStub("SelectableBlockText") }));
 
 const { VoiceBubble, BlockUserText } = await import("@/src/components/chat/BlockUserText");
 
@@ -103,7 +72,7 @@ function flatten(node: El, out: Array<Exclude<El, null | undefined | string | nu
   return out;
 }
 
-// Render the bubble and return the play/pause Pressable's onPress (the toggle).
+// Render the voice bubble and return the play/pause Pressable's onPress (the toggle).
 function getToggle() {
   const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
     audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 4000 }
@@ -115,12 +84,23 @@ function getToggle() {
   return pressable.props.onPress as () => void;
 }
 
+function renderBlock(block: Record<string, unknown>) {
+  return (BlockUserText as unknown as (p: { block: unknown }) => El)({ block });
+}
+
+function textLabels(tree: El): unknown[] {
+  return flatten(tree)
+    .filter((n) => n.type === Text)
+    .map((n) => n.props.children);
+}
+
 beforeEach(() => {
   calls.length = 0;
   seekResolves = [];
   player.play.mockClear();
   player.pause.mockClear();
   player.seekTo.mockClear();
+  openPreview.mockClear();
   playerStatus = { playing: false, currentTime: 0, duration: 0, didJustFinish: false };
 });
 
@@ -183,10 +163,8 @@ describe("VoiceBubble rendering", () => {
     const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
       audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 1000 }
     });
-    const texts = flatten(tree).filter((n) => n.type === Text);
     // The duration label renders 0:09 (decoded) rather than 0:01 (the estimate).
-    const labels = texts.map((n) => n.props.children);
-    expect(labels).toContain("0:09");
+    expect(textLabels(tree)).toContain("0:09");
   });
 
   test("falls back to the client duration before the clip decodes", () => {
@@ -194,17 +172,8 @@ describe("VoiceBubble rendering", () => {
     const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
       audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 4000 }
     });
-    const labels = flatten(tree).filter((n) => n.type === Text).map((n) => n.props.children);
-    expect(labels).toContain("0:04");
+    expect(textLabels(tree)).toContain("0:04");
   });
-});
-
-function renderBlock(block: Record<string, unknown>) {
-  return (BlockUserText as unknown as (p: { block: unknown }) => El)({ block });
-}
-
-beforeEach(() => {
-  openPreview.mockClear();
 });
 
 describe("BlockUserText attachments", () => {
@@ -229,41 +198,39 @@ describe("BlockUserText attachments", () => {
   });
 
   test("renders a non-image attachment as a file chip with type label and size", () => {
-    const labels = flatten(
+    const labels = textLabels(
       renderBlock({ text: "", images: [{ id: "f1", mimeType: "application/pdf", size: 2_500_000 }] })
-    )
-      .filter((n) => n.type === Text)
-      .map((n) => n.props.children);
+    );
     // fileTypeLabel uppercases the mime subtype; formatBytes renders MB at this size.
     expect(labels).toContain("PDF");
     expect(labels).toContain("2.4 MB");
   });
 
   test("formats small and mid-size files as B and KB", () => {
-    const small = flatten(renderBlock({ text: "", images: [{ id: "s", mimeType: "text/csv", size: 512 }] }))
-      .filter((n) => n.type === Text)
-      .map((n) => n.props.children);
+    const small = textLabels(renderBlock({ text: "", images: [{ id: "s", mimeType: "text/csv", size: 512 }] }));
     expect(small).toContain("512 B");
     expect(small).toContain("CSV");
 
-    const kb = flatten(renderBlock({ text: "", images: [{ id: "k", mimeType: "text/plain", size: 4096 }] }))
-      .filter((n) => n.type === Text)
-      .map((n) => n.props.children);
+    const kb = textLabels(renderBlock({ text: "", images: [{ id: "k", mimeType: "text/plain", size: 4096 }] }));
     expect(kb).toContain("4 KB");
   });
 
   test("a mime with no subtype falls back to the whole type for the label", () => {
-    const labels = flatten(renderBlock({ text: "", images: [{ id: "x", mimeType: "weirdtype", size: 10 }] }))
-      .filter((n) => n.type === Text)
-      .map((n) => n.props.children);
+    const labels = textLabels(renderBlock({ text: "", images: [{ id: "x", mimeType: "weirdtype", size: 10 }] }));
     expect(labels).toContain("WEIRDTYPE");
   });
 
-  test("renders the text bubble when the message carries text", () => {
+  test("renders the text bubble (via SelectableBlockText) when the message carries text", () => {
     const tree = renderBlock({ text: "hello there" });
-    const sel = flatten(tree).find((n) => (n.type as { displayName?: string })?.displayName === "SelectableBlockText");
-    expect(sel).toBeTruthy();
-    expect(sel!.props.children).toBe("hello there");
+    // SelectableBlockText is the REAL component (siblings rely on it too); on the
+    // mocked iOS platform it renders a TextInput whose children are the text.
+    const labels = flatten(tree)
+      .flatMap((n) => {
+        const kids = n.props?.children;
+        return Array.isArray(kids) ? kids : [kids];
+      })
+      .filter((k) => typeof k === "string");
+    expect(labels).toContain("hello there");
   });
 
   test("renders a VoiceBubble element when the message carries audio", () => {
@@ -278,7 +245,15 @@ describe("BlockUserText attachments", () => {
 
   test("an image-only message omits the empty text bubble", () => {
     const tree = renderBlock({ text: "", images: [{ id: "img1", mimeType: "image/png", size: 10 }] });
-    const sel = flatten(tree).find((n) => (n.type as { displayName?: string })?.displayName === "SelectableBlockText");
-    expect(sel).toBeUndefined();
+    const voice = flatten(tree).find((n) => n.type === VoiceBubble);
+    expect(voice).toBeUndefined();
+    // No text → the message carries only the image grid (no SelectableBlockText text).
+    const strings = flatten(tree)
+      .flatMap((n) => {
+        const kids = n.props?.children;
+        return Array.isArray(kids) ? kids : [kids];
+      })
+      .filter((k) => typeof k === "string");
+    expect(strings.length).toBe(0);
   });
 });

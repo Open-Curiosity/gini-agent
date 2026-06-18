@@ -22,6 +22,9 @@ export function View() {
 export function Pressable() {
   return null;
 }
+export function Image() {
+  return null;
+}
 export function AnimatedView() {
   return null;
 }
@@ -54,6 +57,7 @@ mock.module("react-native", () => ({
   TextInput,
   View,
   Pressable,
+  Image,
   Share: { share },
   Linking: { openURL: linkingOpenURL },
   StyleSheet: {
@@ -113,7 +117,10 @@ mock.module("@/src/theme", () => ({
     borderStrong: "#D1D1D6",
     accent: "#007AFF",
     assistantBubble: "#E9E9EB",
-    assistantBubbleText: "#1A1A1A"
+    assistantBubbleText: "#1A1A1A",
+    userBubble: "#1A1A1A",
+    userBubbleText: "#FFFFFF",
+    danger: "#FF3B30"
   },
   family: (name: string, weight = 400) => `${name}_${weight}`
 }));
