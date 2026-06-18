@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -19,8 +19,9 @@ import {
   useTasks,
   useUsage
 } from "@/lib/queries";
-import { TokenUsageChart } from "./_components/TokenUsageChart";
+import { TokenUsageChart, TOKEN_USAGE_ALL_AGENTS } from "./_components/TokenUsageChart";
 import type { Authorization, SetupRequest } from "@runtime/types";
+import type { AgentRow } from "@/lib/view-types";
 
 const HOME_APPROVAL_LIMIT = 3;
 
@@ -84,7 +85,14 @@ export default function HomePage() {
   // window, read from the server-side usage ledger via /api/usage. The ledger
   // captures every generative call — chat, jobs, subagents, memory, titles,
   // vision — not just what lands on task.cost, and survives task pruning.
-  const usage = useUsage(TOKEN_HISTORY_DAYS);
+  // Summed across all agents by default; the chart's agent dropdown narrows it.
+  const [usageAgentFilter, setUsageAgentFilter] = useState<string>(TOKEN_USAGE_ALL_AGENTS);
+  const agentsQuery = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const effectiveUsageAgentId = usageAgentFilter === TOKEN_USAGE_ALL_AGENTS ? undefined : usageAgentFilter;
+  const usage = useUsage(TOKEN_HISTORY_DAYS, effectiveUsageAgentId);
 
   return (
     <>
@@ -96,7 +104,12 @@ export default function HomePage() {
           <Stat title="Pending approvals" value={String(pendingTotal)} sub={pendingTotal > 0 ? "needs review" : "all clear"} />
         </div>
 
-        <TokenUsageChart days={usage.data ?? []} />
+        <TokenUsageChart
+          days={usage.data ?? []}
+          agents={agentsQuery.data?.agents ?? []}
+          selectedAgentId={usageAgentFilter}
+          onSelectAgent={setUsageAgentFilter}
+        />
 
         {pendingAuth.length > 0 ? (
           <Card>

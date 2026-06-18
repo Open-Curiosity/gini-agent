@@ -66,7 +66,8 @@ function scopedPath(path: string, agentId: string | undefined): string {
 
 // One day's token usage from GET /api/usage — the server-side rollup of the
 // durable usage ledger (chat, jobs, subagents, memory, titles, vision …),
-// scoped to the active agent. Mirrors DayUsage in src/state/usage.ts.
+// caller-scoped: summed across all agents by default, or filtered to one agent
+// when the caller passes an agentId. Mirrors DayUsage in src/state/usage.ts.
 export interface UsageDay {
   day: string;
   dayStart: number;
@@ -77,14 +78,13 @@ export interface UsageDay {
   bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
 }
 
-export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
-  const agentId = useActiveAgentId();
+export function useUsage(days: number, agentId?: string, options?: Partial<UseQueryOptions<UsageDay[]>>) {
   const { enabled: callerEnabled, ...rest } = options ?? {};
   return useQuery<UsageDay[]>({
     queryKey: ["usage", agentId ?? null, days],
     queryFn: () => api<UsageDay[]>(scopedPath(`/usage?days=${days}`, agentId)),
     refetchInterval: 60_000,
-    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    enabled: callerEnabled ?? true,
     ...rest
   });
 }
