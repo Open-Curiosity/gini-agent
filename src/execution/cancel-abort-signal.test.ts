@@ -29,6 +29,13 @@ import {
 } from "../state";
 import { __inFlightSnapshot } from "./approval-execution";
 import { __turnSnapshot } from "./turn-abort";
+import {
+  addMessagingBridge,
+  checkMessagingBridge,
+  resetMessagingDeps,
+  setMessagingDeps
+} from "../integrations/messaging";
+import type { TelegramClient } from "../integrations/telegram";
 import type { RuntimeConfig, TaskStatus } from "../types";
 
 let scratchHome: string;
@@ -86,6 +93,8 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
   for (const dir of workspaceDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   clearEchoToolCallingResponses();
+  // Drop any injected messaging client so it can't leak into another test.
+  resetMessagingDeps();
 });
 
 function buildConfig(workspaceRoot: string, instance: string, approvalMode: "auto" | "strict" = "auto"): RuntimeConfig {
@@ -522,5 +531,98 @@ describe("per-turn AbortSignal", () => {
     // completed result (resume's emitToolResult is skipped for the abort).
     expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_sleep")).toBe(false);
     expect(readState(config.instance).tasks.find((t) => t.id === task.id)?.status).toBe("cancelled");
+  });
+
+  test("an approved messaging.send aborted mid-send settles `denied`, never `ok` — the bridge swallows the AbortError but the signal still tells the truth", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("approved-msg-abort-not-ok"), "strict");
+
+    // The telegram client holds the send open until the abort fires, then
+    // throws an AbortError. sendMessagingOutput CATCHES that internally and
+    // returns a `status: "failed"` record (it never rejects out), so the
+    // messaging.send branch has no structural `winner === "aborted"` signal —
+    // the only truthful signal is `signal.aborted`. This is the exact gap that
+    // would otherwise let the killed send be painted `ok` by resume's terminal
+    // bail (issue #395 follow-up).
+    const heldClient: TelegramClient = {
+      getMe: async () => ({ id: 11, is_bot: true, username: "ginibot" }),
+      sendMessage: async (_chatId, _text, opts) => {
+        const { promise, reject } = Promise.withResolvers<never>();
+        const sig = opts?.signal;
+        if (sig) {
+          if (sig.aborted) reject(new DOMException("Aborted", "AbortError"));
+          else sig.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        }
+        return promise;
+      },
+      sendChatAction: async () => true as const,
+      sendPhoto: async () => ({ message_id: 2, date: 0, chat: { id: 1, type: "private" } }),
+      getFile: async (fileId) => ({ file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }),
+      downloadFile: async () => new Uint8Array([1, 2, 3]).buffer,
+      getUpdates: async () => []
+    };
+    setMessagingDeps({ telegramClientFactory: () => heldClient });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["chat_x"],
+      botToken: "TOK"
+    });
+    // Health-check so the bridge is `configured` — sendMessagingOutput only
+    // attempts a real send (status starts "sent") for a configured bridge.
+    await checkMessagingBridge(config, bridge.id);
+
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "approved-msg-abort-not-ok", undefined, "agent_m");
+      const t = createTask(config.instance, "send a message", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "waiting_approval";
+      t.mode = "chat";
+      const auth = createAuthorization(state, {
+        taskId: t.id,
+        action: "messaging.send",
+        target: bridge.id,
+        risk: "high",
+        reason: "Send a message",
+        payload: { bridgeId: bridge.id, text: "ping", target: "chat_x", toolCallId: "call_msg" }
+      });
+      t.toolCallState = {
+        messages: [],
+        toolsHash: "h",
+        iterations: 1,
+        pending: [{ toolCallId: "call_msg", toolName: "send_message", approvalId: auth.id }]
+      };
+      t.approvalIds.push(auth.id);
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id, approvalId: auth.id };
+    });
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "send_message",
+      displayLabel: "Send a message",
+      argsPreview: "ping",
+      argsFull: { bridgeId: bridge.id, text: "ping", target: "chat_x" },
+      status: "running",
+      callId: "call_msg",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+
+    // Approve WITHOUT awaiting: the send blocks on the held client. Cancel
+    // once it is genuinely in flight so the abort fires the claimed controller.
+    const approving = decideApproval(config, seeded.approvalId, "approve");
+    await waitFor(() => __inFlightSnapshot(config.instance).some((e) => e.taskId === seeded.taskId));
+
+    await cancelTask(config, seeded.taskId);
+    await approving;
+    await waitFor(() => isTerminalTaskStatus(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status ?? "running"));
+
+    const blocks = listChatBlocks(config.instance, seeded.sessionId);
+    const msgRow = blocks.find((b) => b.kind === "tool_call" && b.callId === "call_msg");
+    // The killed send must NOT read as a success even though the bridge
+    // normalized the AbortError into a `status: "failed"` record.
+    expect(msgRow?.kind === "tool_call" && msgRow.status).toBe("denied");
+    expect(msgRow?.kind === "tool_call" && msgRow.status).not.toBe("ok");
+    expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_msg")).toBe(false);
+    expect(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status).toBe("cancelled");
   });
 });

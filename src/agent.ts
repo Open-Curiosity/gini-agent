@@ -2717,8 +2717,23 @@ async function runApprovedActionImpl(
         { signal }
       );
       resultPayload = { ok: message.status === "sent", messageId: message.id, status: message.status, error: message.error ?? undefined };
+      // Unlike the other side-effecting branches (terminal.exec /
+      // file.* / browser.*), there is no structured `winner === "aborted"`
+      // here: the bridge's outbound path wires `signal` into fetch(), but
+      // sendMessagingOutput CATCHES the fetch AbortError internally and
+      // returns a `status: "failed"` record — the abort never throws out to
+      // our catch below. So a cancel landing mid-send would otherwise leave
+      // `verdict.aborted` false and let resumeChatTask's terminal bail paint
+      // the killed send `ok` (issue #395 follow-up). Detect it via the
+      // signal, gated on the send NOT having reached "sent": a message that
+      // genuinely egressed before the cancel landed (drain window) keeps
+      // status "sent" and stays a real success.
+      if (signal.aborted && message.status !== "sent") verdict.aborted = true;
     } catch (error) {
       resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      // The rare path where sendMessagingOutput itself rejects under
+      // cancellation (rather than normalizing to a failed record).
+      if (signal.aborted) verdict.aborted = true;
     }
     const task = await mutateState(config.instance, (state) => {
       addAudit(
