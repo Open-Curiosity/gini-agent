@@ -107,6 +107,7 @@ import {
   raceWithAbort,
   releaseApproval
 } from "./execution/approval-execution";
+import { abortTurnForTask } from "./execution/turn-abort";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
@@ -422,6 +423,17 @@ function recordInFlightAborted(
   reason: InFlightAbortReason,
   extraEvidence?: Record<string, unknown>
 ): void {
+  // Abort the in-flight MODEL call. The provider streaming call carries the
+  // turn AbortSignal (see src/execution/turn-abort.ts); aborting it here —
+  // inside the caller's mutateState that flips the task terminal — stops the
+  // fetch + SSE reader at the source, so a turn cancelled/failed/denied
+  // mid-stream halts immediately instead of running to the connection's
+  // natural end. The chat-task loop catches the AbortError and bails to the
+  // terminal status this mutation set. Idempotent + harmless when no model
+  // call is in flight (e.g. a task paused at waiting_approval). All three
+  // terminal-flip callers (cancel, fail, sibling-deny) share this path, so
+  // each gets source-level abort uniformly.
+  abortTurnForTask(instance, task.id, reason);
   const aborted = abortApprovalsForTask(instance, task.id, reason);
   if (aborted.length === 0) return;
   addAudit(

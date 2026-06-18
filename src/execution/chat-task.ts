@@ -35,6 +35,7 @@ import {
   ProviderAuthError,
   generateAuxText,
   generateToolCallingResponse,
+  isAbortError,
   isAuthExpiredError,
   isContextOverflowError,
   providerAuthNote,
@@ -114,6 +115,7 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
 import { parseLeadingRouteDirective } from "./route-directive";
+import { registerTurn, releaseTurn } from "./turn-abort";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn, dispatchNextPendingChatMessage } from "./chat";
@@ -623,6 +625,29 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
   await updateRunFromTask(config, task);
 
+  // Resume-path stuck-cursor heal. A boot-resumed orphan (reconcileInFlightTasks
+  // re-dispatches an interrupted running/queued chat task back through here)
+  // left a streaming:true assistant_text block from the dead process. The loop
+  // below mints a FRESH block per iteration and never adopts that orphan, so
+  // without this it would stay stuck at streaming:true forever (the "stuck
+  // cursor"). Settle it now — task-scoped (this task's own block only),
+  // text preserved verbatim, idempotent (no-op when nothing is streaming). This
+  // runs after the task is already flipped to running, so it cannot race a live
+  // writer: the prior process that owned the block is gone, and this turn's
+  // fresh writer hasn't started.
+  const staleStreaming = findInFlightAssistantTextForTask(config.instance, taskId);
+  if (staleStreaming) {
+    const healCtx = resolveEmitContext(config, taskId);
+    if (healCtx) {
+      finalizeAssistantText(healCtx, staleStreaming.blockId, staleStreaming.text);
+      appendTrace(config.instance, taskId, {
+        type: "task",
+        message: "Settled a stale streaming assistant_text block left by a prior process before resuming",
+        data: { blockId: staleStreaming.blockId }
+      });
+    }
+  }
+
   appendTrace(config.instance, taskId, {
     type: "task",
     message: "Chat task started",
@@ -908,7 +933,16 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     }
   });
 
-  return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
+  // Register the per-turn AbortController so cancelTask can abort the in-flight
+  // model call at the source (see src/execution/turn-abort.ts). Released in the
+  // finally on every runLoop exit (completion / pause / cancel / throw) so the
+  // registry never leaks an entry across turns.
+  const turnController = registerTurn(config.instance, taskId);
+  try {
+    return await runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent, turnController.signal);
+  } finally {
+    releaseTurn(config.instance, taskId, turnController);
+  }
 }
 
 // Capture the runtime identity exposed to the model via the ephemeral
@@ -1785,7 +1819,12 @@ async function runLoop(
   messages: ToolCallingMessage[],
   iterationsSoFar: number,
   pendingIdentitySnapshot?: { conversationId: string; snapshot: IdentitySnapshotRecord },
-  inheritedEffective?: EffectiveContext
+  inheritedEffective?: EffectiveContext,
+  // Per-turn abort signal, threaded into every model/aux call so cancelTask
+  // stops the in-flight provider request at the source. The caller owns the
+  // controller's lifecycle via the turn-abort registry (register before this
+  // call, release in a finally); runLoop only reads the signal.
+  turnSignal?: AbortSignal
 ): Promise<Task> {
   // Build the tool catalog once per loop entry. If the user toggles a
   // toolset mid-pause we'll pick up the change on resume — that's a
@@ -2121,6 +2160,26 @@ async function runLoop(
     return exhausted;
   };
 
+  // Bail-out for a turn aborted at the source by cancelTask (the in-flight
+  // model/aux call rejected with an AbortError because the turn AbortSignal
+  // fired). cancelTask already owns the terminal status flip and the
+  // "Cancelled" block emission (it ran the abort inside its mutateState), so
+  // this helper just reads the now-terminal task back and returns it —
+  // mirroring the loop's other terminal-status bail-outs. It never overwrites
+  // status. If the task somehow isn't terminal yet (the abort raced ahead of
+  // cancelTask's commit), the row is still returned as-is; the caller's
+  // terminal guards and cancelTask's own emission converge on the same state.
+  const bailOnTurnAbort = async (): Promise<Task> => {
+    const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+    appendTrace(config.instance, taskId, {
+      type: "task",
+      message: "Chat task bail-out: in-flight model call aborted (turn cancelled)",
+      data: { iterations, status: stale?.status }
+    });
+    await syncSubagentFromTask(config, stale ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
+    return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+  };
+
   while (iterations < cap) {
     iterations += 1;
     // The leading `<route>` directive can only appear on the very first model
@@ -2377,11 +2436,19 @@ async function runLoop(
                 user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
                 maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
               },
-              providerOverride
+              providerOverride,
+              turnSignal
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
             summaryText = aux.text.trim();
           } catch (error) {
+            // Turn-abort: the in-flight compaction aux call was cancelled. Bail
+            // to the cancelled terminal path rather than the partial-result
+            // exit (which would wrongly mark the task completed).
+            if (isAbortError(error)) {
+              await flushChain;
+              return bailOnTurnAbort();
+            }
             // No usable aux model — compaction is impossible, and pruning
             // already failed to bring the projection under the mark.
             appendTrace(config.instance, taskId, {
@@ -2449,9 +2516,19 @@ async function runLoop(
           workingMessages,
           providerTools,
           onDelta,
-          providerOverride
+          providerOverride,
+          turnSignal
         );
       } catch (error) {
+        // Turn-abort: cancelTask aborted the in-flight model call. Drain any
+        // queued flush, then bail to the cancelled terminal path — the abort is
+        // NOT a context overflow (don't compact-and-retry) nor an auth failure
+        // (don't record needs-reauth). cancelTask owns the terminal status flip
+        // and the "Cancelled" block emission; we just stop the loop here.
+        if (isAbortError(error)) {
+          await flushChain;
+          return bailOnTurnAbort();
+        }
         // Tag a provider auth failure with the provider that actually served
         // this turn, so failTask names the right credential even if the active
         // agent switched while the call was in flight (issue #205).
@@ -3400,9 +3477,16 @@ async function runLoop(
         summaryMessages,
         [],
         undefined,
-        providerOverride
+        providerOverride,
+        turnSignal
       );
     } catch (error) {
+      // Turn-abort: the exhaustion-summary call was cancelled. Bail to the
+      // cancelled terminal path — this runs after the main loop, so there is no
+      // in-flight flush to drain.
+      if (isAbortError(error)) {
+        return bailOnTurnAbort();
+      }
       // Same provider-auth tagging as the main loop call, so an expired token
       // on the final summary turn surfaces a named re-auth note instead of a
       // raw failure (issue #205).
@@ -3741,7 +3825,16 @@ export async function resumeChatTask(
     data: { resumedAt: snapshot.iterations }
   });
 
-  const finished = await runLoop(config, taskId, messages, snapshot.iterations);
+  // Register a fresh per-turn AbortController for the resumed turn so a cancel
+  // landing during the resumed model call aborts it at the source, same as a
+  // first turn. Released in the finally on every exit.
+  const turnController = registerTurn(config.instance, taskId);
+  let finished: Task;
+  try {
+    finished = await runLoop(config, taskId, messages, snapshot.iterations, undefined, undefined, turnController.signal);
+  } finally {
+    releaseTurn(config.instance, taskId, turnController);
+  }
   // Drain the per-session queue after an approval resume settles (ADR
   // chat-message-queue.md). The submitTask `.finally` chokepoint only fires
   // for the original runTask promise, which already resolved when the turn

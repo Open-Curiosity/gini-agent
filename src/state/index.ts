@@ -110,6 +110,7 @@ export {
   deleteChatBlocksForSession,
   deleteChatBlock,
   findInFlightAssistantTextForTask,
+  healOrphanedStreamingBlocks,
   taskProducedAssistantText,
   getLatestMessagesBySession,
   subscribeChatBlocks,
