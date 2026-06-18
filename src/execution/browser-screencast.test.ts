@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   ScreencastBridge,
   ScreencastBusyError,
+  ScreencastStaleStartError,
   defaultDeps,
   getOrStartBridge,
   stopActiveBridge,
@@ -958,10 +959,12 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     expect(true).toBe(true);
   });
 
-  test("a stopActiveBridge during an in-flight start tears down the started bridge (no orphan)", async () => {
+  test("a stopActiveBridge during an in-flight start tears down the started bridge and rejects (no orphan)", async () => {
     // Hold start() pending at its fetchJson await via a deferred the test
     // controls, fire stopActiveBridge in that window (the "I've signed in"
     // racing the still-connecting frames request), then release the launch.
+    // The stale start must REJECT (not hand back the now-dead bridge) so the
+    // frames/input caller 409s instead of subscribing to a closed bridge.
     const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
     const socket = new FakeSocket();
     const origAdd = socket.addEventListener.bind(socket);
@@ -986,9 +989,10 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     await Promise.resolve(); // getOrStartBridge builds the bridge + calls start()
     // Teardown fires while start() is parked at the fetchJson await.
     await stopActiveBridge("setup-1");
-    // Release the launch; start() proceeds, opens the socket, and resolves.
+    // Release the launch; start() proceeds, opens the socket, then the
+    // generation-mismatch guard stops the bridge and rejects the stale start.
     openGate();
-    await startP;
+    await expect(startP).rejects.toThrow(ScreencastStaleStartError);
     // The post-start guard fires `void bridge.stop()` (not awaited), so poll the
     // actual condition rather than racing a fixed delay.
     await waitUntil(() => built.length === 1 && built[0].isClosed());

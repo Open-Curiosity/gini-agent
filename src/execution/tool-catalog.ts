@@ -761,8 +761,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription', 'Enter your payment details to finish the booking')." },
           url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to — the sign-in wall, or the page the user must act on. The live browser view shows this exact page, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
-          mode: { type: "string", enum: ["sign-in", "handoff"], default: "sign-in", description: "Which sanctioned use this is. \"sign-in\" (default): clear a sign-in wall — the completion card reads \"I've signed in\". \"handoff\": the user performs a sensitive step themselves (payment entry, final confirmation) — the completion card reads \"I'm done\"." },
-          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / completion flow handles the headed→headless transition automatically.", default: false }
+          mode: { type: "string", enum: ["sign-in", "handoff"], default: "sign-in", description: "Which sanctioned use this is. \"sign-in\" (default): clear a sign-in wall — the completion card reads \"I've signed in\". \"handoff\": the user performs a sensitive step themselves (payment entry, final confirmation) — the completion card reads \"I'm done\"." }
         },
         required: ["reason"]
       }

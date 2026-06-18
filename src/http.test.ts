@@ -2748,6 +2748,76 @@ describe("runtime api", () => {
     expect(r2.status).toBe(404);
   });
 
+  test("open-browser refuses a row cancelled before the stamp mutation (in-mutation status recheck)", async () => {
+    // /open-browser checks pending on a pre-read, then stamps screencast +
+    // signInStarted inside mutateState. A /cancel that commits in that window
+    // must not get a live sign-in stamped on top: the in-mutation status
+    // recheck returns 410 and leaves the cancelled row untouched.
+    const config = testConfig("open-browser-raced-cancel");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    // A live spawned handle so getScreencastPort is non-null (we get past the
+    // 409 no-browser gate and reach the stamp mutation).
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_race" }
+        })
+      );
+      // Cancel the row first — this is the racer that wins.
+      await mutateState(config.instance, (state) => {
+        const row = state.setupRequests.find((s) => s.id === setup.id);
+        if (row) row.status = "cancelled";
+      });
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The pre-read pending gate already 410s here; the in-mutation recheck is
+      // the backstop for a cancel that lands AFTER that gate. Either way the
+      // contract is: no live sign-in stamped on a terminal row.
+      expect(res.status).toBe(410);
+      const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+      expect(after?.status).toBe("cancelled");
+      expect(after?.payload.signInStarted).toBeUndefined();
+      expect(after?.payload.screencast).toBeUndefined();
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
+  });
+
+  test("browser.connect /complete claims the row BEFORE writing the audit row (no duplicate on double-submit)", async () => {
+    // The non-screencast fallback must resolve (claim pending->completed) before
+    // writing the rich browser.connect audit row. A second /complete loses the
+    // claim (ApprovalRaceLostError) and writes ZERO side effects, so exactly one
+    // browser.connect audit row exists no matter how many completes race.
+    const config = testConfig("browser-connect-complete-claim-first");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in to the store",
+        reason: "Sign in to the store",
+        // No screencast marker → the non-screencast fallback path.
+        payload: { toolCallId: "call_complete", reason: "Sign in to the store" }
+      })
+    );
+    const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(first.status).toBe(200);
+    // Second complete on the now-terminal row loses the claim.
+    const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(second.status).toBeGreaterThanOrEqual(400);
+    const browserConnectAudits = readState(config.instance).audit.filter((a) => a.action === "browser.connect");
+    expect(browserConnectAudits).toHaveLength(1);
+  });
+
   test("screencast frames stream a frame and input dispatches with a live bridge", async () => {
     // HTTP success path: install a fake bridge (no real Chrome) so the SSE
     // envelope + input dispatch wiring is exercised end to end at the gateway.
@@ -2912,6 +2982,42 @@ describe("runtime api", () => {
     );
     await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
     expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("cancel stops the owner's bridge unconditionally, even if the row isn't yet stamped screencast", async () => {
+    // /cancel must not gate the bridge teardown on a pre-claim screencast read:
+    // payload.screencast can flip true (via /open-browser) in the window between
+    // that read and the atomic claim. Install a live bridge owned by the setup
+    // on a row that is NOT yet stamped screencast, cancel it, and assert the
+    // bridge is torn down anyway — the unconditional owner-scoped stop.
+    const config = testConfig("screencast-cancel-unstamped");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        // Deliberately NOT stamped screencast/signInStarted yet.
+        payload: { toolCallId: "call_sc_unstamped" }
+      })
+    );
+    let stopped = false;
+    const fakeBridge = {
+      isClosed: () => false,
+      stop: async () => {
+        stopped = true;
+      }
+    } as unknown as import("./execution/browser-screencast").ScreencastBridge;
+    sc.__setActiveBridgeForTest(fakeBridge, setup.id);
+    try {
+      await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+      expect(stopped).toBe(true);
+    } finally {
+      await sc.stopActiveBridge();
+    }
   });
 
   test("a frames request after a screencast complete is rejected (no bridge recreation)", async () => {
@@ -6484,13 +6590,6 @@ function testConfig(instance: string): RuntimeConfig {
   // because the inode is gone. removeMemoryDb closes the cached handle
   // AND unlinks the file + WAL/SHM siblings in one shot.
   removeMemoryDb(instance);
-  // The unreachable-CDP test posts to the real /api/browser/connect route,
-  // which omits the in-process probe override by design. Shrink the probe via
-  // the server-side env knob so the test exercises the 400 mapping without
-  // burning the production probe deadline. Server env, not POST body, so the
-  // network-input boundary stays intact.
-  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
-  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
   // resumeChatTask polls for the loop's flip to waiting_approval before
   // staging a tool result. In-process the flip lands within a couple of
   // mutateState boundaries, and several fill_secret / approval tests seed a

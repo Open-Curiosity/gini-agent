@@ -992,8 +992,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           await stopActiveBridge(setupId);
           return json({ ok: true });
         }
-        const { ok, result } = await completeBrowserConnectSetup(config, setup);
+        // Non-screencast fallback (the user finished acting directly in the
+        // spawned Chrome). Claim the row terminal BEFORE writing the rich
+        // `browser.connect` audit row, mirroring the screencast path above and
+        // the connector/skill branches: a double-submit's loser (or a complete
+        // racing a cancel) throws ApprovalRaceLostError at the claim and writes
+        // ZERO side effects, so the audit row can't be duplicated.
+        const result = JSON.stringify({ success: true, connected: true, mode: "spawned" });
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+        const { ok } = await completeBrowserConnectSetup(config, setup);
         return json({ ok });
       }
 
@@ -1108,12 +1115,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // Resolve (mark terminal) BEFORE stopping the bridge so a racing
       // frames/input request fails the status==="pending" gate instead of
       // recreating an orphaned bridge in the teardown gap.
-      const cancelled = readState(config.instance).setupRequests.find((s) => s.id === params[0]);
-      const wasScreencast = cancelled?.action === "browser.connect" && cancelled.payload.screencast === true;
       const cancelResult = await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false });
-      if (wasScreencast) {
-        await stopActiveBridge(params[0]);
-      }
+      // Stop the bridge unconditionally for the cancelled setup id rather than
+      // gating on a pre-claim screencast read: payload.screencast can flip true
+      // (via /open-browser) in the window between reading and the atomic claim,
+      // so a stale read could skip a teardown that's actually needed.
+      // stopActiveBridge(owner) is owner-scoped — a no-op when nothing or a
+      // DIFFERENT setup holds the bridge — so calling it always is safe.
+      await stopActiveBridge(params[0]);
       return json(cancelResult);
     }],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
@@ -1158,9 +1167,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           409
         );
       }
+      let stamped = false;
       await mutateState(config.instance, (state) => {
         const item = state.setupRequests.find((s) => s.id === setupId);
-        if (!item) return;
+        // Re-check status INSIDE the mutation, not just existence: a /cancel
+        // (or /complete) can commit between the pre-read pending check above and
+        // this lock, and stamping signInStarted/screencast onto an already
+        // terminal row would mark a cancelled sign-in as live.
+        if (!item || item.status !== "pending") return;
+        stamped = true;
         item.payload = {
           ...item.payload,
           signInStarted: true,
@@ -1192,6 +1207,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           });
         }
       });
+      if (!stamped) {
+        // The row was completed/cancelled by a racing request between the
+        // pre-read check and the mutation lock — don't report a live sign-in.
+        const raced = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+        return json({ error: `Setup request is already ${raced?.status ?? "gone"}` }, 410);
+      }
       const refreshedScreencast = readState(config.instance).setupRequests.find((s) => s.id === setupId);
       return json({ ok: true, setupRequest: refreshedScreencast, screencast: true });
     }],
@@ -2017,10 +2038,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
     ["GET", /^\/api\/browser$/, () => json(getBrowserConnection(config))],
-    ["POST", /^\/api\/browser\/connect$/, async (request) => {
-      const payload = await body(request);
-      return json(await connectBrowser(config, payload), 201);
-    }],
+    ["POST", /^\/api\/browser\/connect$/, async () => json(await connectBrowser(config), 201)],
     ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],

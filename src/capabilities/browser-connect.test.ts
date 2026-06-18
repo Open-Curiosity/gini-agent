@@ -61,26 +61,12 @@ describe("browser-connect API surface", () => {
     expect(status.connected).toBe(false);
   });
 
-  test("connect is a no-op acknowledgement (spawn-only transport)", async () => {
+  test("connect is a no-op acknowledgement that writes no record", async () => {
     const config = testConfig("connect-noop");
-    const status = await connectBrowser(config, {});
+    const status = await connectBrowser(config);
     expect(status.connected).toBe(false);
     // No state record is ever written — the spawned Chrome carries no record.
     expect(readState(config.instance).browser ?? null).toBeNull();
-  });
-
-  test("connect ignores its input body and never writes a record", async () => {
-    const config = testConfig("connect-ignores-input");
-    // Even a fully-populated legacy body is ignored: no cdpUrl/managed handling.
-    const status = await connectBrowser(config, { mode: "managed", headless: true });
-    expect(status.connected).toBe(false);
-    expect(readState(config.instance).browser ?? null).toBeNull();
-  });
-
-  test("connect with no args defaults the input and stays a no-op", async () => {
-    const config = testConfig("connect-default-args");
-    const status = await connectBrowser(config);
-    expect(status.connected).toBe(false);
   });
 
   test("disconnect drops the in-process handle and reports disconnected", async () => {

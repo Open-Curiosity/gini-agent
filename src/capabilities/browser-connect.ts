@@ -43,35 +43,13 @@ export function getBrowserConnection(_config: RuntimeConfig): Status {
   return { connected: false };
 }
 
-// PUBLIC input shape — accepted directly from authenticated callers (HTTP
-// POST /api/browser/connect body, CLI). The spawn-only transport takes no
-// connection parameters (no cdpUrl, no managed-window toggle); the body is
-// ignored and connect/disconnect are no-ops that report the stable status.
-// Kept as a named type so the HTTP route and callers stay typed.
-export interface ConnectInput {
-  // Reserved for forward-compatibility with a future remote provider. The
-  // spawn-only transport ignores every field.
-  mode?: "managed";
-  headless?: boolean;
-}
-
-// INTERNAL options — never plumbed from network input. Lives as a separate
-// argument to `connectBrowser` so it can't be smuggled in through the POST
-// body. Retained for the in-process tool-dispatch caller's contract; the
-// spawn-only transport ignores it.
-interface InternalConnectOptions {
-  skipAudit?: boolean;
-}
-
 // Idempotent connect. The runtime always drives a single spawned Chrome, so
 // there is nothing to launch or attach here — the next browser_* tool call
 // lazily spawns the per-instance Chrome via ensureShared(). This stays as a
-// thin acknowledgement so the HTTP route and CLI keep a stable contract.
-export async function connectBrowser(
-  _config: RuntimeConfig,
-  _input: ConnectInput = {},
-  _internal: InternalConnectOptions = {}
-): Promise<Status> {
+// thin acknowledgement so the HTTP route and CLI keep a stable contract. The
+// spawn-only transport takes no connection parameters, so any POST body is
+// ignored.
+export async function connectBrowser(_config: RuntimeConfig): Promise<Status> {
   return { connected: false };
 }
 

@@ -101,7 +101,6 @@ import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserDownloadApproved, browserUploadFileApproved } from "./tools/browser";
-import { connectBrowser } from "./capabilities/browser-connect";
 import { findSkillScript, invokeSkillScript } from "./capabilities/skill-scripts";
 import {
   abortApprovalsForTask,
@@ -1504,11 +1503,11 @@ export async function resolveAuthorization(
 
 // Resolve a SetupRequest. The user-actor flow: the HTTP handler claims the
 // row here (pending → completed/cancelled) and runs the action's side
-// effects around that claim per the action's designed flow —
-// browser.connect runs connectBrowser BEFORE resolving; connector
-// create+probe, playwright fill, and messaging connect/remove/pairing run
-// AFTER the claim wins. No side-effect dispatch happens here — that's the
-// difference from resolveAuthorization. See
+// effects around that claim per the action's designed flow — browser.connect
+// claims FIRST and then writes its audit row / tears down the screencast
+// bridge; connector create+probe, playwright fill, and messaging
+// connect/remove/pairing run AFTER the claim wins. No side-effect dispatch
+// happens here — that's the difference from resolveAuthorization. See
 // docs/adr/authorization-vs-setup-request.md.
 
 // Whether completing a setup request emits a non-terminal `Working: <action>`
@@ -1517,8 +1516,9 @@ export async function resolveAuthorization(
 // network calls), so the activity scan must read "running" — not a stale
 // waiting_approval — while they execute, mirroring the authorization approve
 // path. false: emitting would lie —
-//   - browser.connect runs its side effects BEFORE the claim and the resolve
-//     itself stages the toolResult resume;
+//   - browser.connect's completion is near-instant (claim, then write an audit
+//     row / stop the screencast bridge) and the resolve itself stages the
+//     toolResult resume;
 //   - skill.grant_connector's multi-credential flow mints the NEXT grant card
 //     without a new gate block, and the old gate block staying newest is what
 //     keeps the thread truthfully waiting on the next credential.

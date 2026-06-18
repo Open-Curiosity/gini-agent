@@ -4,7 +4,6 @@ import { api } from "@/lib/api";
 import { openResilientEventSource } from "@/lib/resilient-event-source";
 import type {
   Authorization,
-  BrowserConnectionRecord,
   ChatBlock,
   ConnectorRecord,
   EmailWatcherRecord,
@@ -921,62 +920,6 @@ export function useRenameChatSession() {
       api<ChatSession>(`/chat/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
-    }
-  });
-}
-
-// Browser-connect status. Shape mirrors the gateway response from
-// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
-// Polled every 5s when idle, and every 1s while a connect/disconnect
-// mutation is in flight, so the status card reflects an external `gini
-// browser connect/disconnect` without a manual refresh.
-export interface BrowserConnectionStatus {
-  connected: boolean;
-  record?: BrowserConnectionRecord;
-}
-
-// Polls `GET /api/browser` to keep the Settings browser panel in sync with the
-// runtime. The default cadence is 5s when nothing's happening — that's
-// well below the 3-minute Chrome dev-tools cookie lifetime and noticeably
-// less chatter than the previous 3s. Pass `isActive: true` while a
-// connect / disconnect mutation is in flight to drop to 1s; once
-// settled the caller flips the flag back. We deliberately do NOT switch
-// to SSE — the cost of holding an EventSource open across every chat
-// session that lands the Settings panel outweighs the gain.
-export function useBrowserConnection(options?: { isActive?: boolean }) {
-  const isActive = options?.isActive ?? false;
-  return useQuery<BrowserConnectionStatus>({
-    queryKey: ["browser"],
-    queryFn: () => api<BrowserConnectionStatus>("/browser"),
-    refetchInterval: isActive ? 1000 : 5000
-  });
-}
-
-export function useConnectBrowser() {
-  const qc = useQueryClient();
-  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string; port?: number }>({
-    mutationFn: (input) =>
-      api<BrowserConnectionStatus>("/browser/connect", {
-        method: "POST",
-        body: JSON.stringify(input)
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["browser"] });
-      qc.invalidateQueries({ queryKey: ["events"] });
-      qc.invalidateQueries({ queryKey: ["audit"] });
-    }
-  });
-}
-
-export function useDisconnectBrowser() {
-  const qc = useQueryClient();
-  return useMutation<BrowserConnectionStatus, Error, void>({
-    mutationFn: () =>
-      api<BrowserConnectionStatus>("/browser/disconnect", { method: "POST" }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["browser"] });
-      qc.invalidateQueries({ queryKey: ["events"] });
-      qc.invalidateQueries({ queryKey: ["audit"] });
     }
   });
 }

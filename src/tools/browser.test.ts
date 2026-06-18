@@ -34,8 +34,7 @@ import {
   safetyCheck,
   sanitizeDownloadFilename,
   setBrowserInstance,
-  setBrowserRecording,
-  withTeardownLock
+  setBrowserRecording
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
 import { resolveSetupRequest } from "../agent";
@@ -2746,53 +2745,11 @@ describe("chromeProfileDirFor", () => {
   });
 });
 
-// Round-1 fix: withTeardownLock holds the admission gate closed across
-// the disconnect-then-launch (Connect) and disconnect-then-rm (Wipe)
-// critical sections. Without it, an admission landing between the two
-// awaits could re-acquire the profile lock with a fresh headless
-// persistent context and fight the caller for the dir.
-describe("withTeardownLock", () => {
-  afterEach(() => {
-    browserTest.uninstallFakeBrowserForTest();
-    browserTest.clearFakeSessionsForTest();
-    browserTest.setInFlightDisconnectsForTest(0);
-    browserTest.clearPendingSharedForTest();
-  });
-
-  test("rejects parallel withSession admissions while the lock is held", async () => {
-    let release: () => void = () => undefined;
-    const released = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const lockPromise = withTeardownLock(async () => {
-      await released;
-    });
-    // Yield so withTeardownLock has actually entered (incremented the
-    // generation + inFlightDisconnects) before we attempt the admission.
-    await new Promise((resolve) => setImmediate(resolve));
-    const result = await browserNavigate("teardown-lock-task", { url: "https://example.com/" });
-    const parsed = JSON.parse(result) as { success: boolean; error?: string };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/disconnecting/i);
-    release();
-    await lockPromise;
-  });
-
-  test("restores the gate when fn throws so future admissions can land", async () => {
-    await expect(
-      withTeardownLock(async () => {
-        throw new Error("boom");
-      })
-    ).rejects.toThrow(/boom/);
-    expect(browserTest.inFlightDisconnectsForTest()).toBe(0);
-  });
-});
-
-// Round-1 fix: disconnectSharedBrowser must await any in-flight launch
-// (pendingShared) before tearing down. A slow launchPersistentContext
-// started just before disconnect can otherwise complete after the drain
-// and install itself into `shared`, holding the profile lock against
-// the Connect/Wipe that's running this teardown.
+// disconnectSharedBrowser must await any in-flight launch (pendingShared)
+// before tearing down. A slow launchPersistentContext started just before
+// disconnect can otherwise complete after the drain and install itself into
+// `shared`, holding the profile lock against the Connect/Wipe that's running
+// this teardown.
 describe("disconnectSharedBrowser pending-launch handling", () => {
   afterEach(() => {
     browserTest.uninstallFakeBrowserForTest();
@@ -6412,7 +6369,7 @@ describe("dispatchToolCall(browser_connect)", () => {
   // (the web card / completion contract reads it). With the spawn-only
   // transport there is no managed relaunch, so completion ignores it and
   // returns mode "spawned"; the flag's job is purely the card wording.
-  test("dispatch with headless: true forwards the flag through the approval payload", async () => {
+  test("dispatch ignores a legacy headless arg and never puts it on the payload", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-headless");
@@ -6441,8 +6398,9 @@ describe("dispatchToolCall(browser_connect)", () => {
       if (result.kind !== "pending") throw new Error("unreachable");
       const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
       if (!pendingSetup) throw new Error("setup request not minted");
-      // Flag rode the setup payload from request -> /complete.
-      expect(pendingSetup.payload.headless).toBe(true);
+      // The spawn-only transport dropped the headless param: a stray legacy
+      // headless arg is ignored, never carried onto the setup payload.
+      expect(pendingSetup.payload).not.toHaveProperty("headless");
       const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
       const setup = await resolveSetupRequest(config, result.approvalId, "complete", {
         actor: "user",
@@ -6500,7 +6458,6 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(signInSetup?.payload).toEqual({
       reason: "Sign in to the store",
       toolCallId: "call_mode_default",
-      headless: false,
       url: "https://store.example.com/checkout"
     });
 

@@ -717,6 +717,17 @@ export class ScreencastBusyError extends Error {
   }
 }
 
+// Raised when a bridge start resolves AFTER a teardown bumped the generation:
+// the freshly-built bridge was stopped instead of installed, so the caller must
+// not receive it. The HTTP layer maps this to a 409 (the modal reconnects and
+// re-hits the now-non-pending gate).
+export class ScreencastStaleStartError extends Error {
+  constructor() {
+    super("The sign-in screencast was torn down while connecting.");
+    this.name = "ScreencastStaleStartError";
+  }
+}
+
 // Get the live bridge for `owner` (the setupRequest id), creating + starting one
 // if none is active (or the previous one closed). A request from a DIFFERENT
 // owner while the bridge is held throws ScreencastBusyError → 409, so two
@@ -743,10 +754,15 @@ export async function getOrStartBridge(
     .start(prefer?.preferUrl, prefer?.preferTargetId)
     .then(() => {
       // A teardown landed while we were starting — don't install this bridge;
-      // stop it so its CDP socket isn't orphaned.
+      // stop it so its CDP socket isn't orphaned, and REJECT rather than handing
+      // back the now-dead bridge. Returning it would let the frames/input
+      // handler subscribe to a closed bridge (its onClose already fired and
+      // cleared subscribers), leaving the SSE stream dangling on keepalives and
+      // input calls silently no-op'ing. The reject surfaces as a 409 so the
+      // modal's EventSource reconnects and re-hits the now-non-pending gate.
       if (bridgeGeneration !== startedAtGeneration) {
         void bridge.stop();
-        return bridge;
+        throw new ScreencastStaleStartError();
       }
       activeBridge = bridge;
       activeOwner = owner;

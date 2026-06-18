@@ -421,17 +421,13 @@ async function dispatchToolCallInner(
           })
         };
       }
-      // Exempt an explicit headless:true reconnect: the setup skill re-opens
-      // the browser invisibly AFTER browser_close (post sign-in), so it has no
-      // live session by design. The cold-call misuse is always headless-unset.
-      const headlessReconnect = args.headless === true;
       // "Open page" means a live session on a real http(s) URL — the same
       // notion browser_fill_secrets uses. sanitizeUrlForAuditTarget returns
       // undefined when there's no session, the page is about:blank, or the
       // scheme isn't http(s) (chrome://, data:, …) — none of which can host a
       // sign-in wall to clear.
       const hasOpenPage = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId)) !== undefined;
-      if (!headlessReconnect && !hasOpenPage) {
+      if (!hasOpenPage) {
         return {
           kind: "sync",
           result: JSON.stringify({
@@ -3591,12 +3587,12 @@ function connectWallHost(url: string | undefined): string {
   }
 }
 
-// Approval-gated browser_connect. Spawns a visible managed Chrome
-// after user consent. The reason flows onto the approval row's
-// evidence so the UI can render a friendlier label ("Open a browser
-// window — <reason>") instead of the generic terminal-exec card.
-// The actual connectBrowser() call runs in agent.executeApprovedAction's
-// "browser.connect" branch.
+// Approval-gated browser_connect. Mints a `browser.connect` SetupRequest that
+// surfaces the in-chat Connect card; on completion the user signs in through a
+// screencast of the agent's already-running spawned headless Chrome (no visible
+// window is ever opened — issue #420). The reason flows onto the approval row's
+// evidence so the UI can render a friendlier label instead of the generic
+// terminal-exec card.
 async function requestBrowserConnect(
   config: RuntimeConfig,
   taskId: string,
@@ -3605,20 +3601,11 @@ async function requestBrowserConnect(
   reasonOverride?: string
 ): Promise<string> {
   const reason = requireString(args, "reason");
-  // Headless is opt-in: only honor an explicit boolean true. Anything else
-  // (undefined, false, non-boolean) maps to the existing visible default
-  // so legacy callers that never set the field keep getting a headed
-  // managed Chrome. The flag rides on the approval payload so the
-  // executor in agent.ts can pass it through to connectBrowser when the
-  // user approves.
-  const headless = args.headless === true;
-  // Target URL — the page the agent was trying to reach. When the user clicks
-  // "Connect" the open-browser endpoint launches visible Chrome and navigates
-  // here directly, so the user lands on the sign-in form instead of an empty
-  // about:blank. Falls back to the live page URL when the model omits `url`,
-  // which also keeps the loop-guard dedupe key consistent with the dispatch.
-  // Validated minimally; safetyCheck runs server-side in the open-browser
-  // endpoint before navigation.
+  // Target URL — the page the agent was trying to reach. The screencast binds
+  // to the page the agent already drove to, so this rides the payload as a
+  // fallback hint and keeps the loop-guard dedupe key consistent with the
+  // dispatch. Validated minimally; safetyCheck runs server-side in the
+  // open-browser endpoint.
   const url = resolveConnectUrl(args, taskId);
   // Handoff mode is opt-in: only an explicit mode:"handoff" rides the payload
   // (it flips the web card's completion button from "I've signed in" to
@@ -3637,15 +3624,15 @@ async function requestBrowserConnect(
       // it prominently. The web UI also reads evidence.reason for
       // the body when rendering a browser.connect card.
       target: reason,
-      reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
+      reason: reasonOverride ?? "Signing in through the agent's browser requires explicit approval.",
+      payload: { reason, toolCallId, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
+      data: { approvalId: approval.id, reason, toolCallId, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     return approval.id;
   });

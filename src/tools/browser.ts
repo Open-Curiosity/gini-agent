@@ -979,34 +979,6 @@ export async function disconnectSharedBrowser(): Promise<void> {
   }
 }
 
-// Run `fn` with the disconnect admission gate held closed for the entire
-// duration. Guarantees that no new agent tool call can land between a
-// disconnect-then-launch sequence in the caller's critical section (a future
-// remote provider that relaunches against the shared profile dir needs this).
-//
-// Without this lock, the disconnectSharedBrowser-internal generation bump
-// only blocks new admissions while disconnect itself is running. As soon
-// as disconnect returns control to the caller, the gate reopens, and any
-// admission that lands between `await disconnectSharedBrowser()` and the
-// next step (launchPersistentContext, or fs.rm) sneaks back in — racing the
-// caller for the profile dir lock.
-//
-// Mechanics: bump the generation at entry so any in-flight or
-// freshly-arriving admission sees a generation mismatch and bails with
-// the standard "Browser disconnecting" sentinel. Increment
-// `inFlightDisconnects` so withSession's cheap short-circuit also rejects.
-// Restore both in a `finally` so a thrown `fn` doesn't wedge the
-// admission gate closed forever.
-export async function withTeardownLock<T>(fn: () => Promise<T>): Promise<T> {
-  disconnectGeneration++;
-  inFlightDisconnects++;
-  try {
-    return await fn();
-  } finally {
-    inFlightDisconnects--;
-  }
-}
-
 export async function closeAll(): Promise<void> {
   // Bump the generation so an in-flight launch that resolves during this
   // teardown sees the mismatch and tears its own handle down instead of
