@@ -112,7 +112,7 @@ a generic `aps.alert` envelope. The `threadId` lets the NSE ask the
 gateway for the **thread's** own latest reply instead of the main chat's,
 so a notification fired by threaded work previews the right text. No
 `category` is attached — the only action is the default tap, which
-deep-links to the chat detail via the existing response listener.
+deep-links to the chat detail (see "Tap routing + cold-start recovery").
 
 The "no active subscription" check is per-device, not per-credential:
 two iOS installs of the same human can be in different app states
@@ -200,11 +200,14 @@ lock-screen entry always reflects the newest assistant reply.
   foregrounds (Approve runs only after the OS-required unlock). Failures
   schedule a follow-up local notification ("Failed to approve — open the
   app to retry") so a network blip doesn't silently lose the action.
-- iOS only invokes the response listener if the app is at least
-  suspended. If the user has killed the app from the app switcher,
-  iOS doesn't run JS — the user must open the app and approve from
-  there. The approval remains pending in the runtime until acted on
-  (the runtime has no retry loop that re-emits approval requests).
+- iOS only invokes the response listener for an **action button** if the
+  app is at least suspended. If the user has killed the app from the app
+  switcher, iOS doesn't run JS — the user must open the app and approve from
+  there. The approval remains pending in the runtime until acted on (the
+  runtime has no retry loop that re-emits approval requests). This killed-app
+  limitation is specific to the non-foregrounding Approve / Deny actions; a
+  plain **tap** launches the app and is recovered separately (see "Tap
+  routing + cold-start recovery").
 
 ## Action endpoints
 
@@ -217,6 +220,49 @@ Both already enforce authentication, idempotency, and the audit-trail
 semantics from [Approval And Audit Substrate](./approval-and-audit-substrate.md).
 Adding push as a new caller required zero changes to the action
 endpoints themselves — the new surface is purely a delivery layer.
+
+## Tap routing + cold-start recovery
+
+A default tap (no action button) on any alert push must open the chat the
+push names — `/chat/:sessionId`, or `/chat/:sessionId/thread/:threadId`
+when the payload carries a `threadId` (the main chat filters threaded
+blocks out, so a threaded completion has to open the thread view or it
+would hide the very reply the banner previewed). The `sessionId` /
+`threadId` parse and the route construction are shared by both delivery
+paths below, so a tap routes identically regardless of app state:
+
+- **App alive (foreground or suspended)**: iOS replays the tap through
+  `addNotificationResponseReceivedListener`. The listener
+  (`mobile/src/push.ts`) hands the response to
+  `dispatchNotificationResponse` (`mobile/src/push-dispatch.ts`), whose
+  default-tap branch calls `navigateToChat`.
+- **App killed (cold start)**: iOS does **not** replay the launch tap
+  through the response listener — there is no live JS runtime at tap time,
+  and the listener installed during the subsequent launch only sees taps
+  that arrive *after* it subscribes. The launch tap is recoverable only via
+  `Notifications.getLastNotificationResponse()`. The authed landing screen
+  (`channels`) calls `consumeLaunchNotificationRoute()` on mount: it reads
+  that stored response, routes it through the shared
+  `resolveLaunchTapRoute` (same id-parse as the live path), pushes the
+  named chat on top of the channels list (a natural channels → chat back
+  stack), then calls `Notifications.clearLastNotificationResponse()` so a
+  later remount can't navigate a second time off the same tap. Running it
+  on the authed screen — after the `index` auth gate has already bounced an
+  unauthed/expired credential to `/setup` — keeps a cold-start tap from
+  deep-linking into a 401.
+
+`resolveLaunchTapRoute` returns null (no navigation) for an `APPROVE` /
+`DENY` action launch and for any payload without a `sessionId` (a silent
+wake or malformed payload), so only genuine deep-link taps navigate. Both
+the live-tap and launch-tap paths funnel through the single `navigateToChat`
+helper and the single id-parse (`readRouting`), so the two app states can
+never drift to different routes.
+
+Note this is distinct from the killed-app **Approve / Deny** limitation
+below: those actions are non-foregrounding and resolve the authorization in
+a background handler that iOS won't run for a killed app. The default-tap
+deep-link, by contrast, *does* launch the app, and the launch-tap consume
+recovers it.
 
 ## Token lifecycle
 

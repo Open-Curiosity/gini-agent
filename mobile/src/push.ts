@@ -47,7 +47,8 @@ import {
   APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
-  dispatchNotificationResponse
+  dispatchNotificationResponse,
+  resolveLaunchTapRoute
 } from "./push-dispatch";
 import {
   bumpGeneration,
@@ -198,6 +199,56 @@ export async function refreshBadge(): Promise<void> {
     // network blips; the next event-driven refresh will catch up.
     if (error instanceof ApiError && error.status === 401) return;
     // swallow — badge accuracy is best-effort
+  }
+}
+
+// Deep-links to the chat (or thread) a notification names. A threaded
+// completion opens the thread view — the main chat filters threaded blocks
+// out, so opening it would hide the reply the banner previewed. Shared by
+// the live-tap response listener and the cold-start launch-tap consume so
+// both navigate to exactly the same route.
+function navigateToChat(sessionId: string, threadId: string | null): void {
+  router.push(
+    threadId
+      ? `/chat/${sessionId}/thread/${threadId}`
+      : `/chat/${sessionId}`
+  );
+}
+
+// Cold-start launch-tap recovery. When the app is launched from a fully
+// killed state by a notification tap, iOS does NOT replay that tap through
+// the response listener (the listener only fires for taps received while
+// the JS runtime is already alive). `getLastNotificationResponse()` returns
+// the tap that launched the process; we route it to the right chat, then
+// clear it so a later remount can't navigate a second time off the same tap.
+//
+// Called from the authed landing screen (channels) on mount — running it
+// post-auth-gate means a missing/dead credential still lands on /setup
+// rather than deep-linking into a 401. Best-effort and iOS-gated: any
+// failure leaves the user on the screen they're already on.
+//
+// Approve/Deny action launches resolve to null in resolveLaunchTapRoute, so
+// they never navigate here. Returns the route it navigated to (or null) so
+// callers/tests can assert the outcome.
+export function consumeLaunchNotificationRoute(): { sessionId: string; threadId: string | null } | null {
+  if (Platform.OS !== "ios") return null;
+  try {
+    const last = Notifications.getLastNotificationResponse();
+    if (!last) return null;
+    const route = resolveLaunchTapRoute(last);
+    // Clear unconditionally once observed: even a non-navigable launch
+    // response (silent wake, malformed) should not linger and be
+    // re-evaluated on the next mount.
+    Notifications.clearLastNotificationResponse();
+    if (!route) return null;
+    navigateToChat(route.sessionId, route.threadId);
+    return route;
+  } catch {
+    // getLastNotificationResponse / clearLastNotificationResponse can throw
+    // in unusual states (native module not ready on a very early mount).
+    // The next mount retries; a missed deep-link just leaves the user on
+    // the channels home, which is a safe landing.
+    return null;
   }
 }
 
@@ -408,17 +459,7 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
           void dispatchNotificationResponse(response, {
             apiCall: (path, init) => api(path, init),
-            navigate: (sessionId, threadId) => {
-              // expo-router uses dynamic segments via the bracketed path.
-              // A threaded completion deep-links into the thread view — the
-              // main chat filters threaded blocks out, so opening it would
-              // hide the reply the banner previewed.
-              router.push(
-                threadId
-                  ? `/chat/${sessionId}/thread/${threadId}`
-                  : `/chat/${sessionId}`
-              );
-            },
+            navigate: navigateToChat,
             notifyFailure: notifyActionFailure
           });
         });

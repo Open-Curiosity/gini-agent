@@ -67,6 +67,68 @@ export type NotificationDispatchOutcome =
   | { kind: "deny-failed"; approvalId: string }
   | { kind: "ignored" };
 
+// The deep-link route a notification tap resolves to. `threadId` is set
+// only for a threaded completion (the tap opens the thread view); a plain
+// main-chat tap carries null.
+export interface LaunchTapRoute {
+  sessionId: string;
+  threadId: string | null;
+}
+
+// Reads the routing fields the server-side dispatcher writes into a push
+// payload's `body` object (surfaced by expo-notifications as
+// `content.data`). Shared by the live-tap dispatcher and the cold-start
+// launch-tap resolver so both parse the wire shape identically.
+function readRouting(data: unknown): {
+  sessionId: string | null;
+  approvalId: string | null;
+  threadId: string | null;
+} {
+  const raw = data as
+    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
+    | null
+    | undefined;
+  return {
+    sessionId: typeof raw?.sessionId === "string" ? raw.sessionId : null,
+    approvalId: typeof raw?.approvalId === "string" ? raw.approvalId : null,
+    threadId: typeof raw?.threadId === "string" ? raw.threadId : null
+  };
+}
+
+/**
+ * Resolves the chat route a notification tap should open, or null when the
+ * response is not a navigable tap.
+ *
+ * This is the cold-start counterpart to `dispatchNotificationResponse`'s
+ * deep-link branch. When the app is launched from a fully-killed state by a
+ * notification tap, iOS does NOT replay the tap through
+ * `addNotificationResponseReceivedListener` — the only way to recover it is
+ * `Notifications.getLastNotificationResponse()`. The launch screen feeds that
+ * stored response here to decide where to navigate.
+ *
+ * Returns null (no navigation) for:
+ *   - an APPROVE / DENY action launch — those resolve the authorization via
+ *     the background action handler, not by opening a chat. (In practice the
+ *     non-foregrounding actions don't cold-launch the app, but guarding here
+ *     keeps the resolver correct for any action that ever opens to foreground.)
+ *   - a payload with no sessionId (silent wake, malformed, or a non-routing
+ *     notification).
+ *
+ * A genuine default tap returns `{ sessionId, threadId }`; threadId is
+ * non-null only for a threaded completion, matching the live-tap branch.
+ */
+export function resolveLaunchTapRoute(response: ResponseLike): LaunchTapRoute | null {
+  if (
+    response.actionIdentifier === APPROVE_ACTION ||
+    response.actionIdentifier === DENY_ACTION
+  ) {
+    return null;
+  }
+  const { sessionId, threadId } = readRouting(response.notification.request.content.data);
+  if (!sessionId) return null;
+  return { sessionId, threadId };
+}
+
 export interface DispatchDeps {
   apiCall: <T = unknown>(path: string, init?: { method?: string }) => Promise<T>;
   navigate: (sessionId: string, threadId: string | null) => void;
@@ -107,13 +169,9 @@ export async function dispatchNotificationResponse(
   response: ResponseLike,
   deps: DispatchDeps
 ): Promise<NotificationDispatchOutcome> {
-  const rawData = response.notification.request.content.data as
-    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
-    | null
-    | undefined;
-  const sessionId = typeof rawData?.sessionId === "string" ? rawData.sessionId : null;
-  const approvalId = typeof rawData?.approvalId === "string" ? rawData.approvalId : null;
-  const threadId = typeof rawData?.threadId === "string" ? rawData.threadId : null;
+  const { sessionId, approvalId, threadId } = readRouting(
+    response.notification.request.content.data
+  );
 
   if (response.actionIdentifier === APPROVE_ACTION) {
     if (!approvalId) return { kind: "ignored" };

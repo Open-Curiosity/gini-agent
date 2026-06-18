@@ -17,6 +17,7 @@ import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSw
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { clearCredentials } from "@/src/auth";
+import { consumeLaunchNotificationRoute } from "@/src/push";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { NewAgentSheet } from "@/src/components/NewAgentSheet";
 import { chatListTime, jobCadence } from "@/src/format";
@@ -73,6 +74,17 @@ export default function ChannelsScreen() {
   const [agentsCollapsed, setAgentsCollapsed] = useState(false);
   const [jobsCollapsed, setJobsCollapsed] = useState(false);
   const [archivedCollapsed, setArchivedCollapsed] = useState(true);
+
+  // Cold-start launch-tap recovery. If a notification tap launched the app
+  // from a killed state, iOS doesn't replay it through the response
+  // listener; consume the stored launch response here (the authed landing
+  // screen) and push the named chat on top of this list, so the tap lands on
+  // the right conversation with a natural channels → chat back stack.
+  // Running it here — after the auth gate has already routed an unauthed
+  // user to /setup — keeps a dead credential from deep-linking into a 401.
+  useEffect(() => {
+    consumeLaunchNotificationRoute();
+  }, []);
 
   const unauthorized =
     agents.error instanceof ApiError && agents.error.status === 401;

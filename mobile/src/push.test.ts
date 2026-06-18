@@ -13,6 +13,7 @@ import {
   APPROVE_ACTION,
   DENY_ACTION,
   dispatchNotificationResponse,
+  resolveLaunchTapRoute,
   type DispatchDeps,
   type ResponseLike
 } from "./push-dispatch";
@@ -162,6 +163,57 @@ describe("dispatchNotificationResponse", () => {
     );
     expect(outcome).toEqual({ kind: "ignored" });
     expect(deps.calls.navigate).toEqual([]);
+  });
+});
+
+describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
+  test("a default tap resolves to the main chat route", () => {
+    const route = resolveLaunchTapRoute(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", {
+        sessionId: "chat_cold_1"
+      })
+    );
+    expect(route).toEqual({ sessionId: "chat_cold_1", threadId: null });
+  });
+
+  test("a threaded completion launch tap carries threadId so it opens the thread view", () => {
+    const route = resolveLaunchTapRoute(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", {
+        sessionId: "chat_cold_2",
+        threadId: "thread_cold_2"
+      })
+    );
+    expect(route).toEqual({ sessionId: "chat_cold_2", threadId: "thread_cold_2" });
+  });
+
+  test("an APPROVE action launch does not navigate (resolves to null)", () => {
+    // Approve/Deny resolve the authorization in the background handler, not
+    // by opening a chat — even if such an action ever cold-launched the app.
+    const route = resolveLaunchTapRoute(
+      buildResponse(APPROVE_ACTION, { sessionId: "chat_cold_3", approvalId: "authz_3" })
+    );
+    expect(route).toBeNull();
+  });
+
+  test("a DENY action launch does not navigate (resolves to null)", () => {
+    const route = resolveLaunchTapRoute(
+      buildResponse(DENY_ACTION, { sessionId: "chat_cold_4", approvalId: "authz_4" })
+    );
+    expect(route).toBeNull();
+  });
+
+  test("a launch response with no sessionId resolves to null (silent wake / malformed)", () => {
+    const route = resolveLaunchTapRoute(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", { threadId: "thread_only" })
+    );
+    expect(route).toBeNull();
+  });
+
+  test("a launch response with no data block resolves to null", () => {
+    const route = resolveLaunchTapRoute(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", null)
+    );
+    expect(route).toBeNull();
   });
 });
 
