@@ -16,6 +16,7 @@ import {
 import { cancelTask, submitTask } from "../agent";
 import {
   closeAllMemoryDbs,
+  createAuthorization,
   createChatSession,
   createTask,
   getMemoryDb,
@@ -359,5 +360,66 @@ describe("per-turn AbortSignal", () => {
     expect(resolved?.kind === "tool_call" && resolved.status).toBe("ok");
     // The genuinely-unresolved gated tool is settled to `denied`.
     expect(unresolved?.kind === "tool_call" && unresolved.status).toBe("denied");
+  });
+
+  test("cancel does not deny a tool whose approval already ran but whose result is not yet recorded", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-postrun-prerecord"));
+
+    // The post-release/pre-stageResume window: executeApprovedAction ran the
+    // side effect, flipped the authorization to `approved`, and released the
+    // in-flight registry — but resumeChatTask's stageResume has NOT yet written
+    // the result into toolCallState.pending. The task is still
+    // waiting_approval, the snapshot entry has no `result`, and the in-flight
+    // abort is a no-op (registry already released). A cancel landing here must
+    // NOT deny the tool_call row — the side effect genuinely ran and the resume
+    // path owns settling it to `ok`. cancel recognizes this by the owning
+    // authorization no longer being `pending`.
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "cancel-postrun-prerecord", undefined, "agent_p");
+      const t = createTask(config.instance, "gated work", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "waiting_approval";
+      t.mode = "chat";
+      const auth = createAuthorization(state, {
+        taskId: t.id,
+        action: "terminal.exec",
+        target: "echo ran",
+        risk: "medium",
+        reason: "Run shell command",
+        payload: { command: "echo ran", toolCallId: "call_ran" }
+      });
+      // The approval already resolved (side effect ran) — no longer pending.
+      auth.status = "approved";
+      // Snapshot still lists the call with NO result (stageResume hasn't run).
+      t.toolCallState = {
+        messages: [],
+        toolsHash: "h",
+        iterations: 1,
+        pending: [{ toolCallId: "call_ran", toolName: "terminal_exec", approvalId: auth.id }]
+      };
+      t.approvalIds.push(auth.id);
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+
+    // The tool_call row the loop emitted; it's still `running` because the
+    // resume path hasn't flipped it to `ok` yet.
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo ran",
+      argsFull: { command: "echo ran" },
+      status: "running",
+      callId: "call_ran",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const toolCalls = listChatBlocks(config.instance, seeded.sessionId).filter((b) => b.kind === "tool_call");
+    const ran = toolCalls.find((b) => b.kind === "tool_call" && b.callId === "call_ran");
+    // Must NOT be denied — the side effect ran; the resume path will settle it.
+    expect(ran?.kind === "tool_call" && ran.status).not.toBe("denied");
   });
 });

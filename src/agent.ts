@@ -328,29 +328,48 @@ export async function cancelTask(
     // authorization / setup-request rows for this task, which exist as soon as
     // dispatch creates the gate.
     // Only deny entries that are still UNRESOLVED. An approval resolving in
-    // parallel (resolveAuthorization → resumeChatTask) sets `result` on its
-    // snapshot entry and emits the tool_call row as `ok` BEFORE clearing
-    // toolCallState. A cancel racing that window must not re-flip the
-    // already-settled `ok` row to `denied` — that would mislabel a tool that
-    // genuinely ran. Skipping resolved entries (result already set) leaves
-    // them for the resume path to settle; only the genuinely-pending gated
-    // calls the cancel is tearing down get denied.
+    // parallel (resolveAuthorization → executeApprovedAction → resumeChatTask)
+    // runs its side effect and then settles the tool_call row as `ok`; a cancel
+    // racing that must not re-flip the settled (or about-to-settle) row to
+    // `denied`, which would mislabel a tool that genuinely ran. Two signals
+    // mark a call as already-resolved-or-running, and the deny set must skip
+    // BOTH:
+    //   (a) the snapshot entry already carries a `result` (resumeChatTask's
+    //       stageResume recorded it) — the post-record window; and
+    //   (b) the owning authorization/setup row is NO LONGER `pending` (it
+    //       flipped to approved/completed when the side effect started/ran) —
+    //       the pre-record window, between the side effect committing + the
+    //       in-flight registry releasing and stageResume writing the result.
+    //       In (b) the result isn't on the snapshot yet, so (a)'s filter alone
+    //       would still collect it; the abort is also a no-op (registry already
+    //       released), so the side effect genuinely ran. Excluding non-pending
+    //       owners leaves the resume path to settle the row as `ok`.
+    // `resolvedCallIds` collects (b)'s callids so the final set can subtract
+    // them after the union below.
+    const resolvedCallIds = new Set<string>();
     const gatedToolCallIds = new Set<string>(
       (task.toolCallState?.pending ?? [])
         .filter((p) => typeof p.result !== "string")
         .map((p) => p.toolCallId)
     );
     for (const auth of state.authorizations) {
-      if (auth.taskId !== taskId || auth.status !== "pending") continue;
+      if (auth.taskId !== taskId) continue;
       const callId = approvalToolCallId(auth.payload);
-      if (callId) gatedToolCallIds.add(callId);
+      if (!callId) continue;
+      if (auth.status === "pending") gatedToolCallIds.add(callId);
+      else resolvedCallIds.add(callId); // approved/denied — side effect ran or is running.
     }
     for (const setup of state.setupRequests) {
-      if (setup.taskId !== taskId || setup.status !== "pending") continue;
+      if (setup.taskId !== taskId) continue;
       const callId = approvalToolCallId(setup.payload);
-      if (callId) gatedToolCallIds.add(callId);
+      if (!callId) continue;
+      if (setup.status === "pending") gatedToolCallIds.add(callId);
+      else resolvedCallIds.add(callId); // completed/cancelled — owned by the resume path.
     }
-    cancelledPendingToolCallIds = [...gatedToolCallIds];
+    // Subtract any call whose owner already left `pending` (its side effect ran
+    // or is running) so a still-unresolved snapshot entry can't get denied out
+    // from under the resume path that will settle it as `ok`.
+    cancelledPendingToolCallIds = [...gatedToolCallIds].filter((id) => !resolvedCallIds.has(id));
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
