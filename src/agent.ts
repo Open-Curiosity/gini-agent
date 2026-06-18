@@ -1798,6 +1798,28 @@ async function executeApprovedAction(
   // and feed the result back via resumeChatTask.
   const chatToolCallId = approvalToolCallId(approval.payload);
 
+  // Settle the gated tool_call row to `denied` when this approved action did
+  // NOT run to a successful completion — either it was SKIPPED (task went
+  // terminal before the guard) or it was ABORTED mid-run (its own verdict).
+  // Both cases must NOT route through resumeChatTask's terminal bail, which
+  // hard-codes `ok` and would paint a skipped/killed action as success (issue
+  // #395). cancelTask deliberately leaves approved-but-unrun rows to this site
+  // (it can't tell skipped from completed). The emit is scoped to this task by
+  // resolveEmitContext, so a stale callId reused by a later turn isn't touched.
+  // Best-effort: a chat-block failure must not break the lifecycle.
+  const settleChatRowDenied = (logEvent: string): void => {
+    if (!chatToolCallId || !approval.taskId) return;
+    try {
+      const emitCtx = resolveEmitContext(config, approval.taskId);
+      if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
+    } catch (error) {
+      appendLog(config.instance, logEvent, {
+        taskId: approval.taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+
   // Re-read the owning task and refuse to execute the side effect
   // if it has already reached a terminal state (failed via sibling
   // denial, cancelled, completed). The task-terminal check, the
@@ -1866,24 +1888,11 @@ async function executeApprovedAction(
           message: "Skipping approved action: task already terminal",
           data: { approvalId: approval.id, taskStatus: guard.taskStatus }
         });
-        // Settle the gated tool_call row to `denied` here: the task went
-        // terminal before this approved action could run, so the side effect
-        // is SKIPPED (the guard flipped the approval back to denied). cancelTask
-        // intentionally leaves approved-but-unrun rows to this site — it can't
-        // tell a skipped action from a completed one. Without this the row
-        // would stay stuck `running` after "Cancelled" (issue #395). Best-
-        // effort: a chat-block failure must not break the lifecycle.
-        if (chatToolCallId) {
-          try {
-            const emitCtx = resolveEmitContext(config, approval.taskId);
-            if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
-          } catch (error) {
-            appendLog(config.instance, "chat.skip_block.emit_failed", {
-              taskId: approval.taskId,
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
-        }
+        // The task went terminal before this approved action could run, so the
+        // side effect is SKIPPED (the guard flipped the approval back to
+        // denied). Settle the gated row so it doesn't stay stuck `running`
+        // after "Cancelled" (issue #395).
+        settleChatRowDenied("chat.skip_block.emit_failed");
       }
       return undefined;
     }
@@ -1911,25 +1920,13 @@ async function executeApprovedAction(
     const result = typeof rawResult === "string" ? capToolResultText(rawResult, approval.action) : rawResult;
     if (aborted) {
       // The side effect was aborted by a cancel/fail/sibling-deny (its OWN
-      // verdict, not the racy call-site signal). Settle the gated tool_call
-      // row to `denied` HERE rather than routing the abort-result string
-      // through resumeChatTask: its terminal bail hard-codes `ok`, which would
-      // paint a killed terminal.exec (or any aborted action) as a success
-      // (issue #395 follow-up). Mirror the skip-path settle above. The result
-      // string still returns to the HTTP/CLI caller for its own bookkeeping;
-      // we just don't re-enter the chat loop with it. Best-effort: a chat-
-      // block failure must not break the lifecycle.
-      if (chatToolCallId && approval.taskId) {
-        try {
-          const emitCtx = resolveEmitContext(config, approval.taskId);
-          if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
-        } catch (error) {
-          appendLog(config.instance, "chat.abort_block.emit_failed", {
-            taskId: approval.taskId,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }
+      // verdict, not the racy call-site signal). Settle the gated row to
+      // `denied` rather than routing the abort-result string through
+      // resumeChatTask, whose terminal bail hard-codes `ok` and would paint a
+      // killed terminal.exec (or any aborted action) as success (issue #395).
+      // The result string still returns to the HTTP/CLI caller for its own
+      // bookkeeping; we just don't re-enter the chat loop with it.
+      settleChatRowDenied("chat.abort_block.emit_failed");
       return result;
     }
     if (shouldResumeChat && chatToolCallId && approval.taskId && typeof result === "string") {

@@ -282,7 +282,7 @@ export function setToolCallRunningHint(
   hint: string
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint });
+  const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint }, ctx.taskId);
   return updated ?? undefined;
 }
 
@@ -304,7 +304,7 @@ export function emitToolCallStatus(
     status: params.status,
     errorMessage: params.errorMessage,
     errorSeverity: params.errorSeverity
-  });
+  }, ctx.taskId);
   return updated ?? undefined;
 }
 

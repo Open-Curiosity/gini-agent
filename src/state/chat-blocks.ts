@@ -645,6 +645,17 @@ export function upsertAssistantTextBlock(
 // stamp `errorMessage` on error). Looking up by call_id makes the resume
 // path simple: the chat-task loop and the approval-resume path both
 // know the provider-issued call id but not the block id.
+//
+// `taskId` scopes the lookup to the OWNING turn. callId is NOT globally
+// unique within a session: the codex text-backstop synthesizes a
+// deterministic, content-derived id (`call_textbackstop_<hash>`) that
+// recurs across turns when the same gated call is re-emitted. Without the
+// task filter, a LATE settle for an old turn (e.g. an approved action that
+// was aborted by a cancel, or a resume-terminal bail) would match the
+// NEWEST `(session_id, callId)` row by ordinal and overwrite a fresh
+// turn's tool_call with a stale status. Scoping by `task_id` confines each
+// settle to its own turn's row. Omitting `taskId` keeps the legacy
+// session+callId behavior for callers (and tests) without task context.
 export function updateToolCallBlock(
   instance: Instance,
   callId: string,
@@ -654,19 +665,31 @@ export function updateToolCallBlock(
     errorMessage?: string;
     errorSeverity?: "info" | "error";
     runningHint?: string;
-  }
+  },
+  taskId?: string
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
   const at = now();
-  const row = db
-    .query<ChatBlockRow, [string, string]>(
-      `SELECT * FROM chat_blocks
-       WHERE session_id = ? AND kind = 'tool_call'
-         AND json_extract(payload_json, '$.callId') = ?
-       ORDER BY ordinal DESC
-       LIMIT 1`
-    )
-    .get(sessionId, callId);
+  const row = taskId !== undefined
+    ? db
+        .query<ChatBlockRow, [string, string, string]>(
+          `SELECT * FROM chat_blocks
+           WHERE session_id = ? AND kind = 'tool_call'
+             AND json_extract(payload_json, '$.callId') = ?
+             AND task_id = ?
+           ORDER BY ordinal DESC
+           LIMIT 1`
+        )
+        .get(sessionId, callId, taskId)
+    : db
+        .query<ChatBlockRow, [string, string]>(
+          `SELECT * FROM chat_blocks
+           WHERE session_id = ? AND kind = 'tool_call'
+             AND json_extract(payload_json, '$.callId') = ?
+           ORDER BY ordinal DESC
+           LIMIT 1`
+        )
+        .get(sessionId, callId);
   if (!row) return null;
   let payload: Record<string, unknown> = {};
   try {

@@ -182,6 +182,55 @@ describe("chat-blocks persistence", () => {
     }
   });
 
+  test("updateToolCallBlock with taskId scopes to the owning turn — a stale settle can't hit a newer same-callId row", () => {
+    const instance = "chat-blocks-toolcall-taskscope";
+    // callId is NOT unique across turns: the codex text-backstop synthesizes a
+    // deterministic content-derived id, so the SAME gated call re-emitted in a
+    // later turn carries the SAME callId. Two tool_call blocks, same session,
+    // same callId, DIFFERENT task_ids — turn 2's is higher-ordinal (latest).
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_ts",
+      taskId: "task_1",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo hi",
+      argsFull: { command: "echo hi" },
+      status: "running",
+      callId: "call_dup"
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_ts",
+      taskId: "task_2",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo hi",
+      argsFull: { command: "echo hi" },
+      status: "running",
+      callId: "call_dup"
+    });
+
+    // A LATE settle for turn 1 (e.g. an approved action aborted by cancel)
+    // scoped to task_1 must touch ONLY turn 1's row, even though turn 2's row
+    // is the latest-ordinal match for (session, callId).
+    const settled = updateToolCallBlock(instance, "call_dup", "chat_ts", { status: "denied" }, "task_1");
+    expect(settled?.kind === "tool_call" && settled.status).toBe("denied");
+    expect(settled?.kind === "tool_call" && settled.taskId).toBe("task_1");
+
+    const blocks = listChatBlocks(instance, "chat_ts");
+    const turn1 = blocks.find((b) => b.kind === "tool_call" && b.taskId === "task_1");
+    const turn2 = blocks.find((b) => b.kind === "tool_call" && b.taskId === "task_2");
+    // Turn 1 settled; turn 2 (the newer, latest-ordinal row) is untouched.
+    expect(turn1?.kind === "tool_call" && turn1.status).toBe("denied");
+    expect(turn2?.kind === "tool_call" && turn2.status).toBe("running");
+
+    // Without the taskId scope, the legacy lookup hits the latest-ordinal row
+    // (turn 2) — the exact cross-turn clobber the scope prevents.
+    const legacy = updateToolCallBlock(instance, "call_dup", "chat_ts", { status: "ok" });
+    expect(legacy?.kind === "tool_call" && legacy.taskId).toBe("task_2");
+  });
+
   test("listChatBlocksAfter honors cursor and falls back when unknown", () => {
     const instance = "chat-blocks-cursor";
     const a = insertChatBlock(instance, {
