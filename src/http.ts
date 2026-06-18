@@ -38,7 +38,12 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { browserNavigate, safetyCheck } from "./tools/browser";
+import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import {
+  getOrStartBridge,
+  stopActiveBridge,
+  type ScreencastInput
+} from "./execution/browser-screencast";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
@@ -973,6 +978,21 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
 
       if (setup.action === "browser.connect") {
+        // Screencast path: the agent never left its headless Chrome — the user
+        // just signed in through the modal, so cookies are already in the
+        // shared context. Tear down the screencast bridge and resume the task
+        // headless with no relaunch (completeBrowserConnectSetup's managed
+        // relaunch only applies to the visible-window fallback).
+        if (setup.payload.screencast === true) {
+          const result = JSON.stringify({ success: true, connected: true, mode: "screencast" });
+          // Mark the setup terminal BEFORE tearing the bridge down: a frames /
+          // input request racing this completion would otherwise pass the
+          // status==="pending" gate in the teardown gap and recreate an orphaned
+          // bridge. Resolving first makes that racer 404 instead.
+          await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+          await stopActiveBridge(setupId);
+          return json({ ok: true });
+        }
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
         return json({ ok });
@@ -1082,8 +1102,21 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
     }],
-    ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) =>
-      json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false }))],
+    ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) => {
+      // If this cancels an active sign-in screencast, tear the bridge down so
+      // the raw-CDP socket to the headless Chrome doesn't dangle. The agent's
+      // browser itself stays up (the bridge is only the screencast channel).
+      // Resolve (mark terminal) BEFORE stopping the bridge so a racing
+      // frames/input request fails the status==="pending" gate instead of
+      // recreating an orphaned bridge in the teardown gap.
+      const cancelled = readState(config.instance).setupRequests.find((s) => s.id === params[0]);
+      const wasScreencast = cancelled?.action === "browser.connect" && cancelled.payload.screencast === true;
+      const cancelResult = await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false });
+      if (wasScreencast) {
+        await stopActiveBridge(params[0]);
+      }
+      return json(cancelResult);
+    }],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:
     //   1. Validate the setup-request is browser.connect and pending.
@@ -1110,6 +1143,52 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (targetUrl) {
         const blocked = safetyCheck(targetUrl);
         if (blocked) return json({ error: blocked }, 400);
+      }
+      // Screencast path: when the agent's default spawned headless Chrome is
+      // already live, do NOT launch a visible window — the user signs in
+      // through the in-chat modal that screencasts that same headless Chrome.
+      // This keeps the agent on one browser the whole time (no teardown /
+      // relaunch) and is the common case now that the default browser is the
+      // spawned per-instance Chrome. Falls back to the managed visible window
+      // when no spawned Chrome is running (e.g. a cdp-attach configuration).
+      const screencastPort = getScreencastPort();
+      if (screencastPort !== null) {
+        await mutateState(config.instance, (state) => {
+          const item = state.setupRequests.find((s) => s.id === setupId);
+          if (!item) return;
+          item.payload = {
+            ...item.payload,
+            signInStarted: true,
+            screencast: true,
+            openedAt: new Date().toISOString()
+          };
+          const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
+            ? setup.payload.reason
+            : setup.target;
+          addAudit(
+            state,
+            {
+              actor: "user",
+              action: "browser.connect",
+              target: reasonTarget,
+              risk: "medium",
+              taskId: setup.taskId,
+              runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+              approvalId: setup.id,
+              evidence: { stage: "open-browser", mode: "screencast", headless: true }
+            },
+            setup.taskId ? { taskId: setup.taskId } : setup.agentId ? { agentId: setup.agentId } : { system: true }
+          );
+          if (item.taskId) {
+            appendTrace(config.instance, item.taskId, {
+              type: "approval",
+              message: "Browser connect: sign-in screencast opened, awaiting sign-in",
+              data: { setupRequestId: setupId }
+            });
+          }
+        });
+        const refreshedScreencast = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+        return json({ ok: true, setupRequest: refreshedScreencast, screencast: true });
       }
       // skipAudit so the capability does not write a reasonless row;
       // we write a setup-aware row below that carries the originating
@@ -1196,6 +1275,142 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       });
       const refreshed = readState(config.instance).setupRequests.find((s) => s.id === setupId);
       return json({ ok: true, setupRequest: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
+    }],
+
+    // Live sign-in screencast: stream JPEG frames of the agent's headless
+    // browser to the in-chat modal as Server-Sent Events. Mirrors the
+    // chatBlockStream auth/lifecycle pattern; the bearer gate above already
+    // accepted the request, and the BFF injects that bearer server-side so the
+    // browser never holds the gateway token. The screencast attaches to the
+    // ALREADY-running spawned Chrome (raw CDP over its debug port) — it never
+    // launches a browser and never accepts a port from the client.
+    ["GET", /^\/api\/browser\/screencast\/([^/]+)\/frames$/, async (_request, params) => {
+      const setupId = params[0];
+      const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      // Gate on the live approval window, not just existence: a completed /
+      // cancelled / not-yet-started setup must not (re)open a screencast. This
+      // also closes the stale-EventSource-reconnect path — after /complete
+      // stops the bridge, a lingering reconnect can't rebuild a live drive
+      // channel because the setup is no longer pending.
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
+      }
+      // Bind to the exact page the requesting task is driving (its session.page
+      // CDP targetId), not whatever tab happens to be first or shares a URL, so
+      // the operator signs in on the right page even with sibling tabs open.
+      // The URL is a fallback hint when the targetId can't be resolved.
+      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
+      let bridge;
+      try {
+        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 409);
+      }
+      const encoder = new TextEncoder();
+      let keepalive: ReturnType<typeof setInterval> | undefined;
+      let unsubscribe: (() => void) | undefined;
+      const stream = new ReadableStream({
+        start(controller) {
+          const sendFrame = (frame: { data: string; meta: Record<string, unknown> }) => {
+            try {
+              controller.enqueue(
+                encoder.encode(`event: frame\ndata: ${JSON.stringify(frame)}\n\n`)
+              );
+            } catch {
+              // controller already closed — drop the frame
+            }
+          };
+          // onUrl: stream the gateway-sourced page URL so the modal shows the
+          // operator which origin they're signing into (it has no address bar).
+          const sendUrl = (url: string) => {
+            try {
+              controller.enqueue(encoder.encode(`event: url\ndata: ${JSON.stringify({ url })}\n\n`));
+            } catch {
+              // controller already closed — drop it
+            }
+          };
+          // onClose: when the CDP bridge dies, close the stream so the modal's
+          // EventSource reconnects (and re-hits the gate, 404ing if the setup is
+          // gone) instead of dangling on a stale frame behind keepalives.
+          unsubscribe = bridge.subscribe(
+            sendFrame,
+            () => {
+              if (keepalive) clearInterval(keepalive);
+              try {
+                controller.close();
+              } catch {
+                // already closed
+              }
+            },
+            sendUrl
+          );
+          // Comment keepalive so proxies don't idle-close the stream between
+          // frames (a static page emits no frames until it changes).
+          keepalive = setInterval(() => {
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+            } catch {
+              // closed
+            }
+          }, 15_000);
+          if (typeof keepalive.unref === "function") keepalive.unref();
+        },
+        cancel() {
+          unsubscribe?.();
+          if (keepalive) clearInterval(keepalive);
+        }
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive"
+        }
+      });
+    }],
+
+    // Relay one operator input event (click / move / scroll / drag / key) from
+    // the sign-in modal to the headless browser via the screencast bridge.
+    // Deliberately has no "navigate" kind: free navigation would bypass the
+    // agent's SSRF / domain-policy gate (which lives on browser_navigate).
+    ["POST", /^\/api\/browser\/screencast\/([^/]+)\/input$/, async (request, params) => {
+      const setupId = params[0];
+      const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
+      }
+      let body: ScreencastInput;
+      try {
+        body = (await request.json()) as ScreencastInput;
+      } catch {
+        return json({ error: "Invalid JSON body" }, 400);
+      }
+      const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
+      let bridge;
+      try {
+        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 409);
+      }
+      // Relay the remote page's selection back (present for copy/cut/selectall
+      // and double/drag selection) so the modal can serve it to the operator's
+      // clipboard on a native copy/cut event.
+      const { selection } = await bridge.dispatchInput(body);
+      return json(selection !== undefined ? { ok: true, selection } : { ok: true });
     }],
 
     ["GET", /^\/api\/audit$/, (request) => {

@@ -617,13 +617,15 @@ describe("browser-connect managed launch via playwright", () => {
   });
 });
 
-// Round-1 fix 5: realistic coverage that the same per-instance profile
-// dir is used across a Connect → Disconnect → tool-call sequence. We
-// mock playwright-core so launchPersistentContext records the data dir
-// it was invoked with at every step; the assertion is that the dir is
-// identical across the two launches (sign-ins persist on the same dir).
-describe("persistent profile dir is stable across Connect → Disconnect → tool call", () => {
-  test("Connect launches headed against the same dir the default-tool path uses headless", async () => {
+// The visible Connect flow still launches a headed persistent context via
+// chromium.launchPersistentContext against the per-instance chrome-profile
+// dir (the agent's DEFAULT browser path now spawns its own per-instance Chrome,
+// covered in src/tools/browser.test.ts — it shares this same per-instance
+// chrome-profile dir). This pins that Connect keeps using
+// launchPersistentContext, headed, against the per-instance profile so user
+// sign-ins persist there.
+describe("Connect launches a headed persistent context on the per-instance profile dir", () => {
+  test("Connect uses launchPersistentContext(headless: false) against the per-instance chrome-profile dir", async () => {
     const config = testConfig("profile-stable");
     const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
     mock.module("playwright-core", () => ({
@@ -651,28 +653,17 @@ describe("persistent profile dir is stable across Connect → Disconnect → too
     browserMod.__test.resetChromiumImportForTest();
     browserMod.setBrowserInstance(config.instance);
     try {
-      // Step 1: Connect — launches headed against the per-instance dir.
       const connectResult = await connectBrowser(config, {});
       expect(connectResult.connected).toBe(true);
-      // Step 2: Disconnect — closes the visible context.
       const disconnectResult = await disconnectBrowser(config);
       expect(disconnectResult.connected).toBe(false);
-      // Step 3: Default tool path — relaunches headless against the SAME dir.
-      try {
-        await browserMod.browserNavigate("profile-stable-task", { url: "https://example.com/" });
-      } catch {
-        // snapshot may fail with the fake page; assertion below is what matters.
-      }
 
-      expect(launchCalls.length).toBeGreaterThanOrEqual(2);
-      const first = launchCalls[0]!;
-      const second = launchCalls[launchCalls.length - 1]!;
-      expect(first.dataDir).toBe(second.dataDir);
-      expect(first.dataDir).toContain("chrome-profile");
-      expect(first.dataDir).toContain(config.instance);
-      // Connect is headed; default tool path is headless.
-      expect(first.options.headless).toBe(false);
-      expect(second.options.headless).toBe(true);
+      expect(launchCalls.length).toBe(1);
+      const call = launchCalls[0]!;
+      expect(call.dataDir).toContain("chrome-profile");
+      expect(call.dataDir).toContain(config.instance);
+      // Connect opens a visible (headed) window.
+      expect(call.options.headless).toBe(false);
     } finally {
       mock.restore();
       browserMod.__test.uninstallFakeBrowserForTest();
