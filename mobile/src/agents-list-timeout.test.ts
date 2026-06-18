@@ -1,6 +1,5 @@
-// Independent verification of the fix for issue #396:
-//   "Mobile: navigating back from a chat leaves the agents list stuck on an
-//    infinite loading spinner (force-quit to recover)."
+// Pins the recovery contract for issue #396: a hung /agents request must
+// not leave the agents list latched on its loading spinner.
 //
 // The spinner-latch condition lives in mobile/app/channels.tsx:
 //
@@ -8,29 +7,23 @@
 //
 // where `agents = useAgents()` → useQuery({ queryFn: () => api("/agents") }).
 // In React Query, `isLoading === isPending && isFetching`. A query is
-// `pending` while it has no data AND its queryFn promise has not settled.
-// `retry: 1` (the app's QueryClient default in app/_layout.tsx) only fires
-// after a REJECTION — a fetch promise that never resolves and never rejects
-// keeps the query `pending` forever, so `isLoading` stays true and the
-// spinner never goes away. The only recovery pre-fix is force-quit.
+// `pending` while it has no data AND its queryFn promise has not settled,
+// and `retry: 1` (the app's QueryClient default in app/_layout.tsx) only
+// fires after a REJECTION. So a queryFn promise that never settles keeps
+// the query `pending` and the spinner up indefinitely; the invariant under
+// test is that api() always settles the promise (here, by timing out).
 //
-// This test drives the REAL api() fetcher through a REAL query-core
-// QueryObserver configured exactly the way app/_layout.tsx configures the
-// app's shared QueryClient (refetchOnMount:false, refetchOnWindowFocus:false,
-// retry:1), against a Bun.serve gateway that accepts the TCP connection and
-// then NEVER answers GET /api/agents. We then assert whether the query
-// eventually leaves the loading/pending state (recovers into error) or stays
-// latched in loading forever.
+// This drives the REAL api() fetcher through a REAL QueryObserver
+// configured the way app/_layout.tsx configures the shared QueryClient
+// (refetchOnMount:false, refetchOnWindowFocus:false, retry:1), against a
+// Bun.serve gateway that accepts the TCP connection and then NEVER answers
+// GET /api/agents, and asserts the query leaves the loading state and
+// settles into an error rather than latching.
 //
-// Discrimination: the test passes a short explicit `timeoutMs` to api() so
-// it completes fast, but it exercises the EXACT abort machinery the
-// production default (GET_TIMEOUT_MS = 10_000 for the no-timeout useAgents
-// GET) relies on — same lines of api.ts. On the PRE-FIX api.ts there is no
-// timeoutMs support and no AbortController at all
-// (`fetch(url, { ...rest, headers })` is awaited unconditionally), so the
-// request hangs and the query stays `pending` → these tests FAIL. On the
-// FIXED api.ts the abort fires, api() throws ApiError(0, "…timed out"), the
-// query settles into `isError` → these tests PASS.
+// The test passes a short explicit `timeoutMs` so it runs fast, but it
+// exercises the same AbortController machinery the production GET default
+// (GET_TIMEOUT_MS = 10_000) uses — the timeout aborts the request and api()
+// surfaces ApiError(0, "…timed out"), so the query settles into `isError`.
 
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
@@ -65,7 +58,11 @@ mock.module("expo-file-system/legacy", () => ({
 
 const { api, ApiError } = await import("@/src/api");
 const { saveCredentials, clearCredentials } = await import("@/src/auth");
-const { QueryClient, QueryObserver } = await import("@tanstack/query-core");
+// Import from the declared dependency (@tanstack/react-query) rather than
+// @tanstack/query-core directly — react-query re-exports both classes as
+// the identical references, and query-core is only a transitive dep that
+// mobile/package.json doesn't declare.
+const { QueryClient, QueryObserver } = await import("@tanstack/react-query");
 
 // --- A gateway that accepts the connection but never answers /agents.
 //     The promise returned by the handler never resolves, so the HTTP
@@ -108,10 +105,11 @@ beforeEach(async () => {
 });
 
 // Subscribe to a QueryObserver and resolve once the query reaches a state
-// where it is no longer loading (success or error), OR reject after a wall
-// clock budget. The budget must comfortably exceed the short timeoutMs we
-// pass so the FIXED code's abort has time to land, while still failing fast
-// on the PRE-FIX code (which never settles).
+// where it is no longer loading (success or error), OR report not-settled
+// after a wall-clock budget. The budget comfortably exceeds the short
+// timeoutMs the test passes, so a query that settles is observed as
+// settled and one that never settles is caught as a latched-spinner
+// failure rather than running to the per-test cap.
 // Structural subset of QueryObserver this helper needs. Typing it
 // structurally sidesteps the variance mismatch between the concrete
 // QueryObserver<…, Error, …, string[]> the observer infers and the
@@ -192,9 +190,8 @@ describe("issue #396 — agents-list infinite spinner on a never-answering gatew
 
       // Budget = 6000ms: comfortably longer than the 150ms timeout + the
       // single retry's fixed 1000ms backoff + a second 150ms timeout (1300ms
-      // total) so the FIXED code definitely settles, yet short enough that
-      // the PRE-FIX code (which hangs forever) trips the budget and reports
-      // settled:false.
+      // total), so a settling query is observed as settled while a
+      // never-settling one trips the budget and reports settled:false.
       const result = await waitForSettleOrTimeout(observer, 6_000);
       observer.destroy();
       client.clear();
@@ -211,9 +208,8 @@ describe("issue #396 — agents-list infinite spinner on a never-answering gatew
   test(
     "a bare api('/agents') call against a hung gateway rejects rather than hanging forever",
     async () => {
-      // Directly proves the fetcher-level guarantee the screen depends on:
-      // the promise SETTLES (rejects) instead of staying pending. On pre-fix
-      // code this await never returns and the test trips its own 15s cap.
+      // Directly pins the fetcher-level guarantee the screen depends on:
+      // the promise SETTLES (rejects) instead of staying pending.
       const { promise, resolve } = Promise.withResolvers<
         { outcome: "resolved" | "rejected"; error?: unknown }
       >();
@@ -221,8 +217,8 @@ describe("issue #396 — agents-list infinite spinner on a never-answering gatew
         () => resolve({ outcome: "resolved" }),
         (error) => resolve({ outcome: "rejected", error })
       );
-      // Guard so a hang (pre-fix) surfaces as an explicit assertion failure
-      // within the test rather than the runner's per-test wall-clock kill.
+      // Guard so a hang surfaces as an explicit assertion failure within the
+      // test rather than the runner's per-test wall-clock kill.
       const guard = new Promise<{ outcome: "hung" }>((r) =>
         setTimeout(() => r({ outcome: "hung" }), 3_000)
       );
