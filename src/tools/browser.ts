@@ -460,7 +460,7 @@ const spawnedSessionProvider: BrowserSessionProvider = {
 // Attach to the user's OWN external Chrome over a CDP websocket URL they
 // supplied via /api/browser/connect. We NEVER spawn or kill this process — the
 // user owns it. connectOverCDP works under Bun via the bundled-ws→built-in-ws
-// patch (patches/playwright-core@1.60.0.patch); without it the CDP websocket
+// patch (patches/playwright-core@1.61.0.patch); without it the CDP websocket
 // handshake deadlocks. This is an opt-in transport for users who point us at
 // their own Chrome.
 const cdpSessionProvider: BrowserSessionProvider = {
@@ -497,7 +497,7 @@ const cdpSessionProvider: BrowserSessionProvider = {
     const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
     if (typeof candidate.disconnect === "function") {
       // Bound the disconnect, but NEVER kill — the remote Chrome is the user's
-      // own process. (playwright-core 1.60 does not expose disconnect() on a
+      // own process. (playwright-core 1.61 does not expose disconnect() on a
       // connectOverCDP Browser, so this branch is dormant there; kept for
       // builds/versions that do, where it's the clean detach.)
       await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
