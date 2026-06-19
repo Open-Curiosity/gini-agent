@@ -17,11 +17,19 @@
 //   5. Subscribe to `addPushTokenListener` so a rotated token
 //      (rare, but happens on restore-from-backup) re-registers.
 //   6. Subscribe to `addNotificationResponseReceivedListener` for tap +
-//      action handling. The category registered below pairs with the
-//      NSE attached on the server-side `authorization_requested` payload —
-//      the OS shows Approve / Deny buttons on the lock screen, and
-//      this listener routes each action to the right
-//      /api/authorizations endpoint without forcing the app to foreground.
+//      action handling, via the idempotent installNotificationResponseListener.
+//      The category registered below pairs with the NSE attached on the
+//      server-side `authorization_requested` payload — the OS shows
+//      Approve / Deny buttons on the lock screen, and this listener routes
+//      each action to the right /api/authorizations endpoint without forcing
+//      the app to foreground.
+//
+// Note: the response listener (step 6) is ALSO installed unconditionally at
+// root (`app/_layout.tsx`) on every launch — it needs no permission and must
+// route taps even when no chat detail ever mounted this process. The
+// `registerForPushAsync` flow re-invokes the same idempotent installer, so
+// whichever path runs first wins; the listener is process-level and is not
+// torn down on sign-out (see __resetRegistrationForSignOut).
 //
 // Action handling caveat: `opensAppToForeground: false` means the OS
 // only invokes the response listener if the app is backgrounded
