@@ -4969,12 +4969,11 @@ describe("runtime api", () => {
   });
 
   test("a tokenless web stream marks the session web-watched until it closes", async () => {
-    // The cross-client notification fix: a web client (no X-Device-Token)
-    // opening a chat stream registers on the pushless registry so the
-    // dispatcher can downgrade the phone's completion alert to a silent
-    // badge refresh while the human reads on the web. Closing the stream
-    // clears the entry — so a send-then-close leaves the phone eligible
-    // for its normal alert.
+    // A web client (no X-Device-Token) opening a chat stream registers on
+    // the pushless registry so the dispatcher can downgrade the phone's
+    // completion alert to a silent badge refresh while the human reads on
+    // the web. Closing the stream clears the entry — so a send-then-close
+    // leaves the phone eligible for its normal alert.
     const config = testConfig("chat-stream-web-presence");
     const handler = createHandler(config);
     const { isSessionWebWatched, isDeviceWatching } = await import("./state");

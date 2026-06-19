@@ -578,10 +578,10 @@ describe("apns dispatcher", () => {
   });
 
   test("web-watched session downgrades a completion ALERT to a silent badge refresh on the phone", async () => {
-    // The reported bug: user is reading the chat on the web app while the
-    // turn completes. The phone must NOT buzz — but it must still get a
-    // silent wake so its badge stays accurate (web reads don't clear the
-    // phone's per-device read cursor).
+    // When a web/CLI client is reading the session as the turn completes,
+    // the phone must NOT buzz — but it must still get a silent wake so its
+    // badge stays accurate (web reads don't clear the phone's per-device
+    // read cursor).
     const { client, calls } = buildFakeClient();
     const dispatcher = createApnsDispatcher("test-inst" as Instance, {
       client,
