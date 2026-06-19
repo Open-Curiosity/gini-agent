@@ -11,8 +11,10 @@ import { describe, expect, test } from "bun:test";
 import {
   APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
+  consumeLaunchTap,
   DENY_ACTION,
   dispatchNotificationResponse,
+  type LaunchConsumeDeps,
   resolveLaunchTapRoute,
   type DispatchDeps,
   type ResponseLike
@@ -214,6 +216,74 @@ describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
       buildResponse("expo.modules.notifications.actions.DEFAULT", null)
     );
     expect(route).toBeNull();
+  });
+});
+
+describe("consumeLaunchTap (get → clear-once → navigate orchestration)", () => {
+  // Records the order and arguments of the injected native seams so each
+  // test can pin both WHAT fired and the clear-before-navigate sequencing.
+  function buildConsumeDeps(last: ResponseLike | null): LaunchConsumeDeps & {
+    calls: { clear: number; navigate: Array<{ sessionId: string; threadId: string | null }> };
+  } {
+    const calls = { clear: 0, navigate: [] as Array<{ sessionId: string; threadId: string | null }> };
+    return {
+      getLast: () => last,
+      clear: () => { calls.clear += 1; },
+      navigate: (sessionId, threadId) => { calls.navigate.push({ sessionId, threadId }); },
+      calls
+    };
+  }
+
+  test("no stored response: neither clears nor navigates, returns null", () => {
+    const deps = buildConsumeDeps(null);
+    const route = consumeLaunchTap(deps);
+    expect(route).toBeNull();
+    expect(deps.calls.clear).toBe(0);
+    expect(deps.calls.navigate).toEqual([]);
+  });
+
+  test("default tap: clears once then navigates to the resolved chat", () => {
+    const deps = buildConsumeDeps(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", { sessionId: "chat_launch_1" })
+    );
+    const route = consumeLaunchTap(deps);
+    expect(route).toEqual({ sessionId: "chat_launch_1", threadId: null });
+    expect(deps.calls.clear).toBe(1);
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_launch_1", threadId: null }]);
+  });
+
+  test("threaded completion tap: navigates into the thread view", () => {
+    const deps = buildConsumeDeps(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", {
+        sessionId: "chat_launch_2",
+        threadId: "thread_launch_2"
+      })
+    );
+    const route = consumeLaunchTap(deps);
+    expect(route).toEqual({ sessionId: "chat_launch_2", threadId: "thread_launch_2" });
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_launch_2", threadId: "thread_launch_2" }]);
+  });
+
+  test("non-navigable response (no sessionId): still clears once, never navigates", () => {
+    // The clear-before-null-gate invariant: a silent wake / malformed launch
+    // response must be cleared so it isn't re-evaluated on the next mount.
+    const deps = buildConsumeDeps(
+      buildResponse("expo.modules.notifications.actions.DEFAULT", { threadId: "thread_only" })
+    );
+    const route = consumeLaunchTap(deps);
+    expect(route).toBeNull();
+    expect(deps.calls.clear).toBe(1);
+    expect(deps.calls.navigate).toEqual([]);
+  });
+
+  test("APPROVE action launch: clears once, never navigates", () => {
+    const deps = buildConsumeDeps(
+      buildResponse(APPROVE_ACTION, { sessionId: "chat_launch_3", approvalId: "authz_3" })
+    );
+    const route = consumeLaunchTap(deps);
+    expect(route).toBeNull();
+    expect(deps.calls.clear).toBe(1);
+    expect(deps.calls.navigate).toEqual([]);
   });
 });
 

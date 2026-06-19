@@ -313,7 +313,11 @@ recovers it.
 - **Foregrounding action buttons**: rejected. Forcing the app to
   foreground for every Approve / Deny would defeat the lock-screen UX
   goal. The killed-app edge case (where the action button doesn't run
-  our JS) is mitigated by the runtime re-emitting approval requests.
+  our JS) is an accepted limitation: the approval stays pending in the
+  runtime until the user opens the app and acts on it — the runtime does
+  not re-emit approval requests (see "NSE + category model"). A plain
+  tap, unlike an action button, launches the app and is recovered via the
+  cold-start consume (see "Tap routing + cold-start recovery").
 
 ## Consequences
 

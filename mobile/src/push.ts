@@ -47,8 +47,8 @@ import {
   APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
-  dispatchNotificationResponse,
-  resolveLaunchTapRoute
+  consumeLaunchTap,
+  dispatchNotificationResponse
 } from "./push-dispatch";
 import {
   bumpGeneration,
@@ -233,16 +233,14 @@ function navigateToChat(sessionId: string, threadId: string | null): void {
 export function consumeLaunchNotificationRoute(): { sessionId: string; threadId: string | null } | null {
   if (Platform.OS !== "ios") return null;
   try {
-    const last = Notifications.getLastNotificationResponse();
-    if (!last) return null;
-    const route = resolveLaunchTapRoute(last);
-    // Clear unconditionally once observed: even a non-navigable launch
-    // response (silent wake, malformed) should not linger and be
-    // re-evaluated on the next mount.
-    Notifications.clearLastNotificationResponse();
-    if (!route) return null;
-    navigateToChat(route.sessionId, route.threadId);
-    return route;
+    // The get → clear-once → navigate sequence lives in the native-free
+    // consumeLaunchTap (push-dispatch) so its ordering is unit-testable; we
+    // inject the real Notifications APIs + router here.
+    return consumeLaunchTap({
+      getLast: () => Notifications.getLastNotificationResponse(),
+      clear: () => Notifications.clearLastNotificationResponse(),
+      navigate: navigateToChat
+    });
   } catch {
     // getLastNotificationResponse / clearLastNotificationResponse can throw
     // in unusual states (native module not ready on a very early mount).
@@ -461,6 +459,20 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
             apiCall: (path, init) => api(path, init),
             navigate: navigateToChat,
             notifyFailure: notifyActionFailure
+          }).finally(() => {
+            // A tap handled live is ALSO retained by the OS as the "last
+            // notification response". Clear it so a later channels mount's
+            // consumeLaunchNotificationRoute() can't replay this already-
+            // handled tap (which, after a sign-out → sign-in remount, could
+            // navigate into a chat from the prior credential). The cold-start
+            // path is the only consumer that should ever act on the stored
+            // response.
+            try {
+              Notifications.clearLastNotificationResponse();
+            } catch {
+              // Native module not ready — the stored response is harmless
+              // until the next consume attempt, which clears it itself.
+            }
           });
         });
       }

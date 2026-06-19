@@ -80,8 +80,15 @@ export default function ChannelsScreen() {
   // listener; consume the stored launch response here (the authed landing
   // screen) and push the named chat on top of this list, so the tap lands on
   // the right conversation with a natural channels → chat back stack.
-  // Running it here — after the auth gate has already routed an unauthed
-  // user to /setup — keeps a dead credential from deep-linking into a 401.
+  //
+  // We run this from channels rather than the index gate because the gate
+  // (app/index.tsx) only checks credential PRESENCE, not validity — it
+  // routes a missing credential to /setup but lets a stale/expired one
+  // through. A dead token here pushes the chat optimistically (same as
+  // tapping any agent/channel row, which also pushes before validating),
+  // then the chat screen's own 401 handler clears the token and redirects to
+  // /setup; the next cold start then skips straight to /setup. So the worst
+  // case is a brief loading frame, never a wrong landing.
   useEffect(() => {
     consumeLaunchNotificationRoute();
   }, []);

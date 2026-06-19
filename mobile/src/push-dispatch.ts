@@ -129,6 +129,42 @@ export function resolveLaunchTapRoute(response: ResponseLike): LaunchTapRoute | 
   return { sessionId, threadId };
 }
 
+// Native seams the launch-tap consume orchestration depends on, injected so
+// the get → clear → navigate sequence is unit-testable without loading
+// react-native / expo-notifications / expo-router.
+export interface LaunchConsumeDeps {
+  // Expo's stored launch tap (Notifications.getLastNotificationResponse).
+  getLast: () => ResponseLike | null;
+  // Notifications.clearLastNotificationResponse — drops the stored response
+  // so it isn't re-evaluated on a later mount.
+  clear: () => void;
+  // Deep-link into the resolved chat / thread.
+  navigate: (sessionId: string, threadId: string | null) => void;
+}
+
+/**
+ * Pure orchestration for cold-start launch-tap recovery: read the stored
+ * launch response, clear it exactly once, and navigate when it resolves to a
+ * chat route.
+ *
+ * The clear is intentionally placed BEFORE the null-route gate: any observed
+ * launch response — even a non-navigable one (an action launch, a silent
+ * wake, a malformed payload) — must be cleared so it can't be re-evaluated on
+ * the next mount. Only a genuine deep-link tap then navigates.
+ *
+ * The `push.ts` wrapper injects the real Notifications APIs + router; tests
+ * inject spies to pin the clear-once and navigate-on-route semantics.
+ */
+export function consumeLaunchTap(deps: LaunchConsumeDeps): LaunchTapRoute | null {
+  const last = deps.getLast();
+  if (!last) return null;
+  const route = resolveLaunchTapRoute(last);
+  deps.clear();
+  if (!route) return null;
+  deps.navigate(route.sessionId, route.threadId);
+  return route;
+}
+
 export interface DispatchDeps {
   apiCall: <T = unknown>(path: string, init?: { method?: string }) => Promise<T>;
   navigate: (sessionId: string, threadId: string | null) => void;
