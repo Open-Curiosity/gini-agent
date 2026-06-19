@@ -5063,6 +5063,26 @@ describe("runtime api", () => {
     expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
   });
 
+  test("an unauthenticated stream request 401s and creates no pushless presence", async () => {
+    // The pushless registration is a notification side effect, so it must
+    // sit behind the bearer gate: a request with no Authorization header
+    // 401s before reaching the stream factory, leaving the registry empty.
+    // Pins that the side effect can't be triggered by an unauthenticated
+    // caller who merely knows a session id.
+    const config = testConfig("chat-stream-unauth-no-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "unauth presence" })
+    });
+
+    // No token argument → no Authorization header.
+    const response = await rawCall(handler, config, `/api/chat/${session.id}/stream`, {});
+    expect(response.status).toBe(401);
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
