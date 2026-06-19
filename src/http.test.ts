@@ -4968,6 +4968,66 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("a tokenless web stream marks the session web-watched until it closes", async () => {
+    // The cross-client notification fix: a web client (no X-Device-Token)
+    // opening a chat stream registers on the pushless registry so the
+    // dispatcher can downgrade the phone's completion alert to a silent
+    // badge refresh while the human reads on the web. Closing the stream
+    // clears the entry — so a send-then-close leaves the phone eligible
+    // for its normal alert.
+    const config = testConfig("chat-stream-web-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "web presence" })
+    });
+
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+
+    // No X-Device-Token header → treated as a web/CLI client.
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    // Pump until the initial chat_session frame lands, which only happens
+    // inside the stream's start() — i.e. after registration.
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+    }
+    expect(buffer).toContain("event: chat_session");
+    // Web presence is recorded; the device registry is untouched (no
+    // token to key on).
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(true);
+    expect(isDeviceWatching(config.instance, config.token, session.id)).toBe(false);
+
+    // Close the stream → presence clears (the send-then-close path).
+    if (reader) await reader.cancel();
+    // cancel() runs the stream's cleanup synchronously in-process; give
+    // the microtask queue one turn to settle before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.

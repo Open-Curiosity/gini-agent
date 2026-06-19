@@ -577,6 +577,196 @@ describe("apns dispatcher", () => {
     dispatcher.stop();
   });
 
+  test("web-watched session downgrades a completion ALERT to a silent badge refresh on the phone", async () => {
+    // The reported bug: user is reading the chat on the web app while the
+    // turn completes. The phone must NOT buzz — but it must still get a
+    // silent wake so its badge stays accurate (web reads don't clear the
+    // phone's per-device read cursor).
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_phone", credentialId: "owner" })],
+      // The phone itself is NOT watching over SSE (it's in the user's
+      // pocket); only the web app is.
+      isWatching: () => false,
+      isWebWatched: (_inst, sess) => sess === "chat_xyz",
+      hasAssistantText: () => true,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    // The phone still receives a push, but as a SILENT background wake —
+    // no banner, no sound.
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.token).toBe("tok_phone");
+    expect(call.opts.pushType).toBe("background");
+    expect(call.opts.priority).toBe(5);
+    const aps = call.payload.aps as Record<string, unknown>;
+    expect(aps["content-available"]).toBe(1);
+    expect(aps.alert).toBeUndefined();
+    expect(aps.sound).toBeUndefined();
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_completed");
+    expect(body.silent).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("send-then-close: web no longer watching at completion → phone gets the alert", async () => {
+    // Same user, but they closed the web tab before the turn finished.
+    // The pushless entry is gone by push time, so isWebWatched is false
+    // and the phone correctly gets its banner.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_phone", credentialId: "owner" })],
+      isWatching: () => false,
+      // Web tab already closed — no live web stream on this session.
+      isWebWatched: () => false,
+      hasAssistantText: () => true,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.opts.pushType).toBe("alert");
+    expect(call.opts.priority).toBe(10);
+    const aps = call.payload.aps as Record<string, unknown>;
+    expect((aps.alert as Record<string, unknown>).title).toBe("Gini has a new message");
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("message_completed");
+    expect(body.silent).toBe(false);
+    dispatcher.stop();
+  });
+
+  test("web-watching does not change an already-silent push (no banner to suppress)", async () => {
+    // A Completed-with-no-assistant_text turn is already silent; the web
+    // downgrade is a no-op here. isWebWatched must not even be consulted
+    // in a way that changes the outcome.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_phone" })],
+      isWatching: () => false,
+      isWebWatched: () => true,
+      hasAssistantText: () => false,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_tools_only"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.opts.pushType).toBe("background");
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_completed");
+    expect(body.silent).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("web-watch downgrade composes with per-device suppression", async () => {
+    // Two phones (same human) + an open web tab. Phone A is foregrounded
+    // on the chat over SSE → suppressed entirely. Phone B is in the
+    // pocket → would normally get an ALERT, but the web tab downgrades it
+    // to a silent badge refresh.
+    const { client, calls } = buildFakeClient();
+    const watching = new Set(["tok_phone_a"]);
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [
+        buildDevice({ token: "tok_phone_a", credentialId: "owner" }),
+        buildDevice({ token: "tok_phone_b", credentialId: "owner" })
+      ],
+      isWatching: (_inst, tok, sess) => watching.has(tok) && sess === "chat_xyz",
+      isWebWatched: () => true,
+      hasAssistantText: () => true,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    // Only phone B is contacted, and as a silent wake.
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.token).toBe("tok_phone_b");
+    expect(calls[0]!.opts.pushType).toBe("background");
+    const body = calls[0]!.payload.body as Record<string, unknown>;
+    expect(body.silent).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("isWebWatched throwing falls back to sending the alert", async () => {
+    // A predicate fault must not swallow the user's notification — the
+    // safe default is to deliver the banner the user would otherwise get.
+    const { client, calls } = buildFakeClient();
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_phone" })],
+      isWatching: () => false,
+      isWebWatched: () => {
+        throw new Error("registry boom");
+      },
+      hasAssistantText: () => true,
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.opts.pushType).toBe("alert");
+    expect(warnings.some((w) => w.includes("isWebWatched failed"))).toBe(true);
+    dispatcher.stop();
+  });
+
   test("Completed phase with no taskId falls back to silent (conservative)", async () => {
     // Without a taskId we can't look up assistant_text history, so the
     // safer default is silent. This keeps pre-task-binding callers and
@@ -656,6 +846,245 @@ describe("apns dispatcher", () => {
     expect(body.threadId).toBe("thread_9");
     expect(body.sessionId).toBe("chat_x");
     expect(body.event).toBe("message_completed");
+  });
+
+  test("a throwing onTokenInvalidated on 410 is caught and warned, not propagated", async () => {
+    // The 410 cleanup hook runs inside a try/catch so a DB fault during
+    // token removal can't crash the fan-out for the other devices.
+    const { client, programResults } = buildFakeClient();
+    programResults.set("dead_tok", { ok: false, status: 410, reason: "Unregistered" });
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "dead_tok" })],
+      onTokenInvalidated: () => {
+        throw new Error("db locked");
+      },
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(warnings.some((w) => w.includes("token cleanup failed"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("a client.sendPush that throws is caught and warned", async () => {
+    const calls: string[] = [];
+    const throwingClient: APNsClient = {
+      async sendPush() {
+        throw new Error("socket hang up");
+      },
+      close(): void { /* noop */ }
+    };
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client: throwingClient,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      warn: (msg) => { warnings.push(msg); calls.push(msg); },
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(warnings.some((w) => w.includes("sendPush threw"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("a throwing listDevices is caught on the approval path (no devices, no crash)", async () => {
+    const { client, calls } = buildFakeClient();
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => {
+        throw new Error("devices table gone");
+      },
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(calls.length).toBe(0);
+    expect(warnings.some((w) => w.includes("listDevices failed"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("a throwing listDevices is caught on the phase-completion path", async () => {
+    const { client, calls } = buildFakeClient();
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => {
+        throw new Error("devices table gone");
+      },
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_x"
+    });
+
+    expect(calls.length).toBe(0);
+    expect(warnings.some((w) => w.includes("listDevices failed"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("a throwing hasAssistantText falls back to the silent path", async () => {
+    const { client, calls } = buildFakeClient();
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      hasAssistantText: () => {
+        throw new Error("blocks query failed");
+      },
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_x"
+    });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.opts.pushType).toBe("background");
+    expect(warnings.some((w) => w.includes("hasAssistantText failed"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("the production subscribe seam delivers blocks to dispatch and surfaces rejections", async () => {
+    // Exercises the real subscribe(handler) wiring: the dispatcher
+    // registers a handler that forwards blocks to dispatch() and routes a
+    // rejection into warn(). We drive a block through the captured handler
+    // and assert the fan-out happened.
+    const { client, calls } = buildFakeClient();
+    let captured: ((block: ChatBlock) => void) | undefined;
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      hasAssistantText: () => false,
+      warn: (msg) => warnings.push(msg),
+      subscribe: (_inst, handler) => {
+        captured = handler;
+        return () => { /* noop */ };
+      }
+    });
+
+    expect(captured).toBeDefined();
+    // A terminal phase block drives a (silent) push through the handler.
+    captured?.({
+      id: "block_from_seam",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_x"
+    });
+    // The handler's dispatch() is fire-and-forget; let the microtask settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.opts.pushType).toBe("background");
+    dispatcher.stop();
+  });
+
+  test("a rejection from the subscribe handler's dispatch is routed to warn", async () => {
+    // The subscribe handler is fire-and-forget — it can't await dispatch().
+    // If dispatch() REJECTS (an error past the per-path try/catch, e.g.
+    // payload construction on a malformed block after a successful device
+    // list), the handler's .catch must surface it via warn rather than
+    // leaving an unhandled rejection. We force that by returning a device
+    // list (so the payload-build line is reached) but driving an approval
+    // block whose id accessor throws during payload construction.
+    const { client } = buildFakeClient();
+    let captured: ((block: ChatBlock) => void) | undefined;
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      warn: (msg) => warnings.push(msg),
+      subscribe: (_inst, handler) => {
+        captured = handler;
+        return () => { /* noop */ };
+      }
+    });
+
+    // A malformed authorization block: accessing `authorizationId` throws,
+    // which buildApprovalPayload triggers AFTER listDevices succeeds —
+    // outside dispatchApproval's try, so dispatch() rejects.
+    const malformed = {
+      id: "block_bad",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "authorization_requested",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "boom"
+    } as unknown as ChatBlock;
+    Object.defineProperty(malformed, "authorizationId", {
+      get() { throw new Error("payload build boom"); }
+    });
+
+    captured?.(malformed);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(warnings.some((w) => w.includes("dispatch rejected"))).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("the default warn (no injected warn dep) logs via console.warn without throwing", async () => {
+    // Exercises the default warn closure — both the detail and no-detail
+    // branches — when no `warn` dep is supplied. We swap console.warn to a
+    // capture so the assertion is deterministic and no noise hits the test
+    // output.
+    const original = console.warn;
+    const lines: string[] = [];
+    console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+    try {
+      const { client, programResults } = buildFakeClient();
+      // A non-410 failure → the no-detail warn branch
+      // (`sendPush failed ...`). A 410 with a throwing cleanup → the
+      // with-detail branch (`token cleanup failed`, err message).
+      programResults.set("bad_tok", { ok: false, status: 400, reason: "BadDeviceToken" });
+      programResults.set("dead_tok", { ok: false, status: 410, reason: "Unregistered" });
+      const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+        client,
+        listDevices: () => [buildDevice({ token: "bad_tok" }), buildDevice({ token: "dead_tok" })],
+        onTokenInvalidated: () => { throw new Error("cleanup boom"); },
+        // No `warn` dep — the default console.warn closure runs.
+        subscribe: () => () => { /* noop */ }
+      });
+
+      await dispatcher.dispatch(approvalBlock());
+
+      expect(lines.some((l) => l.includes("[apns-dispatcher] sendPush failed"))).toBe(true);
+      expect(lines.some((l) => l.includes("[apns-dispatcher] token cleanup failed"))).toBe(true);
+      dispatcher.stop();
+    } finally {
+      console.warn = original;
+    }
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {

@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { Instance } from "../types";
 import {
   __resetSseSubscriptionsForTests,
+  addPushlessSubscription,
   addSseSubscription,
   clearDeviceWatch,
   clearSessionWatch,
   clearStreamWatch,
   hasAnyActiveSubscription,
-  isDeviceWatching
+  isDeviceWatching,
+  isSessionWebWatched
 } from "./sse-subscriptions";
 
 const INST = "sse-subs-test" as Instance;
@@ -189,5 +191,77 @@ describe("sse-subscriptions registry", () => {
     // A bare clearSessionWatch still clears a named stream (legacy path).
     expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
     expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+  });
+});
+
+describe("pushless (web/CLI) presence registry", () => {
+  beforeEach(() => {
+    __resetSseSubscriptionsForTests();
+  });
+
+  test("isSessionWebWatched is false when nothing is registered", () => {
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
+  });
+
+  test("addPushlessSubscription marks the session web-watched until cleanup", () => {
+    const cleanup = addPushlessSubscription(INST, "chat_x");
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(true);
+    // A different session is unaffected.
+    expect(isSessionWebWatched(INST, "chat_y")).toBe(false);
+    cleanup();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
+  });
+
+  test("two web tabs on the same chat survive a single cleanup (ref-counted)", () => {
+    // Two browser tabs open on the same chat. Closing one must not clear
+    // the presence the other still holds.
+    const tabA = addPushlessSubscription(INST, "chat_x");
+    const tabB = addPushlessSubscription(INST, "chat_x");
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(true);
+    tabA();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(true);
+    tabB();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
+  });
+
+  test("pushless cleanup is idempotent", () => {
+    const cleanup = addPushlessSubscription(INST, "chat_x");
+    cleanup();
+    cleanup();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
+  });
+
+  test("pushless presence is isolated per instance", () => {
+    const otherInst = "sse-subs-test-other" as Instance;
+    const cleanup = addPushlessSubscription(INST, "chat_x");
+    expect(isSessionWebWatched(otherInst, "chat_x")).toBe(false);
+    cleanup();
+  });
+
+  test("pushless and device registries are independent", () => {
+    // A web client watching chat_x must NOT make a device look like it's
+    // watching chat_x, and vice versa — the two predicates read disjoint
+    // state.
+    const web = addPushlessSubscription(INST, "chat_x");
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(true);
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+    const dev = addSseSubscription(INST, "tok_a", "chat_y");
+    expect(isDeviceWatching(INST, "tok_a", "chat_y")).toBe(true);
+    expect(isSessionWebWatched(INST, "chat_y")).toBe(false);
+    web();
+    dev();
+  });
+
+  test("__resetSseSubscriptionsForTests clears pushless presence too", () => {
+    addPushlessSubscription(INST, "chat_x");
+    __resetSseSubscriptionsForTests();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
+  });
+
+  test("a stale pushless cleanup after reset is harmless", () => {
+    const cleanup = addPushlessSubscription(INST, "chat_x");
+    __resetSseSubscriptionsForTests();
+    expect(() => cleanup()).not.toThrow();
+    expect(isSessionWebWatched(INST, "chat_x")).toBe(false);
   });
 });

@@ -136,7 +136,9 @@ export {
   hasAnyActiveSubscription,
   clearDeviceWatch,
   clearSessionWatch,
-  clearStreamWatch
+  clearStreamWatch,
+  addPushlessSubscription,
+  isSessionWebWatched
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,

@@ -17,6 +17,13 @@
 //     when that device has an active SSE subscription on the session —
 //     the open stream delivers the block directly and the wake-up is
 //     redundant.
+//     Separately, an alert push is DOWNGRADED to a silent badge refresh
+//     (across every phone) when a tokenless web/CLI client is
+//     live-watching the session: the human is reading the chat on the web
+//     app, so a banner on their phone for that same message is just
+//     noise. The badge still ticks (web reads don't clear a phone's
+//     per-device read cursor), but the phone doesn't buzz. Send-then-close
+//     leaves no web entry, so the phone gets its normal alert.
 //
 // Privacy: every alert payload carries ids + a generic title only.
 // Never the message text, the approval summary, or any user-authored
@@ -33,6 +40,7 @@
 
 import {
   isDeviceWatching,
+  isSessionWebWatched,
   listAllDevices,
   removeDevice,
   subscribeAllChatBlocks,
@@ -68,6 +76,13 @@ export interface DispatcherDeps {
   // block's sessionId; the implementation should return true when
   // that specific device has an open SSE stream on the session.
   isWatching?: (instance: Instance, deviceToken: string, sessionId: string) => boolean;
+  // Override the web-watch predicate — tests pin "a web/CLI client is
+  // reading this session" without touching the pushless registry's
+  // process state. True when a tokenless (web/CLI) client has a live SSE
+  // stream open on the session; the dispatcher uses it to downgrade an
+  // alert completion push to a silent badge refresh so the user's phone
+  // doesn't buzz for a message they're already reading on the web app.
+  isWebWatched?: (instance: Instance, sessionId: string) => boolean;
   // Override the "did this task produce an assistant_text block" lookup
   // — tests pin alert-vs-silent routing on Completed phase blocks
   // without seeding chat_blocks rows.
@@ -221,6 +236,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
   const onTokenInvalidated = deps?.onTokenInvalidated ?? ((inst, token) => { removeDevice(inst, token); });
   const subscribe = deps?.subscribe ?? subscribeAllChatBlocks;
   const isWatching = deps?.isWatching ?? isDeviceWatching;
+  const isWebWatched = deps?.isWebWatched ?? isSessionWebWatched;
   const hasAssistantText = deps?.hasAssistantText ?? taskProducedAssistantText;
   const warn = deps?.warn ?? ((message: string, detail?: unknown) => {
     if (detail !== undefined) console.warn(`[apns-dispatcher] ${message}`, detail);
@@ -314,7 +330,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     // when the block has no taskId — without a task to query, we can't
     // know whether a user-visible message was emitted, so we fall back
     // to the conservative silent path.
-    const sendAlert =
+    const wouldAlert =
       block.label === "Completed" &&
       typeof block.taskId === "string" &&
       block.taskId.length > 0 &&
@@ -326,6 +342,27 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
           return false;
         }
       })();
+
+    // Downgrade an alert to a silent badge refresh when a web/CLI client
+    // is live-watching this session: the human is reading the chat on the
+    // web app, so a banner on their phone for the same message is just
+    // noise. The badge still ticks (web reads don't advance the phone's
+    // per-device read cursor, so the message genuinely is unread there),
+    // but the phone doesn't buzz. A pure-silent push (Failed, or Completed
+    // with no assistant_text) is unaffected — it carries no banner to
+    // suppress. Evaluated live: the predicate is true only while a web
+    // stream is open, so a user who sends then closes the tab leaves no
+    // entry and the phone gets its normal alert.
+    let webWatched = false;
+    if (wouldAlert) {
+      try {
+        webWatched = isWebWatched(instance, block.sessionId);
+      } catch (error) {
+        warn("isWebWatched failed", error instanceof Error ? error.message : String(error));
+        webWatched = false;
+      }
+    }
+    const sendAlert = wouldAlert && !webWatched;
 
     const payload = sendAlert
       ? buildMessageCompletedPayload(block)

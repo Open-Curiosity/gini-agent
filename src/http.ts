@@ -5,6 +5,7 @@ import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
+  addPushlessSubscription,
   clearDeviceWatch,
   clearSessionWatch,
   clearStreamWatch,
@@ -3729,13 +3730,25 @@ function chatBlockStream(
       // (rare, but possible on certain client disconnects), the
       // registry doesn't pick up a phantom entry.
       //
-      // Web/CLI clients (no X-Device-Token) skip registration: there's
-      // no APNs device behind them, so per-device suppression doesn't
-      // apply. Registering under a credential key would also incorrectly
-      // suppress pushes to a foregrounded mobile device sharing the
-      // same credential.
+      // Mobile clients (with an X-Device-Token) register on the
+      // per-device registry so the dispatcher can skip a redundant
+      // completion push to THIS device — its open stream delivers the
+      // block directly. Registering under a credential key instead would
+      // wrongly suppress pushes to a foregrounded sibling device sharing
+      // the same credential, so the device token is load-bearing here.
+      //
+      // Web/CLI clients carry no device token. They still register —
+      // on the pushless (per-session) registry — so the dispatcher knows
+      // a human is reading this chat on the web and can downgrade the
+      // OTHER devices' completion alert to a silent badge refresh (no
+      // buzz for a message the user is already looking at). The entry
+      // lives only while the stream is open, so a client that sends and
+      // then closes the tab leaves nothing behind and the phone gets its
+      // normal alert.
       if (deviceToken) {
         unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId, streamId ?? undefined);
+      } else {
+        unregisterSubscription = addPushlessSubscription(config.instance, sessionId);
       }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
