@@ -4968,6 +4968,121 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("a tokenless web stream marks the session web-watched until it closes", async () => {
+    // A web client (no X-Device-Token) opening a chat stream registers on
+    // the pushless registry so the dispatcher can downgrade the phone's
+    // completion alert to a silent badge refresh while the human reads on
+    // the web. Closing the stream clears the entry — so a send-then-close
+    // leaves the phone eligible for its normal alert.
+    const config = testConfig("chat-stream-web-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "web presence" })
+    });
+
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+
+    // No X-Device-Token header → treated as a web/CLI client.
+    await withChatStream(handler, config, session.id, {}, () => {
+      // Web presence is recorded; the device registry is untouched (no
+      // token to key on).
+      expect(isSessionWebWatched(config.instance, session.id)).toBe(true);
+      expect(isDeviceWatching(config.instance, config.token, session.id)).toBe(false);
+    });
+
+    // Stream closed → presence cleared (the send-then-close path).
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
+  test("a stream with a valid X-Device-Token registers per-device watch (not pushless)", async () => {
+    // The mobile path: a registered device opens the stream with its
+    // valid token, which lands in the per-device registry so the
+    // dispatcher skips a redundant push to THIS device. It must NOT land
+    // in the pushless registry (that's web-only).
+    const config = testConfig("chat-stream-device-watch");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "device watch" })
+    });
+    // Register the device so deviceTokenFromRequest resolves it for the
+    // caller's credential.
+    const deviceToken = "valid_device_token_wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww";
+    await call(handler, config, "/api/push/devices", {
+      method: "POST",
+      body: JSON.stringify({ token: deviceToken, platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+    });
+
+    await withChatStream(
+      handler,
+      config,
+      session.id,
+      { headers: { "x-device-token": deviceToken } },
+      () => {
+        // Device watch recorded; pushless registry untouched.
+        expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(true);
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+      }
+    );
+    expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(false);
+  });
+
+  test("a stream with a present-but-invalid X-Device-Token registers NO presence (not web, not device)", async () => {
+    // Tri-state guard: deviceTokenFromRequest returns null for BOTH an
+    // absent header AND a present-but-unregistered/mismatched token. Only
+    // a truly-absent header is a web/CLI client. A real iPhone whose
+    // persisted token went stale (rotated server-side, or re-paired) primes
+    // that stale token onto the SSE handshake on cold launch — it must NOT
+    // be misclassified as a web client, or it would silence its OWN
+    // completion alerts for the session. With an invalid token present we
+    // register nothing: no pushless downgrade, no per-device skip.
+    const config = testConfig("chat-stream-stale-token");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stale token" })
+    });
+
+    const staleToken = "stale_unregistered_token_zzzzzzzzzzzzzzzzzzzzzzzz";
+    await withChatStream(
+      handler,
+      config,
+      session.id,
+      { headers: { "x-device-token": staleToken } },
+      () => {
+        // Neither registry recorded this stream — a stale-token phone keeps
+        // its normal alert.
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+        expect(isDeviceWatching(config.instance, staleToken, session.id)).toBe(false);
+      }
+    );
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
+  test("an unauthenticated stream request 401s and creates no pushless presence", async () => {
+    // The pushless registration is a notification side effect, so it must
+    // sit behind the bearer gate: a request with no Authorization header
+    // 401s before reaching the stream factory, leaving the registry empty.
+    // Pins that the side effect can't be triggered by an unauthenticated
+    // caller who merely knows a session id.
+    const config = testConfig("chat-stream-unauth-no-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "unauth presence" })
+    });
+
+    // No token argument → no Authorization header.
+    const response = await rawCall(handler, config, `/api/chat/${session.id}/stream`, {});
+    expect(response.status).toBe(401);
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
@@ -7157,6 +7272,50 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
     headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}), ...(init.headers ?? {}) }
   }));
   return response;
+}
+
+// Opens a chat SSE stream, pumps frames until the initial `chat_session`
+// frame lands (which only happens inside the stream's start() — i.e. AFTER
+// presence registration), runs the caller's `whileOpen` assertions, then
+// ALWAYS cancels the reader in a finally so a thrown assertion can't leak
+// the stream (its keepalive interval and presence entry would otherwise
+// survive the test). Returns after the reader is cancelled.
+async function withChatStream(
+  handler: ReturnType<typeof createHandler>,
+  config: RuntimeConfig,
+  sessionId: string,
+  init: RequestInit,
+  whileOpen: () => void
+): Promise<void> {
+  const response = await rawCall(handler, config, `/api/chat/${sessionId}/stream`, init, config.token);
+  expect(response.status).toBe(200);
+  const reader = response.body?.getReader();
+  expect(reader).toBeDefined();
+  if (!reader) return;
+  try {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise<{ done: boolean; value: undefined }>((resolve) =>
+          setTimeout(() => resolve({ done: false, value: undefined }), 50)
+        )
+      ]);
+      if (done) break;
+      if (value) buffer += decoder.decode(value);
+      if (buffer.includes("event: chat_session")) break;
+    }
+    expect(buffer).toContain("event: chat_session");
+    whileOpen();
+  } finally {
+    await reader.cancel();
+  }
+  // cancel() runs the stream's cleanup synchronously in-process; give the
+  // microtask queue one turn to settle before the caller asserts the
+  // post-close registry state.
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function testConfig(instance: string): RuntimeConfig {

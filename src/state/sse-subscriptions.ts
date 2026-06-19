@@ -1,21 +1,25 @@
-// Active SSE subscription tracking. A small in-process registry that
-// maps a device token to the set of chat session ids that device
-// currently has open over /api/chat/:id/stream.
+// SSE presence tracking. Two in-process registries that record which
+// chat sessions are currently being watched, consulted by the APNs
+// dispatcher (src/integrations/apns/dispatcher.ts):
 //
-// Used by the APNs dispatcher (src/integrations/apns/dispatcher.ts) so
-// that "completion" silent pushes — phase blocks with label `Completed`
-// or `Failed` — are suppressed when THIS device is actively watching
-// the session. Per-device (rather than per-credential) suppression is
-// load-bearing: two iOS installs of the same human share one
-// credential ("owner"), but only one of them might be foregrounded on
-// the chat — the other still needs the silent wake to refresh its
-// badge. Keying on the APNs token (which the device sends as
-// X-Device-Token on the SSE handshake) keeps the two devices distinct.
+//   1. Per-DEVICE (this file's primary registry): maps an APNs device
+//      token to the chat session ids that device has open over
+//      /api/chat/:id/stream. Lets the dispatcher SKIP a redundant
+//      completion push to THIS device — its open stream delivers the
+//      block directly. Per-device (rather than per-credential)
+//      suppression is load-bearing: two iOS installs of the same human
+//      share one credential ("owner"), but only one might be foregrounded
+//      on the chat — the other still needs the wake to refresh its badge.
+//      Keying on the APNs token (sent as X-Device-Token on the SSE
+//      handshake) keeps the two devices distinct.
 //
-// Web and CLI clients without a device token never register here —
-// they don't need silent-push suppression (there's no APNs device
-// behind them), and including them would collapse onto the same
-// credential key and break the per-device guarantee above.
+//   2. PUSHLESS web/CLI presence (the second registry, below): web and
+//      CLI clients carry no APNs device token, so they're absent from the
+//      per-device registry — but their presence still matters. When a
+//      human is reading a chat on the web app, the dispatcher DOWNGRADES
+//      the user's phone completion ALERT to a silent badge refresh so the
+//      phone doesn't buzz for a message they're already looking at. That
+//      registry is keyed by session id (there's no token to key on).
 //
 // The state is per-process and per-instance because SSE connections
 // terminate at this gateway process; a future multi-process deployment
@@ -204,8 +208,78 @@ export function clearStreamWatch(
   return cleared;
 }
 
+// Pushless (web / CLI) presence. Web and CLI clients open a chat SSE
+// stream but carry no APNs device token, so they never appear in the
+// per-device registry above — and they never need a push (there's no
+// APNs device behind them). Their presence still matters to the OTHER
+// devices: when a human is reading a chat on the web app, the phone
+// should not BUZZ for that chat's completion. The dispatcher downgrades
+// the phone's completion alert to a silent badge refresh while a web/CLI
+// client is live-watching the session (it can't fully suppress — web
+// reads don't advance the phone's per-device read cursor, so the message
+// genuinely is unread on the phone).
+//
+// Keyed by sessionId (there's no device token to key on) and
+// reference-counted by an opaque per-connection nonce, so two web tabs
+// open on the same chat coexist and one closing can't wipe the other.
+//
+// Evaluated LIVE at push time: an entry exists only while the stream is
+// open. A client that sends a message and then closes the tab leaves no
+// entry behind, so the phone receives its normal alert — there is no
+// stickiness. Per-session rather than per-connection because the
+// dispatcher's only question is "is ANY web/CLI client reading this chat
+// right now"; it never needs to address an individual web connection.
+const pushlessSessions: Map<string, Map<string, Set<string>>> = new Map();
+
+// Register a live web/CLI stream on the session it is watching. Returns
+// a cleanup function the stream MUST invoke from every teardown path
+// (cancel, error, normal close) so the registry stays accurate. Idempotent.
+export function addPushlessSubscription(
+  instance: Instance,
+  sessionId: string
+): () => void {
+  let sessions = pushlessSessions.get(instance);
+  if (!sessions) {
+    sessions = new Map();
+    pushlessSessions.set(instance, sessions);
+  }
+  let conns = sessions.get(sessionId);
+  if (!conns) {
+    conns = new Set();
+    sessions.set(sessionId, conns);
+  }
+  const nonce = Math.random().toString(36).slice(2);
+  conns.add(nonce);
+
+  let removed = false;
+  return () => {
+    if (removed) return;
+    removed = true;
+    const liveSessions = pushlessSessions.get(instance);
+    const liveConns = liveSessions?.get(sessionId);
+    if (!liveSessions || !liveConns) return;
+    liveConns.delete(nonce);
+    if (liveConns.size === 0) liveSessions.delete(sessionId);
+    if (liveSessions.size === 0) pushlessSessions.delete(instance);
+  };
+}
+
+// True when at least one web/CLI client has a live SSE stream open on
+// this session. The dispatcher consults this before firing a completion
+// alert: if a human is reading the chat on the web app, the alert is
+// downgraded to a silent badge refresh so the phone doesn't buzz for a
+// message the user is already looking at.
+export function isSessionWebWatched(
+  instance: Instance,
+  sessionId: string
+): boolean {
+  const conns = pushlessSessions.get(instance)?.get(sessionId);
+  return Boolean(conns && conns.size > 0);
+}
+
 // Test-only entry — wipes every recorded subscription so tests that
 // drive add/remove cycles don't leak into each other.
 export function __resetSseSubscriptionsForTests(): void {
   subscriptions.clear();
+  pushlessSessions.clear();
 }

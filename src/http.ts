@@ -5,6 +5,7 @@ import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
+  addPushlessSubscription,
   clearDeviceWatch,
   clearSessionWatch,
   clearStreamWatch,
@@ -695,11 +696,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!credential) return json({ error: "Unauthorized" }, 401);
       // X-Device-Token is optional — mobile clients send it after
       // they've registered their APNs token via POST /push/devices, so
-      // the dispatcher can per-device suppress completion silent pushes
-      // while they're watching. Web/CLI clients don't send it (they
-      // have no APNs token); they simply aren't tracked in the
-      // suppression registry, which is correct — no push is ever sent
-      // to them anyway.
+      // the dispatcher can per-device suppress a redundant completion push
+      // to THIS device while it's watching. Web/CLI clients don't send it
+      // (they have no APNs token), so they aren't in the per-device
+      // registry — but the stream factory below DOES record them in the
+      // pushless (per-session) registry, which lets the dispatcher
+      // downgrade the user's OTHER devices' completion alert to a silent
+      // badge refresh while the chat is open on the web.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
       // Optional client-named stream id. When present it's woven into the
       // watch handle so POST /push/unwatch?streamId= can clear exactly
@@ -3807,13 +3810,35 @@ function chatBlockStream(
       // (rare, but possible on certain client disconnects), the
       // registry doesn't pick up a phantom entry.
       //
-      // Web/CLI clients (no X-Device-Token) skip registration: there's
-      // no APNs device behind them, so per-device suppression doesn't
-      // apply. Registering under a credential key would also incorrectly
-      // suppress pushes to a foregrounded mobile device sharing the
-      // same credential.
+      // Mobile clients (with a valid X-Device-Token) register on the
+      // per-device registry so the dispatcher can skip a redundant
+      // completion push to THIS device — its open stream delivers the
+      // block directly. Registering under a credential key instead would
+      // wrongly suppress pushes to a foregrounded sibling device sharing
+      // the same credential, so the device token is load-bearing here.
+      //
+      // Web/CLI clients carry NO X-Device-Token header. They register on
+      // the pushless (per-session) registry so the dispatcher knows a
+      // human is reading this chat on the web and can downgrade the OTHER
+      // devices' completion alert to a silent badge refresh (no buzz for a
+      // message the user is already looking at). The entry lives only
+      // while the stream is open, so a client that sends and then closes
+      // the tab leaves nothing behind and the phone gets its normal alert.
+      //
+      // The header-PRESENT-but-invalid case (a stale rotated token, or a
+      // token paired to a different credential) is neither: deviceToken is
+      // null, but treating it as web presence would let a real phone whose
+      // persisted token went stale silence its OWN completion alerts on
+      // cold launch (the mobile client primes a possibly-stale token onto
+      // the handshake before it re-registers). So we register nothing for
+      // that case — no per-device skip, no pushless downgrade — which is
+      // the safe default (the phone keeps getting its alert).
+      const rawDeviceHeader = request.headers.get("x-device-token");
+      const deviceHeaderAbsent = !rawDeviceHeader || !rawDeviceHeader.trim();
       if (deviceToken) {
         unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId, streamId ?? undefined);
+      } else if (deviceHeaderAbsent) {
+        unregisterSubscription = addPushlessSubscription(config.instance, sessionId);
       }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
