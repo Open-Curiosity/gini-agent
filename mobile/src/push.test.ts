@@ -86,14 +86,15 @@ describe("dispatchNotificationResponse", () => {
     expect(deps.calls.api).toEqual([{ path: "/authorizations/authz_2/deny", method: "POST" }]);
   });
 
-  test("a well-formed approvalId passes through the path unchanged", () => {
+  test("a well-formed approvalId passes through the path unchanged", async () => {
     // encodeURIComponent must be a no-op for the server's opaque id shape
     // (`authz_<hex>`) — every character is URL-unreserved.
     const deps = buildSpyDeps();
-    void dispatchNotificationResponse(
+    const outcome = await dispatchNotificationResponse(
       buildResponse(APPROVE_ACTION, { approvalId: "authz_a1b2c3d4" }),
       deps
     );
+    expect(outcome).toEqual({ kind: "approve", approvalId: "authz_a1b2c3d4" });
     expect(deps.calls.api).toEqual([
       { path: "/authorizations/authz_a1b2c3d4/approve", method: "POST" }
     ]);
@@ -193,6 +194,24 @@ describe("dispatchNotificationResponse", () => {
     );
     expect(outcome).toEqual({ kind: "ignored" });
     expect(deps.calls.navigate).toEqual([]);
+  });
+
+  test("a throwing navigate rejects the dispatch promise (caller must catch)", async () => {
+    // The navigate branch doesn't guard deps.navigate, so a synchronous throw
+    // from router.push rejects the returned promise. The live listener's
+    // fire-and-forget call site appends .catch() to keep that from surfacing
+    // as an unhandled rejection; this pins the reject path it guards.
+    const deps: DispatchDeps = {
+      apiCall: async () => ({}) as never,
+      navigate: () => { throw new Error("navigator not ready"); },
+      notifyFailure: async () => {}
+    };
+    await expect(
+      dispatchNotificationResponse(
+        buildResponse("expo.modules.notifications.actions.DEFAULT", { sessionId: "chat_throw" }),
+        deps
+      )
+    ).rejects.toThrow("navigator not ready");
   });
 });
 

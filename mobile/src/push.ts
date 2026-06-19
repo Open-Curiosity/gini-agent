@@ -266,6 +266,11 @@ export function installNotificationResponseListener(): void {
         // Native module not ready — the stored response is harmless until
         // the next consume attempt, which clears it itself.
       }
+    }).catch(() => {
+      // dispatchNotificationResponse only rejects if the injected navigate
+      // (router.push) throws synchronously — the action branches swallow API
+      // errors themselves. Swallow here so a throwing navigate on this
+      // fire-and-forget path can't surface as an unhandled promise rejection.
     });
   });
 }
