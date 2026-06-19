@@ -1,21 +1,25 @@
-// Active SSE subscription tracking. A small in-process registry that
-// maps a device token to the set of chat session ids that device
-// currently has open over /api/chat/:id/stream.
+// SSE presence tracking. Two in-process registries that record which
+// chat sessions are currently being watched, consulted by the APNs
+// dispatcher (src/integrations/apns/dispatcher.ts):
 //
-// Used by the APNs dispatcher (src/integrations/apns/dispatcher.ts) so
-// that "completion" silent pushes — phase blocks with label `Completed`
-// or `Failed` — are suppressed when THIS device is actively watching
-// the session. Per-device (rather than per-credential) suppression is
-// load-bearing: two iOS installs of the same human share one
-// credential ("owner"), but only one of them might be foregrounded on
-// the chat — the other still needs the silent wake to refresh its
-// badge. Keying on the APNs token (which the device sends as
-// X-Device-Token on the SSE handshake) keeps the two devices distinct.
+//   1. Per-DEVICE (this file's primary registry): maps an APNs device
+//      token to the chat session ids that device has open over
+//      /api/chat/:id/stream. Lets the dispatcher SKIP a redundant
+//      completion push to THIS device — its open stream delivers the
+//      block directly. Per-device (rather than per-credential)
+//      suppression is load-bearing: two iOS installs of the same human
+//      share one credential ("owner"), but only one might be foregrounded
+//      on the chat — the other still needs the wake to refresh its badge.
+//      Keying on the APNs token (sent as X-Device-Token on the SSE
+//      handshake) keeps the two devices distinct.
 //
-// Web and CLI clients without a device token never register here —
-// they don't need silent-push suppression (there's no APNs device
-// behind them), and including them would collapse onto the same
-// credential key and break the per-device guarantee above.
+//   2. PUSHLESS web/CLI presence (the second registry, below): web and
+//      CLI clients carry no APNs device token, so they're absent from the
+//      per-device registry — but their presence still matters. When a
+//      human is reading a chat on the web app, the dispatcher DOWNGRADES
+//      the user's phone completion ALERT to a silent badge refresh so the
+//      phone doesn't buzz for a message they're already looking at. That
+//      registry is keyed by session id (there's no token to key on).
 //
 // The state is per-process and per-instance because SSE connections
 // terminate at this gateway process; a future multi-process deployment

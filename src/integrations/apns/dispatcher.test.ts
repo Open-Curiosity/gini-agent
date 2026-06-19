@@ -970,11 +970,12 @@ describe("apns dispatcher", () => {
     dispatcher.stop();
   });
 
-  test("the production subscribe seam delivers blocks to dispatch and surfaces rejections", async () => {
+  test("the production subscribe seam delivers blocks to dispatch", async () => {
     // Exercises the real subscribe(handler) wiring: the dispatcher
-    // registers a handler that forwards blocks to dispatch() and routes a
-    // rejection into warn(). We drive a block through the captured handler
-    // and assert the fan-out happened.
+    // registers a handler that forwards blocks to dispatch(). We drive a
+    // block through the captured handler and assert the fan-out happened.
+    // (The rejection-routing half of that handler is covered by the next
+    // test.)
     const { client, calls } = buildFakeClient();
     let captured: ((block: ChatBlock) => void) | undefined;
     const warnings: string[] = [];

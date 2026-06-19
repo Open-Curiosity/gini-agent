@@ -98,7 +98,7 @@ The chosen design uses two transports in concert:
 | ----- | ---- | --------- |
 | `authorization_requested` | Always (alert + inline Approve/Deny actions) | The runtime can't make progress without user input; the user may not be in the app. |
 | `setup_requested` | Always (alert, no action buttons — deep-links on tap) | The user must complete a step (sign in, fill a form) in the app; surface it but don't offer approve/deny. |
-| `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device | Background and scheduled work that produces a real reply is exactly what the user wants to know about. |
+| `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device; **downgraded to a silent badge tick** while a web/CLI client is reading the session (see "Cross-client presence") | Background and scheduled work that produces a real reply is exactly what the user wants to know about — unless the user is already reading it elsewhere. |
 | `phase: Completed` with no `assistant_text` (only tool calls / system notes) | Silent (badge tick), only if no active SSE subscription | Nothing for the user to read — bump the badge so the chat list is accurate, but don't surface a banner. |
 | `phase: Failed` | Silent (badge tick), only if no active SSE subscription | Failure noise shouldn't yell at the user; tapping the chat surfaces the error. |
 | `phase: Cancelled` | Never | User-initiated terminal state; the user is already in the app. |
@@ -119,6 +119,47 @@ two iOS installs of the same human can be in different app states
 (one watching, one backgrounded). The backgrounded install still gets
 the wake-up (alert or silent) so its badge and visible state stay in
 sync.
+
+## Cross-client presence (web/CLI reading downgrades the phone alert)
+
+The per-device suppression above only knows about clients that carry an
+APNs device token — i.e. iOS installs. A web or CLI client opens the same
+`/api/chat/:id/stream` but sends no `X-Device-Token`, so it can never
+appear in the per-device registry. Without more, a turn the user finishes
+in the web app still fires the "Gini has a new message" banner to their
+phone — a buzz for a message they're already reading.
+
+So the gateway tracks tokenless stream presence in a second, per-session
+registry (`addPushlessSubscription` / `isSessionWebWatched` in
+`src/state/sse-subscriptions.ts`). When a `Completed`-with-`assistant_text`
+push would fire an alert, the dispatcher first checks whether a web/CLI
+client is live-watching that session; if so it **downgrades the alert to a
+silent badge tick** for every phone (`sendAlert = wouldAlert &&
+!webWatched` in `src/integrations/apns/dispatcher.ts`). The badge still
+ticks — web reads do not advance a phone's per-device read cursor, so the
+message is genuinely unread on the phone — but the phone does not buzz.
+
+Three properties make this safe:
+
+- **Live, not latched.** Presence is the open stream itself, evaluated at
+  push time. A user who sends a message and then closes the tab leaves no
+  entry, so the phone receives its normal alert.
+- **Header-absent only.** `deviceTokenFromRequest` returns `null` for an
+  absent header AND for a present-but-invalid/mismatched token. Only a
+  genuinely absent header registers pushless presence. A real phone whose
+  persisted token went stale (the mobile client primes a possibly-stale
+  token onto the handshake on cold launch before it re-registers) is NOT
+  misclassified as web — it registers nothing and keeps its own alert.
+- **Non-destructive.** The downgrade only ever turns an alert into a
+  silent badge refresh. A pure-silent push (`Failed`, or `Completed` with
+  no `assistant_text`) carries no banner and is unaffected.
+
+Liveness mirrors the per-device path's normal close: the stream's
+`cancel()` clears the entry. Web/CLI clients reach the gateway over a
+loopback hop (the Next.js BFF, or `next start` → BFF), not the mobile
+relay, so a client disconnect propagates to `cancel()` and there is no
+relay-buffered stale-socket case to need an explicit unwatch beacon. The
+registry is per-process in-memory, so a gateway restart resets it.
 
 ## NSE enrichment (rich previews without leaking text to Apple)
 

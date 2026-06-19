@@ -4986,45 +4986,14 @@ describe("runtime api", () => {
     expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
 
     // No X-Device-Token header → treated as a web/CLI client.
-    const response = await rawCall(
-      handler,
-      config,
-      `/api/chat/${session.id}/stream`,
-      {},
-      config.token
-    );
-    expect(response.status).toBe(200);
-    const reader = response.body?.getReader();
-    expect(reader).toBeDefined();
-    // Pump until the initial chat_session frame lands, which only happens
-    // inside the stream's start() — i.e. after registration.
-    const decoder = new TextDecoder();
-    let buffer = "";
-    if (reader) {
-      const deadline = Date.now() + 500;
-      while (Date.now() < deadline) {
-        const { done, value } = await Promise.race([
-          reader.read(),
-          new Promise<{ done: boolean; value: undefined }>((resolve) =>
-            setTimeout(() => resolve({ done: false, value: undefined }), 50)
-          )
-        ]);
-        if (done) break;
-        if (value) buffer += decoder.decode(value);
-        if (buffer.includes("event: chat_session")) break;
-      }
-    }
-    expect(buffer).toContain("event: chat_session");
-    // Web presence is recorded; the device registry is untouched (no
-    // token to key on).
-    expect(isSessionWebWatched(config.instance, session.id)).toBe(true);
-    expect(isDeviceWatching(config.instance, config.token, session.id)).toBe(false);
+    await withChatStream(handler, config, session.id, {}, () => {
+      // Web presence is recorded; the device registry is untouched (no
+      // token to key on).
+      expect(isSessionWebWatched(config.instance, session.id)).toBe(true);
+      expect(isDeviceWatching(config.instance, config.token, session.id)).toBe(false);
+    });
 
-    // Close the stream → presence clears (the send-then-close path).
-    if (reader) await reader.cancel();
-    // cancel() runs the stream's cleanup synchronously in-process; give
-    // the microtask queue one turn to settle before asserting.
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Stream closed → presence cleared (the send-then-close path).
     expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
   });
 
@@ -5048,38 +5017,17 @@ describe("runtime api", () => {
       body: JSON.stringify({ token: deviceToken, platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
     });
 
-    const response = await rawCall(
+    await withChatStream(
       handler,
       config,
-      `/api/chat/${session.id}/stream`,
+      session.id,
       { headers: { "x-device-token": deviceToken } },
-      config.token
-    );
-    expect(response.status).toBe(200);
-    const reader = response.body?.getReader();
-    expect(reader).toBeDefined();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    if (reader) {
-      const deadline = Date.now() + 500;
-      while (Date.now() < deadline) {
-        const { done, value } = await Promise.race([
-          reader.read(),
-          new Promise<{ done: boolean; value: undefined }>((resolve) =>
-            setTimeout(() => resolve({ done: false, value: undefined }), 50)
-          )
-        ]);
-        if (done) break;
-        if (value) buffer += decoder.decode(value);
-        if (buffer.includes("event: chat_session")) break;
+      () => {
+        // Device watch recorded; pushless registry untouched.
+        expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(true);
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
       }
-    }
-    expect(buffer).toContain("event: chat_session");
-    // Device watch recorded; pushless registry untouched.
-    expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(true);
-    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
-    if (reader) await reader.cancel();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    );
     expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(false);
   });
 
@@ -5101,39 +5049,18 @@ describe("runtime api", () => {
     });
 
     const staleToken = "stale_unregistered_token_zzzzzzzzzzzzzzzzzzzzzzzz";
-    const response = await rawCall(
+    await withChatStream(
       handler,
       config,
-      `/api/chat/${session.id}/stream`,
+      session.id,
       { headers: { "x-device-token": staleToken } },
-      config.token
-    );
-    expect(response.status).toBe(200);
-    const reader = response.body?.getReader();
-    expect(reader).toBeDefined();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    if (reader) {
-      const deadline = Date.now() + 500;
-      while (Date.now() < deadline) {
-        const { done, value } = await Promise.race([
-          reader.read(),
-          new Promise<{ done: boolean; value: undefined }>((resolve) =>
-            setTimeout(() => resolve({ done: false, value: undefined }), 50)
-          )
-        ]);
-        if (done) break;
-        if (value) buffer += decoder.decode(value);
-        if (buffer.includes("event: chat_session")) break;
+      () => {
+        // Neither registry recorded this stream — a stale-token phone keeps
+        // its normal alert.
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+        expect(isDeviceWatching(config.instance, staleToken, session.id)).toBe(false);
       }
-    }
-    expect(buffer).toContain("event: chat_session");
-    // Neither registry recorded this stream — a stale-token phone keeps
-    // its normal alert.
-    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
-    expect(isDeviceWatching(config.instance, staleToken, session.id)).toBe(false);
-    if (reader) await reader.cancel();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    );
     expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
   });
 
@@ -7147,6 +7074,50 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
     headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}), ...(init.headers ?? {}) }
   }));
   return response;
+}
+
+// Opens a chat SSE stream, pumps frames until the initial `chat_session`
+// frame lands (which only happens inside the stream's start() — i.e. AFTER
+// presence registration), runs the caller's `whileOpen` assertions, then
+// ALWAYS cancels the reader in a finally so a thrown assertion can't leak
+// the stream (its keepalive interval and presence entry would otherwise
+// survive the test). Returns after the reader is cancelled.
+async function withChatStream(
+  handler: ReturnType<typeof createHandler>,
+  config: RuntimeConfig,
+  sessionId: string,
+  init: RequestInit,
+  whileOpen: () => void
+): Promise<void> {
+  const response = await rawCall(handler, config, `/api/chat/${sessionId}/stream`, init, config.token);
+  expect(response.status).toBe(200);
+  const reader = response.body?.getReader();
+  expect(reader).toBeDefined();
+  if (!reader) return;
+  try {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise<{ done: boolean; value: undefined }>((resolve) =>
+          setTimeout(() => resolve({ done: false, value: undefined }), 50)
+        )
+      ]);
+      if (done) break;
+      if (value) buffer += decoder.decode(value);
+      if (buffer.includes("event: chat_session")) break;
+    }
+    expect(buffer).toContain("event: chat_session");
+    whileOpen();
+  } finally {
+    await reader.cancel();
+  }
+  // cancel() runs the stream's cleanup synchronously in-process; give the
+  // microtask queue one turn to settle before the caller asserts the
+  // post-close registry state.
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function testConfig(instance: string): RuntimeConfig {
