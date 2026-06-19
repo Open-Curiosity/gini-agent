@@ -374,8 +374,8 @@ describe("chat-task loop", () => {
   test("resumeChatTask rehydrates the snapshot and runLoop re-dehydrates on a second pause (pins the wiring)", async () => {
     // Pins the production WIRING, not just the helpers: a paused task carries a
     // dehydrated inline-image snapshot. The REAL resumeChatTask must rehydrate
-    // it (chat-task.ts:3843) before feeding runLoop, and when runLoop pauses
-    // again at a fresh gate it must re-dehydrate the snapshot (chat-task.ts:3383).
+    // it before feeding runLoop, and when runLoop pauses again at a fresh gate
+    // it must re-dehydrate the snapshot it persists.
     // The decisive check reads the messages echo actually received post-resume
     // (echo records each turn) and asserts the image part there is the FULL
     // restored data-URL — so a missing rehydrate (marker left in place) fails
