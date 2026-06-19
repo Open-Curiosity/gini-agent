@@ -175,10 +175,13 @@ being re-read every turn.
 - The `tool_call_id` is the contract between the LLM and the runtime.
   Don't drop it on the approval payload — the resume path needs it to
   match the snapshot's pending entry.
-- `Task.toolCallState` is large (a full message array). It is cleared
-  on completion or failure. Any new branch that ends the loop must
-  clear it too, otherwise completed tasks retain stale conversation
-  snapshots in state.
+- `Task.toolCallState` holds the paused turn's message array. Large
+  inline image/document base64 payloads are externalized out of it into
+  a content-addressed side store before the snapshot is persisted, and
+  rehydrated on resume (see ADR toolcall-payload-externalization.md), so
+  the persisted snapshot stays small. It is cleared on completion or
+  failure. Any new branch that ends the loop must clear it too, otherwise
+  completed tasks retain stale conversation snapshots in state.
 - Streaming partial text into `task.partialSummary` still works: the
   loop debounces deltas the same way the legacy summary path did.
 

@@ -72,3 +72,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Per-Agent Structured Database Primitive](agent-database.md)
 - [In-App Log Viewing](logs-viewing.md)
 - [Comprehensive Token Usage Accounting](usage-accounting.md)
+- [Tool-Call State Payload Externalization](toolcall-payload-externalization.md)

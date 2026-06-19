@@ -776,6 +776,44 @@ describe("provider", () => {
     }
   });
 
+  test("deepseek strip THROWS on a document carrying an unresolved payload ref instead of silently dropping it", async () => {
+    // Regression guard (ADR toolcall-payload-externalization.md): a paused task
+    // can resume after the provider changed to one that can't ingest documents
+    // (nativeDocs:false). If that document's data is an UNRESOLVED externalized
+    // reference (side file missing), the request-boundary strip must throw, not
+    // silently drop it — otherwise the externalization silent-loss guard is
+    // bypassed for documents. The marker shape mirrors toolcall-payloads.ts:
+    // a 0x1e control byte + "gini-toolcall-ref:sha256:" + 64 hex chars.
+    const originalKey = process.env.DEEPSEEK_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    let fetched = false;
+    globalThis.fetch = (() => { fetched = true; return Promise.resolve(new Response("{}", { status: 200 })); }) as unknown as typeof fetch;
+    try {
+      const provider = normalizeProvider({ name: "deepseek", model: "deepseek-chat" });
+      const ref = `\x1egini-toolcall-ref:sha256:${"a".repeat(64)}`;
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "summarize this" },
+            { type: "document", document: { mimeType: "application/pdf", data: ref, filename: "report.pdf" } }
+          ]
+        }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(String(err)).toContain("Unresolved toolCallState payload reference");
+      // Crucially, it threw at the request-build boundary BEFORE any network call.
+      expect(fetched).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = originalKey;
+    }
+  });
+
   test("openai vision posts an image_url content part to /chat/completions", async () => {
     const original = process.env.OPENAI_API_KEY;
     const originalFetch = globalThis.fetch;

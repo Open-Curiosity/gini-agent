@@ -721,6 +721,16 @@ function stripDocumentPartsIfUnsupported(
   return messages.map((message) => {
     if (!Array.isArray(message.content)) return message;
     if (!message.content.some((part) => part.type === "document")) return message;
+    // A document carrying an UNRESOLVED payload reference must never be
+    // silently dropped here: that would reintroduce the exact silent-loss
+    // failure the externalization guards prevent (ADR
+    // toolcall-payload-externalization.md). Assert before stripping so a
+    // missing side file throws loudly rather than vanishing on a
+    // provider-changed resume. A resolved (real-base64) document strips as
+    // before.
+    for (const part of message.content) {
+      if (part.type === "document") assertNoPayloadRef(part.document.data);
+    }
     const kept = message.content.filter((part) => part.type !== "document");
     return {
       ...message,
