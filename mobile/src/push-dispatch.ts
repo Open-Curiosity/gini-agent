@@ -75,6 +75,21 @@ export interface LaunchTapRoute {
   threadId: string | null;
 }
 
+// Builds the deep-link route string a notification tap opens. A threaded
+// completion opens the thread view (the main chat filters threaded blocks
+// out, so opening it would hide the reply the banner previewed); a main-chat
+// tap omits the thread segment. Both dynamic segments are percent-encoded as
+// a boundary guard so a malformed id from the push payload can't reshape the
+// route path — the ids are server-generated opaque tokens, so the encode is a
+// no-op for well-formed input. Pure (no expo-router) so the encode + the
+// thread-vs-main branch are unit-testable; the push.ts navigateToChat wrapper
+// just feeds the result to router.push.
+export function buildChatRoute(sessionId: string, threadId: string | null): string {
+  return threadId
+    ? `/chat/${encodeURIComponent(sessionId)}/thread/${encodeURIComponent(threadId)}`
+    : `/chat/${encodeURIComponent(sessionId)}`;
+}
+
 // Reads the routing fields the server-side dispatcher writes into a push
 // payload's `body` object (surfaced by expo-notifications as
 // `content.data`). Shared by the live-tap dispatcher and the cold-start

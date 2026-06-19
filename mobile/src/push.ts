@@ -46,7 +46,7 @@
 // row's `last_seen_at` is bumped and nothing else changes.
 
 import { Platform } from "react-native";
-import { router } from "expo-router";
+import { router, type Href } from "expo-router";
 import * as Notifications from "expo-notifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { api, ApiError } from "./api";
@@ -55,6 +55,7 @@ import {
   APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
+  buildChatRoute,
   consumeLaunchTap,
   dispatchNotificationResponse
 } from "./push-dispatch";
@@ -216,15 +217,12 @@ export async function refreshBadge(): Promise<void> {
 // the live-tap response listener and the cold-start launch-tap consume so
 // both navigate to exactly the same route.
 function navigateToChat(sessionId: string, threadId: string | null): void {
-  // Percent-encode the dynamic segments. Both ids are server-generated opaque
-  // tokens (`chat_…` / `thread_…`), so this is a no-op for well-formed input;
-  // it's a boundary guard so a malformed id from the push payload can't
-  // reshape the route path.
-  router.push(
-    threadId
-      ? `/chat/${encodeURIComponent(sessionId)}/thread/${encodeURIComponent(threadId)}`
-      : `/chat/${encodeURIComponent(sessionId)}`
-  );
+  // Route construction (encode + thread/main branch) lives in the native-free
+  // buildChatRoute so it's unit-testable; this wrapper just performs the push.
+  // buildChatRoute returns a plain string (it's native-free); cast to Href for
+  // expo-router's typed-route signature — the path always matches a declared
+  // /chat/[sessionId][/thread/[threadId]] route.
+  router.push(buildChatRoute(sessionId, threadId) as Href);
 }
 
 // Installs the live notification-response listener that routes taps and

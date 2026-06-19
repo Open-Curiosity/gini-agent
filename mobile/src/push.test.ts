@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import {
   APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
+  buildChatRoute,
   consumeLaunchTap,
   DENY_ACTION,
   dispatchNotificationResponse,
@@ -263,6 +264,33 @@ describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
       buildResponse("expo.modules.notifications.actions.DEFAULT", null)
     );
     expect(route).toBeNull();
+  });
+});
+
+describe("buildChatRoute", () => {
+  test("a main-chat route omits the thread segment", () => {
+    expect(buildChatRoute("chat_1", null)).toBe("/chat/chat_1");
+  });
+
+  test("a thread route includes both segments", () => {
+    expect(buildChatRoute("chat_1", "thread_2")).toBe("/chat/chat_1/thread/thread_2");
+  });
+
+  test("a well-formed id passes through unchanged (encode is a no-op)", () => {
+    // Server ids are `[a-z0-9_]`, all URL-unreserved — encoding must not alter them.
+    expect(buildChatRoute("chat_a1b2c3d4", "thread_e5f6")).toBe(
+      "/chat/chat_a1b2c3d4/thread/thread_e5f6"
+    );
+  });
+
+  test("a malformed sessionId is percent-encoded so it can't reshape the route", () => {
+    expect(buildChatRoute("../setup?x=", null)).toBe("/chat/..%2Fsetup%3Fx%3D");
+  });
+
+  test("both segments are encoded on the thread path (the second is the easy one to miss)", () => {
+    expect(buildChatRoute("../a?x=", "../b#y")).toBe(
+      "/chat/..%2Fa%3Fx%3D/thread/..%2Fb%23y"
+    );
   });
 });
 
