@@ -35,6 +35,19 @@ function approvalBlock(overrides?: Partial<Extract<ChatBlock, { kind: "authoriza
   };
 }
 
+function phaseBlock(overrides?: Partial<Extract<ChatBlock, { kind: "phase" }>>): Extract<ChatBlock, { kind: "phase" }> {
+  return {
+    id: "block_phase_done",
+    sessionId: "chat_xyz",
+    instance: "test-inst" as Instance,
+    ordinal: 10,
+    createdAt: new Date().toISOString(),
+    kind: "phase",
+    label: "Completed",
+    ...overrides
+  };
+}
+
 function buildFakeClient(): { client: APNsClient; calls: Array<{ token: string; payload: APNsPayload; opts: APNsSendOptions }>; programResults: Map<string, APNsSendResult>; } {
   const calls: Array<{ token: string; payload: APNsPayload; opts: APNsSendOptions }> = [];
   const programResults = new Map<string, APNsSendResult>();
@@ -237,15 +250,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    await dispatcher.dispatch(phaseBlock());
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -277,15 +282,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_fail",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 11,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Failed"
-    });
+    await dispatcher.dispatch(phaseBlock({ id: "block_phase_fail", ordinal: 11, label: "Failed" }));
 
     expect(calls.length).toBe(1);
     const body = calls[0]!.payload.body as Record<string, unknown>;
@@ -304,15 +301,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    await dispatcher.dispatch(phaseBlock());
 
     expect(calls.length).toBe(0);
 
@@ -325,15 +314,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
     watching = false;
-    await dispatcher2.dispatch({
-      id: "block_phase_done2",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 11,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    await dispatcher2.dispatch(phaseBlock({ id: "block_phase_done2", ordinal: 11 }));
     expect(calls.length).toBe(1);
     dispatcher.stop();
     dispatcher2.stop();
@@ -358,15 +339,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    await dispatcher.dispatch(phaseBlock());
 
     // iPhone B must receive the silent wake; iPhone A must not.
     expect(calls.length).toBe(1);
@@ -382,38 +355,14 @@ describe("apns dispatcher", () => {
       isWatching: () => false,
       subscribe: () => () => { /* noop */ }
     });
-    await dispatcher.dispatch({
-      id: "phase_thinking",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 1,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Thinking"
-    });
-    await dispatcher.dispatch({
-      id: "phase_cancelled",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 2,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Cancelled"
-    });
+    await dispatcher.dispatch(phaseBlock({ id: "phase_thinking", ordinal: 1, label: "Thinking" }));
+    await dispatcher.dispatch(phaseBlock({ id: "phase_cancelled", ordinal: 2, label: "Cancelled" }));
     expect(calls.length).toBe(0);
     dispatcher.stop();
   });
 
   test("buildPhaseSilentPayload carries only routing fields and a number-typed content-available", () => {
-    const payload = buildPhaseSilentPayload({
-      id: "b1",
-      sessionId: "chat_x",
-      instance: "test-inst" as Instance,
-      ordinal: 1,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    const payload = buildPhaseSilentPayload(phaseBlock({ id: "b1", sessionId: "chat_x", ordinal: 1 }));
     // Round-tripping through JSON preserves the numeric 1.
     const wire = JSON.parse(JSON.stringify(payload));
     expect(wire.aps["content-available"]).toBe(1);
@@ -440,16 +389,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -485,16 +425,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_tools_only"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_tools_only" }));
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -522,16 +453,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_fail",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 11,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Failed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ id: "block_phase_fail", ordinal: 11, label: "Failed", taskId: "task_with_text" }));
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -560,16 +482,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     expect(calls.length).toBe(1);
     expect(calls[0]!.token).toBe("tok_iphone_b");
@@ -594,16 +507,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     // The phone still receives a push, but as a SILENT background wake —
     // no banner, no sound.
@@ -637,16 +541,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -674,16 +569,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_tools_only"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_tools_only" }));
 
     expect(calls.length).toBe(1);
     const call = calls[0]!;
@@ -713,16 +599,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     // Only phone B is contacted, and as a silent wake.
     expect(calls.length).toBe(1);
@@ -750,16 +627,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_with_text"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_with_text" }));
 
     expect(calls.length).toBe(1);
     expect(calls[0]!.opts.pushType).toBe("alert");
@@ -782,15 +650,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed"
-    });
+    await dispatcher.dispatch(phaseBlock());
 
     expect(calls.length).toBe(1);
     expect(calls[0]!.opts.pushType).toBe("background");
@@ -801,16 +661,9 @@ describe("apns dispatcher", () => {
     // Privacy assertion: the wire payload for a completion alert must
     // carry only routing ids and the generic title. No assistant text,
     // no tool output, nothing user-visible.
-    const payload = buildMessageCompletedPayload({
-      id: "b1",
-      sessionId: "chat_x",
-      instance: "test-inst" as Instance,
-      ordinal: 1,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_x"
-    });
+    const payload = buildMessageCompletedPayload(
+      phaseBlock({ id: "b1", sessionId: "chat_x", ordinal: 1, taskId: "task_x" })
+    );
     const wire = JSON.stringify(payload);
     // Defensive: a sample of strings that must never leak into push
     // payloads. If a future change starts forwarding chat text, these
@@ -831,17 +684,9 @@ describe("apns dispatcher", () => {
   test("buildMessageCompletedPayload carries threadId for a threaded completion", () => {
     // So the NSE's preview fetch resolves the thread's own reply rather
     // than stale main-chat text.
-    const payload = buildMessageCompletedPayload({
-      id: "b2",
-      sessionId: "chat_x",
-      instance: "test-inst" as Instance,
-      ordinal: 2,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_y",
-      threadId: "thread_9"
-    });
+    const payload = buildMessageCompletedPayload(
+      phaseBlock({ id: "b2", sessionId: "chat_x", ordinal: 2, taskId: "task_y", threadId: "thread_9" })
+    );
     const body = payload.body as Record<string, unknown>;
     expect(body.threadId).toBe("thread_9");
     expect(body.sessionId).toBe("chat_x");
@@ -923,16 +768,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_x"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_x" }));
 
     expect(calls.length).toBe(0);
     expect(warnings.some((w) => w.includes("listDevices failed"))).toBe(true);
@@ -953,16 +789,7 @@ describe("apns dispatcher", () => {
       subscribe: () => () => { /* noop */ }
     });
 
-    await dispatcher.dispatch({
-      id: "block_phase_done",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 10,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_x"
-    });
+    await dispatcher.dispatch(phaseBlock({ taskId: "task_x" }));
 
     expect(calls.length).toBe(1);
     expect(calls[0]!.opts.pushType).toBe("background");
@@ -993,16 +820,7 @@ describe("apns dispatcher", () => {
 
     expect(captured).toBeDefined();
     // A terminal phase block drives a (silent) push through the handler.
-    captured?.({
-      id: "block_from_seam",
-      sessionId: "chat_xyz",
-      instance: "test-inst" as Instance,
-      ordinal: 1,
-      createdAt: new Date().toISOString(),
-      kind: "phase",
-      label: "Completed",
-      taskId: "task_x"
-    });
+    captured?.(phaseBlock({ id: "block_from_seam", ordinal: 1, taskId: "task_x" }));
     // The handler's dispatch() is fire-and-forget; let the microtask settle.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(calls.length).toBe(1);
