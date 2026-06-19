@@ -376,10 +376,12 @@ describe("chat-task loop", () => {
     // dehydrated inline-image snapshot. The REAL resumeChatTask must rehydrate
     // it (chat-task.ts:3843) before feeding runLoop, and when runLoop pauses
     // again at a fresh gate it must re-dehydrate the snapshot (chat-task.ts:3383).
-    // If either wiring call were removed, this test fails: a missing rehydrate
-    // would leave the marker, and the guarded Anthropic/echo serializers would
-    // throw (resume errors); a missing dehydrate would leave the raw base64 in
-    // the re-paused state.json on disk.
+    // The decisive check reads the messages echo actually received post-resume
+    // (echo records each turn) and asserts the image part there is the FULL
+    // restored data-URL — so a missing rehydrate (marker left in place) fails
+    // even though echo never serializes through the assertNoPayloadRef guard.
+    // A missing dehydrate would leave the raw base64 in the re-paused
+    // state.json on disk, caught by the final assertion.
     const { dehydrateMessages, isPayloadRef, __testing } = await import("../state/toolcall-payloads");
     const { resumeChatTask } = await import("../execution/chat-task");
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
@@ -432,14 +434,31 @@ describe("chat-task loop", () => {
     await resumeChatTask(config, taskId, "call_g1", "wrote first.txt");
     const repaused = await waitForTerminal(config, taskId);
 
-    // Resume succeeded and re-paused at the second gate — proves rehydrate fed
-    // valid (non-marker) content through runLoop without the serializer throwing.
+    // Resume succeeded and re-paused at the second gate.
     expect(repaused.status).toBe("waiting_approval");
     expect(repaused.toolCallState).toBeDefined();
 
-    // The re-paused snapshot still has the image as a REFERENCE (runLoop
-    // re-dehydrated), pointing at the SAME content hash — proving the image
-    // survived rehydrate→loop→dehydrate byte-identical.
+    // DECISIVE rehydrate assertion: inspect the exact messages the loop fed to
+    // the model on the post-resume turn (echo records each turn's messages).
+    // The image part there must carry the FULL restored data-URL, never the
+    // marker — this is true ONLY if resumeChatTask's rehydrateMessages actually
+    // dereferenced the side file. A regression that left the marker (broken
+    // rehydrate) would show the marker here and fail, even though the snapshot
+    // round-trip below would otherwise look unchanged.
+    const turns = getEchoToolCallingCalls();
+    const postResumeTurn = turns[turns.length - 1]!;
+    const fedImageMsg = postResumeTurn.find(
+      (m) => Array.isArray(m.content) && (m.content as MessageContentPart[]).some((p) => p.type === "image_url")
+    )!;
+    const fedUrl = (fedImageMsg.content as MessageContentPart[]).find(
+      (p): p is { type: "image_url"; image_url: { url: string } } => p.type === "image_url"
+    )!.image_url.url;
+    expect(fedUrl).toBe(dataUrl); // restored byte-exact, NOT the marker
+    expect(isPayloadRef(fedUrl)).toBe(false);
+
+    // The re-paused snapshot re-dehydrated the restored bytes back to a
+    // REFERENCE at the SAME content hash — proving the round-trip
+    // rehydrate→loop→dehydrate is byte-identical.
     const reMessages = repaused.toolCallState!.messages;
     const imageMsg = reMessages.find(
       (m: any) => Array.isArray(m.content) && m.content.some((p: any) => p?.type === "image_url")
