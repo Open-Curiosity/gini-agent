@@ -166,6 +166,16 @@ export const __unreachableLogTestHooks = {
 // BFF typically wants to forward (content-disposition + x-content-type-options
 // to keep served uploads download-only and no-sniff, etag/last-modified for
 // revalidation, vary for cache key correctness).
+// NOTE: deliberately does NOT include `content-encoding` (or `content-length`).
+// This BFF reads the upstream body via `upstream.text()` / streams
+// `upstream.body`, and the underlying fetch (undici) auto-negotiates
+// `Accept-Encoding` and TRANSPARENTLY DECOMPRESSES the body before we ever see
+// it. Forwarding the upstream's `content-encoding` would therefore label an
+// already-decompressed body as gzip/br, which the browser then fails to decode
+// (`ERR_CONTENT_DECODING_FAILED`). Likewise the upstream `content-length` is
+// the compressed length and no longer matches the decompressed bytes. Both are
+// intentionally dropped so the platform recomputes/omit them for the body we
+// actually emit.
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "cache-control",
   "etag",
@@ -173,8 +183,7 @@ const PASSTHROUGH_RESPONSE_HEADERS = [
   "vary",
   "content-disposition",
   "x-content-type-options",
-  "content-language",
-  "content-encoding"
+  "content-language"
 ];
 
 export async function proxyRequest(
@@ -271,8 +280,10 @@ export async function proxyRequest(
       const v = upstream.headers.get(name);
       if (v) passthroughHeaders.set(name, v);
     }
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) passthroughHeaders.set("content-length", contentLength);
+    // Deliberately NOT forwarding content-length: undici has already
+    // decompressed upstream.body, so the upstream content-length (the
+    // COMPRESSED size) no longer matches the bytes we stream. Letting the
+    // platform frame the response (chunked) avoids a truncated/over-read body.
     return new Response(upstream.body, { status: upstream.status, headers: passthroughHeaders });
   }
   const text = await upstream.text();

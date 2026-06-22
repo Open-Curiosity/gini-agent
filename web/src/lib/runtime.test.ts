@@ -422,6 +422,66 @@ describe("proxyRequest — SSE passthrough", () => {
   });
 });
 
+describe("proxyRequest — never forwards a stale content-encoding", () => {
+  // The underlying fetch (undici) auto-negotiates Accept-Encoding and
+  // transparently decompresses the upstream body before proxyRequest reads it.
+  // Forwarding the upstream's content-encoding would label an
+  // already-decompressed body as gzip/br, which the browser then fails to
+  // decode (ERR_CONTENT_DECODING_FAILED). These pin that the header is dropped
+  // on both the JSON/text path and the binary-passthrough path.
+  test("JSON path: upstream content-encoding is NOT forwarded to the client", async () => {
+    const fetcher = (async () =>
+      // Simulates the body undici hands back AFTER decompression: plain JSON
+      // text, but the upstream response still advertises content-encoding.
+      new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8", "content-encoding": "br" }
+      })) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/status", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["status"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBeNull();
+    // Body is intact, decodable plain JSON.
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  test("binary path: upstream content-encoding and content-length are NOT forwarded", async () => {
+    const raw = new Uint8Array([0x68, 0x69, 0xff, 0x0a]);
+    const fetcher = (async () =>
+      new Response(raw, {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "content-encoding": "gzip",
+          "content-length": "999"
+        }
+      })) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/uploads/x.png", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["uploads", "x.png"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBeNull();
+    // The stale compressed content-length must not be forwarded onto the
+    // decompressed stream.
+    expect(res.headers.get("content-length")).toBeNull();
+    const out = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(out)).toEqual(Array.from(raw));
+  });
+});
+
 describe("canonicalizeSegments", () => {
   test("decodes nested encodings until stable", () => {
     // %2561 → %61 → a (two decode passes).
