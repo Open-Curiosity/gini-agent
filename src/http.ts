@@ -2453,6 +2453,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           maxAge: SESSION_COOKIE_TTL_SECONDS
         })
       );
+      // Slide gini_client on the SAME cadence as the session — but only when the
+      // browser already holds one. Both cookies share the 400-day cap, yet the
+      // session slides on navigation while a fixed-lifetime gini_client would
+      // lapse at day 400 for a daily-active browser that never re-pairs; a later
+      // re-pair would then mint a fresh clientId and fail to supersede the slid
+      // session. Re-issuing only when a value is present avoids minting a
+      // write-only id for a mid-first-pair or pre-upgrade browser that sent none.
+      const clientId = clientCookieValue(request, secure);
+      if (clientId) {
+        refreshed.append(
+          "set-cookie",
+          serializeCookie(clientCookieName(secure), clientId, {
+            ...sessionCookieAttributes,
+            secure,
+            maxAge: CLIENT_COOKIE_TTL_SECONDS
+          })
+        );
+      }
       return new Response(proxied.body, { status: proxied.status, statusText: proxied.statusText, headers: refreshed });
     }
     return proxied;

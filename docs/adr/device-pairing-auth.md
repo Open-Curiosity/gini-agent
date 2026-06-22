@@ -246,7 +246,9 @@ admin to anything but the operator's own loopback dev port.
   `gini_session` token remains the entire access decision. Attributes mirror
   `gini_session`, **not** `gini_pair`: `HttpOnly; SameSite=Lax; Path=/`, host-only
   (no `Domain`), `__Host-` prefix on a secure front (the gate reads `__Host-` first
-  then the plain name), long `Max-Age` (one year). It is in `GATEWAY_ONLY_COOKIES`,
+  then the plain name), `Max-Age` of 400 days (matching the session cookie cap) and
+  re-issued on document navigation alongside the session so it never lapses behind a
+  slid session. It is in `GATEWAY_ONLY_COOKIES`,
   so it is stripped before the inner web child ever sees it. A native client is
   cookieless and instead sends the same id as the `X-Gini-Client-ID` header.
 - `Secure` is conditional (`pairingCookieSecure`): set on relay and

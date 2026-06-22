@@ -668,6 +668,34 @@ describe("relay session gate (web-bound branch)", () => {
     expect(setCookieValue(res, "__Host-gini_session")).toBeUndefined();
   });
 
+  test("a document navigation also slides the gini_client cookie forward when one is present", async () => {
+    const { handler, relay, session } = await pairedSession("gate-slide-client");
+    const clientId = "stable-client-on-nav";
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document",
+      cookie: `__Host-gini_session=${encodeURIComponent(session)}; __Host-gini_client=${encodeURIComponent(clientId)}`
+    });
+    // gini_client must slide on the SAME cadence as gini_session — otherwise a
+    // daily-active browser's client id lapses at the 400-day cap while its session
+    // slides past it, and a later re-pair mints a fresh id that fails to supersede.
+    expect(setCookieValue(res, "__Host-gini_client")).toBe(clientId);
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_client="));
+    expect(cookie).toContain("Max-Age=");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+  });
+
+  test("a document navigation without a gini_client cookie does NOT mint one (no write-only garbage)", async () => {
+    const { handler, relay, session } = await pairedSession("gate-no-client-nav");
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document", cookie: `__Host-gini_session=${encodeURIComponent(session)}`
+    });
+    // No inbound gini_client (mid-first-pair or pre-upgrade browser) → re-issuing
+    // would mint an id no device row references. The session still slides.
+    expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    expect(setCookieValue(res, "__Host-gini_session")).toBe(session);
+  });
+
   test("loopback is never gated", async () => {
     const { handler } = makeHandler("gate-loopback");
     const res = await pair(handler, "/", { host: "127.0.0.1:7337", secFetchDest: "document" });
