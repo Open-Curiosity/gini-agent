@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { createHandler, isPairingBootstrapPath, resetPairingLimiters } from "./http";
 import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "./lib/origin-trust";
-import { createPairingRequest, mutateState } from "./state";
+import { createPairingRequest, mutateState, readState } from "./state";
 
 // The pairing rate limiters are module-level singletons shared across this
 // file's many create calls; reset their buckets before each test so tests stay
@@ -44,6 +44,7 @@ interface CallOpts {
   // Native mobile-client headers: the cookieless pairing path.
   pairClient?: string; // X-Gini-Pair-Client
   pairSecret?: string; // X-Gini-Pair-Secret
+  pairClientId?: string; // X-Gini-Client-ID (native per-install id)
   auth?: string; // Authorization: Bearer <token>
 }
 
@@ -63,6 +64,7 @@ async function pair(handler: ReturnType<typeof createHandler>, path: string, opt
   if (opts.userAgent) headers["user-agent"] = opts.userAgent;
   if (opts.pairClient) headers["x-gini-pair-client"] = opts.pairClient;
   if (opts.pairSecret) headers["x-gini-pair-secret"] = opts.pairSecret;
+  if (opts.pairClientId) headers["x-gini-client-id"] = opts.pairClientId;
   if (opts.auth) headers.authorization = `Bearer ${opts.auth}`;
   return handler(
     new Request(`http://127.0.0.1:7337${path}`, {
@@ -863,6 +865,217 @@ describe("pairing routes — native client (mobile)", () => {
     // ...but it's the browser shape: the binding secret is cookie-only, not in the body.
     expect((await res.json()).bindSecret).toBeUndefined();
     expect(setCookieValue(res, "gini_pair")).toBeTruthy();
+  });
+});
+
+// The shared-subdomain eviction bug, exercised through the real HTTP route.
+// Two distinct browsers (or two distinct mobile installs) pairing on the SAME
+// relay subdomain with the SAME User-Agent must NOT evict each other. Identity
+// is keyed on a stable per-browser gini_client cookie (browsers) / per-install
+// X-Gini-Client-ID header (native), not the User-Agent-derived name.
+describe("pairing routes — per-browser client identity (gini_client)", () => {
+  const SAME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36";
+
+  test("a browser create issues a host-only gini_client cookie", async () => {
+    const { handler } = makeHandler("client-cookie-mint");
+    const relay = RELAY("client-cookie-mint");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: SAME_UA, body: {}
+    });
+    expect(res.status).toBe(201);
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_client="));
+    expect(cookie).toBeDefined();
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Path=/");
+    expect(cookie).toContain("SameSite=Lax");
+    // A fresh request with no inbound gini_client mints a non-empty id.
+    expect(setCookieValue(res, "__Host-gini_client")).toBeTruthy();
+  });
+
+  test("a create that already carries gini_client reuses the value (no new id minted)", async () => {
+    const { handler } = makeHandler("client-cookie-reuse");
+    const relay = RELAY("client-cookie-reuse");
+    const existing = "client-existing-uuid";
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(existing)}`, body: {}
+    });
+    expect(res.status).toBe(201);
+    // When the browser already holds a gini_client, the server reuses it rather
+    // than minting a fresh id (so identity is stable across re-pairs). It may
+    // re-set the same value (refreshing Max-Age) or omit the Set-Cookie entirely.
+    const reissued = setCookieValue(res, "__Host-gini_client");
+    if (reissued !== undefined) expect(reissued).toBe(existing);
+  });
+
+  test("native create does NOT set a gini_client cookie (cookieless)", async () => {
+    const { handler } = makeHandler("client-cookie-native");
+    const relay = RELAY("client-cookie-native");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", pairClientId: "install-uuid-1",
+      userAgent: "GiniMobile/1.0 (iOS)", body: {}
+    });
+    expect(res.status).toBe(201);
+    expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    expect(setCookieValue(res, "gini_client")).toBeUndefined();
+  });
+
+  test("over a plain-http trusted front the gini_client cookie is plain-named and omits Secure", async () => {
+    // A non-relay, non-loopback GINI_TRUSTED_ORIGINS front served over plain http
+    // would have a Secure/__Host- cookie silently dropped — so the gini_client
+    // cookie uses the plain name and no Secure, mirroring gini_session/gini_pair.
+    const front = "client-front.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { handler } = makeHandler("client-cookie-plain");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, body: {}
+      });
+      expect(res.status).toBe(201);
+      const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_client="));
+      expect(cookie).toBeDefined();
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).not.toContain("Secure");
+      expect(cookie).not.toContain("__Host-");
+      // No __Host- variant is set on a plain front.
+      expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
+  test("a plain-named gini_client cookie is read back (plain fallback) and reused on re-pair", async () => {
+    // Mirrors the secure-front reuse test but exercises clientCookieValue's plain
+    // fallback: a request carrying only the plain gini_client (no __Host-) reuses it.
+    const front = "client-front2.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { config, handler } = makeHandler("client-cookie-plain-reuse");
+      const existing = "plain-client-uuid";
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `gini_client=${encodeURIComponent(existing)}`, body: {}
+      });
+      expect(created.status).toBe(201);
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; gini_client=${encodeURIComponent(existing)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const device = readState(config.instance).devices.find((d) => d.status === "active")!;
+      expect(device.clientId).toBe(existing);
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
+  // End-to-end bug proof for browsers: two distinct browsers, same relay + same
+  // UA, distinct gini_client ids → both sessions stay active.
+  test("two distinct browsers on the same subdomain do not evict each other", async () => {
+    const { config, handler } = makeHandler("client-two-browsers");
+    const relay = RELAY("client-two-browsers");
+
+    async function pairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; __Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const devices = readState(config.instance).devices;
+      return devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const alice = await pairWithClient("client-alice");
+    const bob = await pairWithClient("client-bob");
+    expect(alice).not.toBe(bob);
+    const devices = readState(config.instance).devices;
+    // Both sessions remain active — neither evicted the other.
+    expect(devices.filter((d) => d.status === "active").length).toBe(2);
+    expect(devices.find((d) => d.id === alice)!.status).toBe("active");
+    expect(devices.find((d) => d.id === bob)!.status).toBe("active");
+  });
+
+  // The same browser re-pairing (same gini_client) still supersedes its own
+  // prior session — one active session per browser.
+  test("the same browser re-pairing supersedes its own prior session", async () => {
+    const { config, handler } = makeHandler("client-same-browser-repair");
+    const relay = RELAY("client-same-browser-repair");
+
+    async function pairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; __Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      return readState(config.instance).devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const first = await pairWithClient("client-stable");
+    const second = await pairWithClient("client-stable");
+    expect(first).not.toBe(second);
+    const devices = readState(config.instance).devices;
+    expect(devices.find((d) => d.id === first)!.status).toBe("revoked");
+    expect(devices.find((d) => d.id === second)!.status).toBe("active");
+    expect(devices.filter((d) => d.status === "active").length).toBe(1);
+  });
+
+  // End-to-end bug proof for mobile: two distinct installs, same relay + same UA,
+  // distinct X-Gini-Client-ID → both sessions stay active.
+  test("two distinct mobile installs on the same subdomain do not evict each other", async () => {
+    const { config, handler } = makeHandler("client-two-mobiles");
+    const relay = RELAY("client-two-mobiles");
+
+    async function nativePairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, pairClient: "native", pairClientId: clientId,
+        userAgent: "GiniMobile/1.0 (iOS)", body: {}
+      });
+      const { id, bindSecret } = await created.json();
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, pairClient: "native", pairClientId: clientId, pairSecret: bindSecret, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      return readState(config.instance).devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const phoneA = await nativePairWithClient("install-aaaa");
+    const phoneB = await nativePairWithClient("install-bbbb");
+    expect(phoneA).not.toBe(phoneB);
+    const devices = readState(config.instance).devices;
+    expect(devices.filter((d) => d.status === "active").length).toBe(2);
   });
 });
 

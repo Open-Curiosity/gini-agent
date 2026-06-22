@@ -2254,6 +2254,11 @@ export interface PairedDevice {
   // Raw User-Agent captured at pairing time, for the Active Sessions list.
   // Absent on legacy/mobile rows.
   userAgent?: string;
+  // Stable per-browser id from the gini_client cookie; survives re-pairs.
+  // Used to key device identity so two distinct browsers with the same
+  // User-Agent on one relay subdomain don't collide (and evict each other).
+  // Absent on legacy/mobile rows.
+  clientId?: string;
   // Optional session expiry for relay browser sessions. Bearer/mobile devices
   // omit it (no expiry). The read-only session validator treats a past
   // expiresAt as inactive even while status is still "active".
@@ -2296,6 +2301,10 @@ export interface PairingRequest {
   createdAt: string;
   expiresAt: string;
   resolvedAt?: string;
+  // Stable per-browser id from the gini_client cookie; survives re-pairs.
+  // Copied onto the PairedDevice on claim so device identity keys on it.
+  // Absent on legacy/mobile rows.
+  clientId?: string;
   // Set when a claim mints the session device, linking request → PairedDevice.
   deviceId?: string;
 }

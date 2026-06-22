@@ -3059,6 +3059,19 @@ const PAIR_BIND_COOKIE = "gini_pair";
 export const SESSION_COOKIE = "gini_session";
 const SESSION_COOKIE_SECURE = `__Host-${SESSION_COOKIE}`;
 
+// Stable per-browser id cookie. Unlike gini_session (which a re-pair re-mints) it
+// persists across re-pairs, so device identity can key on it instead of the
+// fuzzy User-Agent label — two distinct browsers on one relay subdomain with the
+// same User-Agent then no longer evict each other on re-pair. It mirrors
+// gini_session, NOT gini_pair: it is durable and Path=/ (the `__Host-` prefix
+// mandates Path=/, which gini_pair's /api/pairing scope can't use). It carries no
+// secret — only an opaque dedup id — so it is not a credential; the gini_session
+// token remains the entire access decision.
+const CLIENT_COOKIE = "gini_client";
+const CLIENT_COOKIE_SECURE = `__Host-${CLIENT_COOKIE}`;
+// Native (cookieless) clients send the same id in this header instead.
+const CLIENT_ID_HEADER = "x-gini-client-id";
+
 // The session cookie NAME to issue: `__Host-`-prefixed on a secure front (so a
 // sibling-subdomain Domain cookie can't toss it), plain otherwise.
 function sessionCookieName(secure: boolean): string {
@@ -3072,15 +3085,37 @@ export function sessionCookieValue(request: Request): string | undefined {
   return cookieValue(request, SESSION_COOKIE_SECURE) ?? cookieValue(request, SESSION_COOKIE);
 }
 
+// The client-id cookie NAME to issue: `__Host-`-prefixed on a secure front,
+// plain otherwise. Mirrors sessionCookieName so the two stay in lockstep.
+function clientCookieName(secure: boolean): string {
+  return secure ? CLIENT_COOKIE_SECURE : CLIENT_COOKIE;
+}
+
+// Read the per-browser client id from whichever name was issued: prefer the
+// secure `__Host-` cookie, fall back to the plain name. Mirrors sessionCookieValue.
+export function clientCookieValue(request: Request): string | undefined {
+  return cookieValue(request, CLIENT_COOKIE_SECURE) ?? cookieValue(request, CLIENT_COOKIE);
+}
+
 // Gateway-owned cookies that must never reach the inner web child: it is
 // relay-agnostic and authenticates via the BFF's owner bearer, never these, so
 // stripping them (in proxyWeb) keeps the pairing credentials from crossing into
-// the inner app. Both session cookie names are stripped.
-const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, SESSION_COOKIE_SECURE, PAIR_BIND_COOKIE]);
+// the inner app. Both session and client cookie names are stripped.
+const GATEWAY_ONLY_COOKIES = new Set([
+  SESSION_COOKIE,
+  SESSION_COOKIE_SECURE,
+  PAIR_BIND_COOKIE,
+  CLIENT_COOKIE,
+  CLIENT_COOKIE_SECURE
+]);
 // Derived from the single source of truth so the cookie Max-Age and the
 // server-side device.expiresAt can't drift apart.
 const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
+// The client id must outlive any single session so it stays stable across
+// re-pairs; a year keeps it effectively permanent without being literally
+// non-expiring.
+const CLIENT_COOKIE_TTL_SECONDS = 60 * 60 * 24 * 365;
 // Flood control on the public create endpoint. Keyed on the inbound Host (the
 // relay subdomain is un-forgeable — the relay owns its DNS), NOT on
 // X-Forwarded-For, which a client can spoof to mint fresh buckets. A separate
@@ -3326,13 +3361,21 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     // "Unknown device". Absent/blank → undefined, and the state layer falls back
     // to the User-Agent-derived label.
     const deviceName = sanitizeDeviceName((await body(request)).deviceName);
+    // The stable per-browser/per-install id. A browser already paired here re-sends
+    // its gini_client cookie (reused as-is so identity is stable across re-pairs);
+    // a native client sends the X-Gini-Client-ID header. A first-time browser sends
+    // neither, so the gateway mints one and sets it as the cookie below. An empty
+    // header/cookie is treated as absent so a blank never becomes an identity.
+    const reusedClientId = (native ? request.headers.get(CLIENT_ID_HEADER) : clientCookieValue(request)) || undefined;
+    const clientId = reusedClientId ?? randomBindSecret();
     let created: Awaited<ReturnType<typeof requestPairing>>;
     try {
       created = await requestPairing(config, {
         userAgent: request.headers.get("user-agent") ?? "",
         relayHost: host,
         bindSecret,
-        deviceName
+        deviceName,
+        clientId
       });
     } catch (error) {
       // Cap enforced atomically inside the create mutation.
@@ -3349,12 +3392,23 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       201
     );
     if (!native) {
+      const secure = pairingCookieSecure(request, host);
       response.headers.append(
         "set-cookie",
         serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
           ...bindCookieAttributes,
-          secure: pairingCookieSecure(request, host),
+          secure,
           maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
+        })
+      );
+      // Persist the per-browser id (minted fresh or refreshing an existing one's
+      // Max-Age). Native clients own their id locally and stay cookieless.
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(clientCookieName(secure), clientId, {
+          ...sessionCookieAttributes,
+          secure,
+          maxAge: CLIENT_COOKIE_TTL_SECONDS
         })
       );
     }

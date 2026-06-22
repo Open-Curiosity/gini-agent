@@ -784,18 +784,27 @@ export function claimPairingCode(
   return { device, token };
 }
 
-// Stable identity for collapsing a physical device/front's repeated pairings:
-// its relay origin + derived label. The relay subdomain is stable per gateway,
-// so for one operator `origin` is effectively constant and `name` is the
+// Stable identity for collapsing a physical browser/front's repeated pairings:
+// its relay origin + the per-browser gini_client cookie id (clientId) — minted
+// at pairing-request time and re-sent across re-pairs, so it survives the new
+// session token a re-pair mints. The relay subdomain is stable per gateway, so
+// `origin` is effectively constant for one operator and `clientId` is the
 // discriminator; pinning both keeps a match from ever spanning two relay fronts.
+//
 // Returns null for a session with NO origin (a legacy code-claimed mobile bearer
 // device, which is long-lived and originless) so those are deliberately exempt
 // from supersession — a re-pair must never retire a standing bearer credential.
-// Two genuinely distinct same-model devices on one relay are the only false
-// match, and that is fully recoverable by re-pairing.
+//
+// Rows minted before gini_client existed have no clientId; they fall back to
+// keying on the derived name, in a SEPARATE namespace ("name:" vs "client:") so
+// a legacy row and a clientId-bearing row can never match each other (the legacy
+// rows simply age out via SESSION_TTL_MS). This is what fixes the shared-
+// subdomain bug: two genuinely distinct browsers with the same User-Agent each
+// carry their own clientId, so re-pairing one no longer evicts the other.
 export function pairedDeviceIdentityKey(device: PairedDevice): string | null {
   if (!device.origin) return null;
-  return `${device.origin}\n${device.name}`;
+  if (device.clientId) return `${device.origin}\nclient:${device.clientId}`;
+  return `${device.origin}\nname:${device.name}`;
 }
 
 export function isSamePairedDevice(a: PairedDevice, b: PairedDevice): boolean {
@@ -936,7 +945,7 @@ export function deviceNameFromUserAgent(userAgent: string): string {
 // 60-3600s window as createPairing.
 export function createPairingRequest(
   state: RuntimeState,
-  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number; deviceName?: string }
+  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number; deviceName?: string; clientId?: string }
 ): PairingRequest {
   expirePairingRequests(state);
   if (state.pairingRequests.filter((r) => r.status === "pending").length >= MAX_PENDING_PAIRING_REQUESTS) {
@@ -953,6 +962,10 @@ export function createPairingRequest(
     deviceName: input.deviceName ?? deviceNameFromUserAgent(input.userAgent),
     userAgent: input.userAgent,
     relayHost: input.relayHost,
+    // Stable per-browser/per-install id (gini_client cookie or X-Gini-Client-ID
+    // header). Carried onto the claimed device so identity keys on it. Absent for
+    // a client that sent none (a pre-clientId browser or an older mobile build).
+    ...(input.clientId ? { clientId: input.clientId } : {}),
     createdAt: at,
     expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString()
   };
@@ -1105,6 +1118,9 @@ export function claimPairingRequest(
     scopes: [...DEFAULT_SESSION_SCOPES],
     origin: request.relayHost,
     userAgent: request.userAgent,
+    // Carry the per-browser/per-install id from the request so device identity
+    // keys on it (pairedDeviceIdentityKey) instead of the User-Agent label.
+    ...(request.clientId ? { clientId: request.clientId } : {}),
     createdAt: at,
     updatedAt: at,
     lastSeenAt: at,

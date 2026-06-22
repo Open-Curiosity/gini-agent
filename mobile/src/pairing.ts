@@ -62,9 +62,27 @@ export interface PairingClient {
 }
 
 type FetchFn = typeof fetch;
+// Returns the stable per-install client id, or null when none is primed yet.
+type ClientIdProvider = () => string | null;
 
 const NATIVE_CLIENT_HEADER = "x-gini-pair-client";
 const NATIVE_SECRET_HEADER = "x-gini-pair-secret";
+// Stable per-install id so device identity keys on it (the cookieless native
+// mirror of the browser's gini_client cookie). The gateway threads it onto the
+// PairedDevice so two phones on one relay subdomain don't evict each other.
+const NATIVE_CLIENT_ID_HEADER = "x-gini-client-id";
+
+// Default provider: lazy-require the AsyncStorage-backed singleton so this
+// module stays react-native-free for its unit tests (which inject fetch and
+// never load RN). A test env without RN simply gets null and omits the header.
+function defaultClientIdProvider(): string | null {
+  try {
+    const mod = require("./client-id") as { getCachedClientId?: () => string | null };
+    return mod.getCachedClientId?.() ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function safeParse(text: string): unknown {
   try {
@@ -79,7 +97,11 @@ function safeParse(text: string): unknown {
 // http:// host) so a bad or hostile link can never ship a pairing request — or
 // later the bearer — in cleartext to the wrong place. `fetchImpl` is injectable
 // for tests.
-export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch): PairingClient {
+export function createPairingClient(
+  relayUrl: string,
+  fetchImpl: FetchFn = fetch,
+  clientIdProvider: ClientIdProvider = defaultClientIdProvider
+): PairingClient {
   const origin = normalizeBaseUrl(relayUrl);
   // Enforce the relay/loopback pairing policy in the client itself so it's
   // safe-by-construction — a caller can never drive a pairing handshake (or, on
@@ -104,6 +126,8 @@ export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch
       [NATIVE_CLIENT_HEADER]: "native"
     };
     if (init.secret) headers[NATIVE_SECRET_HEADER] = init.secret;
+    const clientId = clientIdProvider();
+    if (clientId) headers[NATIVE_CLIENT_ID_HEADER] = clientId;
     const response = await fetchImpl(`${origin}/api/pairing${path}`, {
       method: init.method ?? "GET",
       headers,

@@ -556,15 +556,21 @@ describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
     };
   }
 
-  test("keys on origin + name", () => {
-    expect(pairedDeviceIdentityKey(device({}))).toBe(`${RELAY_A}\nChrome · Mac`);
+  test("a legacy (no clientId) device keys on origin + name in the name: namespace", () => {
+    expect(pairedDeviceIdentityKey(device({}))).toBe(`${RELAY_A}\nname:Chrome · Mac`);
+  });
+
+  test("a device with a clientId keys on origin + clientId in the client: namespace", () => {
+    expect(pairedDeviceIdentityKey(device({ clientId: "client-123" }))).toBe(`${RELAY_A}\nclient:client-123`);
   });
 
   test("an originless device (legacy code-claimed bearer) keys to null", () => {
     expect(pairedDeviceIdentityKey(device({ origin: undefined }))).toBeNull();
+    // Even with a clientId, no origin means no key (originless bearer stays exempt).
+    expect(pairedDeviceIdentityKey(device({ origin: undefined, clientId: "client-123" }))).toBeNull();
   });
 
-  test("same origin + same name match; differing origin OR name do not", () => {
+  test("legacy rows: same origin + same name match; differing origin OR name do not", () => {
     expect(isSamePairedDevice(device({}), device({ id: "device_y" }))).toBe(true);
     expect(isSamePairedDevice(device({}), device({ origin: RELAY_B }))).toBe(false);
     expect(isSamePairedDevice(device({}), device({ name: "Safari · iPhone" }))).toBe(false);
@@ -572,6 +578,30 @@ describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
 
   test("two originless devices never match (null key is not equal to null key)", () => {
     expect(isSamePairedDevice(device({ origin: undefined }), device({ origin: undefined }))).toBe(false);
+  });
+
+  // The shared-subdomain eviction bug: two DISTINCT browsers on the same relay
+  // subdomain produce the same User-Agent-derived name ("Chrome · Mac"). Each
+  // holds its own per-browser gini_client id (clientId), so they must NOT be
+  // treated as the same device. Before the clientId fix the key was origin+name,
+  // so these collided and a re-pair by one evicted the other.
+  test("same origin + same name but DIFFERENT clientId are NOT the same device", () => {
+    const browserA = device({ id: "device_a", clientId: "client-aaaa" });
+    const browserB = device({ id: "device_b", clientId: "client-bbbb" });
+    expect(isSamePairedDevice(browserA, browserB)).toBe(false);
+    expect(pairedDeviceIdentityKey(browserA)).not.toBe(pairedDeviceIdentityKey(browserB));
+  });
+
+  test("same origin + same clientId ARE the same device (own re-pair still supersedes)", () => {
+    const before = device({ id: "device_old", clientId: "client-same" });
+    const after = device({ id: "device_new", clientId: "client-same" });
+    expect(isSamePairedDevice(before, after)).toBe(true);
+  });
+
+  test("a clientId-bearing row and a legacy (no clientId) row never match, even same origin+name", () => {
+    const legacy = device({ id: "device_legacy", clientId: undefined });
+    const modern = device({ id: "device_modern", clientId: "client-xyz" });
+    expect(isSamePairedDevice(legacy, modern)).toBe(false);
   });
 });
 
