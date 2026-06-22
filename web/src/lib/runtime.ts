@@ -217,6 +217,16 @@ export async function proxyRequest(
   const target = `${options.runtimeUrl}/api/${encodedPath}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
+  // Ask the gateway NOT to compress this loopback hop. Without an explicit
+  // value, the underlying fetch (undici) auto-injects `Accept-Encoding:
+  // gzip, deflate, br`, so the gateway spends brotli/gzip CPU on a response
+  // this BFF immediately decompresses and re-serves — pure waste over
+  // loopback. `identity` makes the gateway's negotiator skip compression at
+  // the source. This does NOT remove the need to strip content-encoding on
+  // the way back (undici still transparently decompresses any upstream that
+  // compresses regardless, leaving a stale header) — see
+  // PASSTHROUGH_RESPONSE_HEADERS; the two work together.
+  headers.set("accept-encoding", "identity");
   const init: RequestInit = { method: request.method, headers };
   const signal = options.signal ?? request.signal;
   if (signal) init.signal = signal;

@@ -7252,8 +7252,13 @@ describe("response compression", () => {
   // Seed enough audit rows that /api/state's JSON body clears the 1 KB
   // threshold, so the compressible-path assertions exercise real compression
   // rather than the too-small skip.
-  function seedBulkyState(config: RuntimeConfig): void {
-    mutateState(config.instance, (state) => {
+  async function seedBulkyState(config: RuntimeConfig): Promise<void> {
+    // Awaited by every caller: mutateState is async (it chains on the
+    // per-instance write lock), so without awaiting it the subsequent
+    // readState in the request under test can race the write and read state
+    // before the bulky audit rows land — intermittently dropping the body
+    // under the 1 KB threshold and skipping compression.
+    await mutateState(config.instance, (state) => {
       for (let i = 0; i < 200; i += 1) {
         addAudit(state, {
           actor: "runtime",
@@ -7269,7 +7274,7 @@ describe("response compression", () => {
   test("gzips a large JSON response when the client accepts only gzip", async () => {
     const config = testConfig("gzip-json");
     const handler = createHandler(config);
-    seedBulkyState(config);
+    await seedBulkyState(config);
     const response = await rawCall(
       handler,
       config,
@@ -7292,7 +7297,7 @@ describe("response compression", () => {
   test("prefers brotli when the client accepts both br and gzip", async () => {
     const config = testConfig("br-json");
     const handler = createHandler(config);
-    seedBulkyState(config);
+    await seedBulkyState(config);
     const response = await rawCall(
       handler,
       config,
@@ -7315,7 +7320,7 @@ describe("response compression", () => {
   test("falls back to gzip when br is explicitly opted out (br;q=0)", async () => {
     const config = testConfig("br-optout");
     const handler = createHandler(config);
-    seedBulkyState(config);
+    await seedBulkyState(config);
     const response = await rawCall(
       handler,
       config,
@@ -7329,7 +7334,7 @@ describe("response compression", () => {
   test("does not compress when the client omits Accept-Encoding", async () => {
     const config = testConfig("gzip-absent");
     const handler = createHandler(config);
-    seedBulkyState(config);
+    await seedBulkyState(config);
     const response = await rawCall(handler, config, "/api/state", {}, config.token);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-encoding")).toBeNull();
@@ -7340,7 +7345,7 @@ describe("response compression", () => {
   test("honors gzip;q=0 as an explicit opt-out", async () => {
     const config = testConfig("gzip-q0");
     const handler = createHandler(config);
-    seedBulkyState(config);
+    await seedBulkyState(config);
     const response = await rawCall(
       handler,
       config,

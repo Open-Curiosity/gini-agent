@@ -480,6 +480,29 @@ describe("proxyRequest — never forwards a stale content-encoding", () => {
     const out = new Uint8Array(await res.arrayBuffer());
     expect(Array.from(out)).toEqual(Array.from(raw));
   });
+
+  test("sends Accept-Encoding: identity on the loopback hop so the gateway skips compression", async () => {
+    // Without this, undici auto-injects gzip/br and the gateway wastes CPU
+    // compressing a loopback response the BFF immediately decompresses.
+    let seenAcceptEncoding: string | null = "UNSET";
+    const fetcher = (async (_url: string, init: RequestInit) => {
+      seenAcceptEncoding = new Headers(init.headers).get("accept-encoding");
+      return new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/status", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    await proxyRequest(req, ["status"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(seenAcceptEncoding).toBe("identity");
+  });
 });
 
 describe("canonicalizeSegments", () => {
