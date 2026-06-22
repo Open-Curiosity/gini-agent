@@ -66,7 +66,8 @@ function scopedPath(path: string, agentId: string | undefined): string {
 
 // One day's token usage from GET /api/usage — the server-side rollup of the
 // durable usage ledger (chat, jobs, subagents, memory, titles, vision …),
-// scoped to the active agent. Mirrors DayUsage in src/state/usage.ts.
+// caller-scoped: summed across all agents by default, or filtered to one agent
+// when the caller passes an agentId. Mirrors DayUsage in src/state/usage.ts.
 export interface UsageDay {
   day: string;
   dayStart: number;
@@ -77,14 +78,13 @@ export interface UsageDay {
   bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
 }
 
-export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
-  const agentId = useActiveAgentId();
+export function useUsage(days: number, agentId?: string, options?: Partial<UseQueryOptions<UsageDay[]>>) {
   const { enabled: callerEnabled, ...rest } = options ?? {};
   return useQuery<UsageDay[]>({
     queryKey: ["usage", agentId ?? null, days],
     queryFn: () => api<UsageDay[]>(scopedPath(`/usage?days=${days}`, agentId)),
     refetchInterval: 60_000,
-    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    enabled: callerEnabled ?? true,
     ...rest
   });
 }
@@ -865,7 +865,10 @@ export function useThreadsInbox() {
 export function useReplyToThread(sessionId: string | null, threadId: string | null) {
   const qc = useQueryClient();
   return useMutation<
-    { sessionId: string; threadId: string; runId: string; taskId: string; status: string },
+    // A reply runs immediately, or queues behind a live turn (ADR
+    // chat-message-queue.md) and returns the pending id instead.
+    | { sessionId: string; threadId: string; runId: string; taskId: string; status: string }
+    | { sessionId: string; queued: true; pendingId: string },
     Error,
     {
       content: string;
@@ -926,23 +929,17 @@ export function useRenameChatSession() {
 }
 
 // Browser-connect status. Shape mirrors the gateway response from
-// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
-// Polled every 5s when idle, and every 1s while a connect/disconnect
-// mutation is in flight, so the status card reflects an external `gini
-// browser connect/disconnect` without a manual refresh.
+// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }. The
+// record is present only when the user attached the runtime to their own
+// external Chrome over CDP; the default spawned browser carries no record.
 export interface BrowserConnectionStatus {
   connected: boolean;
   record?: BrowserConnectionRecord;
 }
 
-// Polls `GET /api/browser` to keep the Settings browser panel in sync with the
-// runtime. The default cadence is 5s when nothing's happening — that's
-// well below the 3-minute Chrome dev-tools cookie lifetime and noticeably
-// less chatter than the previous 3s. Pass `isActive: true` while a
-// connect / disconnect mutation is in flight to drop to 1s; once
-// settled the caller flips the flag back. We deliberately do NOT switch
-// to SSE — the cost of holding an EventSource open across every chat
-// session that lands the Settings panel outweighs the gain.
+// Polls GET /api/browser so the Settings browser panel reflects an external
+// `gini browser connect/disconnect` without a manual refresh. 5s when idle,
+// 1s while a connect/disconnect mutation is in flight.
 export function useBrowserConnection(options?: { isActive?: boolean }) {
   const isActive = options?.isActive ?? false;
   return useQuery<BrowserConnectionStatus>({
@@ -952,9 +949,12 @@ export function useBrowserConnection(options?: { isActive?: boolean }) {
   });
 }
 
+// Attach the runtime to the user's own external Chrome over a CDP URL. With no
+// cdpUrl the gateway returns a stable disconnected status (the default spawned
+// browser needs no explicit connect).
 export function useConnectBrowser() {
   const qc = useQueryClient();
-  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string; port?: number }>({
+  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string }>({
     mutationFn: (input) =>
       api<BrowserConnectionStatus>("/browser/connect", {
         method: "POST",

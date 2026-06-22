@@ -21,8 +21,13 @@ import {
   useDisconnectBrowser
 } from "@/lib/queries";
 
-// Connect opens a visible browser so the user can sign in to sites the agent
-// needs. Disconnect closes the window; saved sign-ins stay available for later.
+// Two transports (issue #420). By DEFAULT the agent drives its own spawned
+// per-instance headless Chrome — launched on demand, no controls needed; a
+// site sign-in happens through the in-chat screencast modal. As a power-user
+// option the user can instead attach the runtime to their OWN already-running
+// Chrome over a CDP websocket URL (the "Advanced" section). There is no
+// managed/visible-window mode anymore — only the spawned default and CDP
+// attach.
 export function BrowserSettingsCard() {
   const connect = useConnectBrowser();
   const disconnect = useDisconnectBrowser();
@@ -36,23 +41,22 @@ export function BrowserSettingsCard() {
   const connected = status.data?.connected ?? false;
   const record = status.data?.record;
 
-  const handleConnect = (mode: "managed" | "cdp") => {
-    const body: { cdpUrl?: string } = {};
-    if (mode === "cdp") {
-      const trimmed = cdpUrl.trim();
-      if (!trimmed) {
-        toast.error("Paste a CDP URL first.");
-        return;
-      }
-      body.cdpUrl = trimmed;
+  const handleAttach = () => {
+    const trimmed = cdpUrl.trim();
+    if (!trimmed) {
+      toast.error("Paste a CDP URL first.");
+      return;
     }
-    connect.mutate(body, {
-      onSuccess: () => {
-        toast.success(mode === "cdp" ? "Attached to Chrome via CDP." : "Chrome connected.");
-        setCdpUrl("");
-      },
-      onError: (error: Error) => toast.error(error.message)
-    });
+    connect.mutate(
+      { cdpUrl: trimmed },
+      {
+        onSuccess: () => {
+          toast.success("Attached to Chrome via CDP.");
+          setCdpUrl("");
+        },
+        onError: (error: Error) => toast.error(error.message)
+      }
+    );
   };
 
   const handleDisconnect = () => {
@@ -69,41 +73,26 @@ export function BrowserSettingsCard() {
     <>
       <Card>
         <CardHeader>
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <CardTitle className="text-sm">Browser sign-ins</CardTitle>
-              <CardDescription>
-                {connected
-                  ? "Chrome is open for sign-in."
-                  : "Connect to sign in to sites the agent needs."}
-              </CardDescription>
-            </div>
-          </div>
+          <CardTitle className="text-sm">Browser</CardTitle>
+          <CardDescription>
+            {connected
+              ? "Attached to your Chrome over CDP."
+              : "The agent uses its own browser; attach your own Chrome only if you need to."}
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           {record ? (
             <dl className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-              <Detail
-                label="Mode"
-                value={
-                  record.mode === "managed"
-                    ? "Managed (visible Chrome window)"
-                    : "External CDP attach"
-                }
-              />
-              <Detail label="Started" value={new Date(record.startedAt).toLocaleString()} />
-              {record.pid !== null ? <Detail label="PID" value={String(record.pid)} mono /> : null}
-              {record.chromePath ? <Detail label="Binary" value={record.chromePath} mono wrap /> : null}
-              {record.dataDir ? <Detail label="Profile" value={record.dataDir} mono wrap /> : null}
-              {record.mode === "cdp" ? (
-                <Detail label="CDP URL" value={record.cdpUrl} mono wrap />
-              ) : null}
+              <Detail label="Mode" value="External CDP attach" />
+              <Detail label="Attached" value={new Date(record.startedAt).toLocaleString()} />
+              <Detail label="CDP URL" value={record.cdpUrl} mono wrap />
             </dl>
           ) : (
             <p className="text-xs text-muted-foreground">
-              Click Connect to open Chrome and sign in to anything the agent needs to use.
-              When you are done, disconnect closes the window. Saved sign-ins stay available
-              for future agent browser tasks.
+              By default the agent drives its own browser, launched automatically when a task
+              needs the web. When it hits a sign-in wall it opens a live view of that browser
+              in chat so you can sign in once. You only need the option below if you want the
+              agent to drive a Chrome you are already running yourself.
             </p>
           )}
 
@@ -118,22 +107,13 @@ export function BrowserSettingsCard() {
                 Disconnect
               </Button>
             ) : (
-              <>
-                <Button
-                  size="sm"
-                  onClick={() => handleConnect("managed")}
-                  disabled={connect.isPending}
-                >
-                  {connect.isPending ? "Connecting..." : "Connect"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setShowAdvanced((value) => !value)}
-                >
-                  {showAdvanced ? "Hide Advanced" : "Advanced"}
-                </Button>
-              </>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setShowAdvanced((value) => !value)}
+              >
+                {showAdvanced ? "Hide Advanced" : "Advanced"}
+              </Button>
             )}
           </div>
 
@@ -154,17 +134,18 @@ export function BrowserSettingsCard() {
                   <code className="rounded bg-muted px-1 py-0.5 font-mono text-[10px]">
                     --remote-debugging-port=9222
                   </code>{" "}
-                  yourself, then paste its websocket debugger URL here. The runtime never
-                  touches your Chrome process in this mode.
+                  yourself, then paste its websocket debugger URL here. The runtime drives
+                  that Chrome but never starts or stops the process. Most people don't need this —
+                  the agent's own browser works out of the box.
                 </p>
                 <div className="mt-2">
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleConnect("cdp")}
+                    onClick={handleAttach}
                     disabled={connect.isPending || cdpUrl.trim().length === 0}
                   >
-                    Attach via CDP
+                    {connect.isPending ? "Attaching..." : "Attach via CDP"}
                   </Button>
                 </div>
               </div>
@@ -184,18 +165,11 @@ export function BrowserSettingsCard() {
           <DialogHeader>
             <DialogTitle>Disconnect browser?</DialogTitle>
             <DialogDescription>
-              {record?.mode === "managed"
-                ? "This closes Chrome. Your saved sign-ins stay available to the agent."
-                : "The runtime will drop its CDP attachment but never touch the Chrome process you started."}
+              The runtime will drop its CDP attachment but never touch the Chrome process you
+              started. The agent falls back to its own spawned browser.
             </DialogDescription>
           </DialogHeader>
-          <p className="text-xs text-muted-foreground">
-            {record?.mode === "managed" ? (
-              "You can connect again whenever you need to sign into another site."
-            ) : (
-              "Your Chrome process is left alone."
-            )}
-          </p>
+          <p className="text-xs text-muted-foreground">Your Chrome process is left alone.</p>
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="outline">Cancel</Button>
@@ -205,7 +179,7 @@ export function BrowserSettingsCard() {
               onClick={handleDisconnect}
               disabled={disconnect.isPending}
             >
-              {disconnect.isPending ? "Disconnecting..." : "Disconnect Chrome"}
+              {disconnect.isPending ? "Disconnecting..." : "Disconnect"}
             </Button>
           </DialogFooter>
         </DialogContent>

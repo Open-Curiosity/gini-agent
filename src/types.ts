@@ -49,39 +49,20 @@ export type ImportSource = "hermes" | "openclaw";
 
 export type AgentStatus = "active" | "inactive";
 
-// Headed-browser connection mode. `managed` means the runtime spawned the
-// Chrome process and owns its lifecycle (PID + dedicated user-data-dir).
-// `cdp` means the user pointed us at an existing CDP endpoint (e.g. their
-// own already-running Chrome) and we never touch the process. The two modes
-// share most of the same record so the API stays uniform.
-export type BrowserConnectionMode = "managed" | "cdp";
+// Headed-browser connection mode. `cdp` is the only persisted mode: the user
+// pointed the runtime at an existing external Chrome's CDP endpoint (e.g. their
+// own already-running Chrome) and we never spawn or signal that process. (The
+// old `managed` visible-window mode was removed — see issue #420; the default
+// no-record path is the runtime's own spawned Chrome.)
+export type BrowserConnectionMode = "cdp";
 
 export interface BrowserConnectionRecord {
   mode: BrowserConnectionMode;
-  // ws:// CDP debugger URL. For `managed` we discover it by polling the
-  // launched Chrome's /json/version endpoint; for `cdp` it's the value the
-  // user supplied. Stored normalized (no credentials in the path).
+  // ws:// CDP debugger URL the user supplied. Stored normalized (no
+  // credentials in the path).
   cdpUrl: string;
-  // PID of the Chrome we spawned. Null when mode === "cdp" because we
-  // don't own that process and must not signal it on disconnect.
-  pid: number | null;
-  // Profile directory passed to Chrome via --user-data-dir. Null for
-  // mode: "cdp". Survives disconnect so the user's signed-in state stays
-  // intact across reconnects.
-  dataDir: string | null;
-  // Absolute path of the Chrome binary the runtime launched. Null for cdp
-  // mode (we never resolved a binary). Useful for surfacing in the UI so
-  // users can confirm which install is being driven.
-  chromePath: string | null;
   // ISO timestamp of when the connection record was created/updated.
   startedAt: string;
-  // True when the managed Chrome was launched with headless: true (no
-  // window). Defaults to false / absent for visible managed launches and
-  // for cdp mode. Tracked on the record so an idempotent reconnect can
-  // detect a headed/headless visibility mismatch and tear down + relaunch
-  // when the caller asks for a different visibility than the current
-  // record has.
-  headless?: boolean;
 }
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
@@ -124,10 +105,10 @@ export interface TunnelState {
   message?: string;
 }
 
-// Persisted singleton on RuntimeState. Mirrors the BrowserConnectionRecord
-// opt-in shape: absent/null until the user first selects a provider. The
-// catalog itself is NOT persisted — it's rebuilt from code on every read so
-// adding a provider doesn't require a state migration.
+// Persisted singleton on RuntimeState. Opt-in shape: absent/null until the
+// user first selects a provider. The catalog itself is NOT persisted — it's
+// rebuilt from code on every read so adding a provider doesn't require a state
+// migration.
 export interface TunnelSelectionRecord {
   instance: Instance;
   selectedProvider: TunnelProviderId | null;
@@ -487,8 +468,10 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 
 // User-actor: user performs a setup step. No risk pill. Card layout is
 // chosen by `action`:
-//   - `browser.connect` → "Connect" button that opens visible Chrome
-//     (POST /api/setup-requests/<id>/open-browser), then signals complete.
+//   - `browser.connect` → "Connect" button (POST /api/setup-requests/<id>/open-browser)
+//     that opens a live sign-in screencast modal over the agent's headless
+//     spawned Chrome (relaunching it headless and navigating to the target page
+//     first if it isn't currently running), then signals complete.
 //   - `connector.request` → credential dialog. Submit POSTs the credential
 //     payload to /api/setup-requests/<id>/complete.
 //   - `browser.fill_secret` → inline credential inputs with destination URL
@@ -727,11 +710,11 @@ export interface RuntimeState {
   messagingMessages: MessagingMessageRecord[];
   runs: RunRecord[];
   planSteps: PlanStepRecord[];
-  // Optional headed-browser connection. Populated by the browser-connect
-  // capability and consumed by the session manager in src/tools/browser.ts
-  // to switch from headless `chromium.launch()` to `chromium.connectOverCDP()`
-  // so authenticated state lives in the user's Chrome profile, not the
-  // ephemeral test context. Purely opt-in; legacy state files omit it.
+  // Headed-browser connection slot. null (the default) means the runtime drives
+  // its own spawned per-instance Chrome (src/tools/browser.ts). A non-null
+  // record means the user attached the runtime to their OWN external Chrome
+  // over CDP via /api/browser/connect — the only persisted connection mode.
+  // (The old managed/visible-window mode was removed — see issue #420.)
   browser?: BrowserConnectionRecord | null;
   // Optional tunnel selection singleton (see ADR tunnel-connectivity.md).
   // Populated by the tunnel integration when the user selects/connects a
@@ -1059,6 +1042,16 @@ export interface PendingChatMessage {
   content: string;
   images?: ImageAttachment[];
   clientSurface?: ChatClientSurface;
+  // Set when the queued message is a thread reply, so auto-dispatch
+  // re-dispatches it back into its thread (a popped reply that lost these
+  // would drain as a main-chat turn). Optional so persisted state without
+  // them stays valid.
+  threadId?: string;
+  parentBlockId?: string;
+  // Carries the thread reply's "also show in main chat" flag so the mirror
+  // block survives the queue (a popped reply that lost it would re-dispatch
+  // without the main-chat mirror).
+  alsoToMain?: boolean;
   createdAt: string;
 }
 
@@ -1630,10 +1623,11 @@ export interface Authorization {
 // connect-only: their side effect (addMessagingBridge / allowChat /
 // removeMessagingBridge) runs inside the /complete handler AFTER the row is
 // atomically claimed pending → completed — the same claim-first ordering as
-// connector.request's create+probe. browser.connect is the inverse: its side
-// effect runs before the resolve. See SETUP_COMPLETE_EMITS_WORKING_PHASE in
-// src/agent.ts. They carry no approve/deny semantics, so they live here
-// rather than on AuthorizationAction.
+// connector.request's create+probe. browser.connect also claims first now:
+// /complete claims the row, then writes the audit row / tears down the
+// screencast bridge. See SETUP_COMPLETE_EMITS_WORKING_PHASE in src/agent.ts.
+// They carry no approve/deny semantics, so they live here rather than on
+// AuthorizationAction.
 export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"

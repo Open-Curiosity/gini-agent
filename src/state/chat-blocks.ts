@@ -501,6 +501,71 @@ export function findInFlightAssistantTextForTask(
   };
 }
 
+// One-shot boot heal for orphaned streaming assistant_text blocks (the "stuck
+// cursor"). A block left at streaming:true by a process that died/was killed
+// mid-stream — whose owning task is now terminal, waiting_approval, or pruned
+// from state.json — would otherwise render a perpetual cursor forever, since
+// nothing replays a dead turn. This settles each such block in place
+// (streaming:false, its OWN accreted text re-written verbatim — never empty),
+// the same lossless flip finalizeAssistantText performs on a live cancel.
+//
+// SAFETY (see docs/adr/chat-block-protocol.md + the per-turn-abort design):
+//   - The caller MUST run this on a quiescent boot, BEFORE the gateway binds
+//     its HTTP port and BEFORE reconcileInFlightTasks re-dispatches resumed
+//     turns, so no live or resumed writer can race the finalize. (mutateState
+//     locks only state.json, never chat_blocks — placement IS the race guard.)
+//   - `cutoffIso` excludes any block touched at/after this boot (a block whose
+//     updated_at >= cutoff belongs to a turn THIS process started, not an
+//     orphan). Same updatedAt<cutoff discipline reconcileInFlightTasks uses.
+//   - `isSafeToHeal(taskId)` is supplied by the caller from state.json: it MUST
+//     return false for running/queued tasks (a running/queued orphan is resumed
+//     by reconcileInFlightTasks, which mints a FRESH block — the resume path,
+//     not this sweep, owns settling its stale block) and true only for
+//     terminal/waiting_approval/absent-task blocks. taskId is null for rows with
+//     no owning task (legacy/pruned), which the caller treats as safe.
+//
+// Scans via idx_chat_blocks_streaming (the partial index on the same predicate)
+// so cost is O(stuck rows), not a full table scan. Returns the number of blocks
+// healed. Does NOT publish() — a boot backfill of old orphans has no live SSE
+// subscriber, and a silent in-place settle avoids waking pollers with stale
+// months-old rows.
+export function healOrphanedStreamingBlocks(
+  instance: Instance,
+  cutoffIso: string,
+  isSafeToHeal: (taskId: string | null) => boolean
+): number {
+  const db = getMemoryDb(instance);
+  const rows = db
+    .query<ChatBlockRow, [string]>(
+      `SELECT * FROM chat_blocks
+       WHERE kind = 'assistant_text'
+         AND json_extract(payload_json, '$.streaming') = 1
+         AND updated_at < ?`
+    )
+    .all(cutoffIso);
+  let healed = 0;
+  for (const row of rows) {
+    if (!isSafeToHeal(row.task_id ?? null)) continue;
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    } catch {
+      payload = {};
+    }
+    // Re-write the block's OWN text verbatim and only flip the flag — the
+    // last-writer-wins upsert means passing anything else would destroy the
+    // user-visible partial reply.
+    payload.text = String(payload.text ?? "");
+    payload.streaming = false;
+    db.run(
+      `UPDATE chat_blocks SET payload_json = ?, updated_at = ? WHERE id = ?`,
+      [JSON.stringify(payload), now(), row.id]
+    );
+    healed += 1;
+  }
+  return healed;
+}
+
 // Returns true when the given task has emitted at least one
 // assistant_text block whose text is non-empty after trimming. The push
 // dispatcher consults this on terminal `phase: Completed` blocks to
@@ -531,6 +596,88 @@ export function taskProducedAssistantText(
     }
   }
   return false;
+}
+
+// Returns the full text of the most recent non-empty, FINALIZED
+// assistant_text block in a session, or null when the session has none.
+// The push notification-preview endpoint consults this so the iOS
+// Notification Service Extension can show the latest assistant reply on
+// the lock screen. Because it reads the latest row by ordinal (not by
+// task), a notification collapsed onto a single session entry always
+// reflects the newest completed message even across multiple agent turns.
+//
+// Only finalized rows (`streaming = false`) are considered: the NSE
+// fetches this asynchronously after a turn's `Completed` push, and by then
+// a *newer* turn may already be mid-stream (a quick user follow-up or a
+// job firing on the same session). Without the finalized filter the
+// preview could surface that newer turn's half-streamed partial text under
+// the older turn's "new message" banner — confusing, even though it would
+// eventually converge. A streaming block carries the full accreted text on
+// every delta and flips to `streaming = false` on its terminal delta, so
+// filtering to finalized rows yields the last *complete* reply.
+//
+// Thread replies are excluded so the preview tracks the main chat the
+// notification deep-links to. Rows are scanned newest-first (ordinal DESC)
+// and the loop stops at the first non-empty text, skipping trailing
+// whitespace-only blocks — in the common case that's a single row.
+export function latestAssistantTextForSession(
+  instance: Instance,
+  sessionId: string
+): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId]
+  );
+}
+
+// Thread variant: the newest finalized assistant reply WITHIN a specific
+// thread. The push dispatcher emits a `message_completed` alert for a
+// threaded turn too (the turn produced a real reply), but that reply lives
+// under a thread_id — so the main-chat lookup above would surface stale
+// main-chat text or nothing. The notification-preview endpoint calls this
+// instead when the push carries a threadId, so a threaded completion shows
+// the thread's own reply.
+export function latestAssistantTextForThread(
+  instance: Instance,
+  sessionId: string,
+  threadId: string
+): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND thread_id = ? AND kind = 'assistant_text'
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId, threadId]
+  );
+}
+
+// Shared scan: run the query (already ordered newest-first), return the
+// first row whose payload `text` is non-empty after trimming, else null.
+// Skips whitespace-only and malformed rows. Both the main-chat and thread
+// lookups above differ only in their WHERE clause, so they share this.
+function scanLatestFinalizedAssistantText(
+  instance: Instance,
+  sql: string,
+  params: string[]
+): string | null {
+  const db = getMemoryDb(instance);
+  const rows = db.query<{ payload_json: string }, string[]>(sql).all(...params);
+  for (const r of rows) {
+    try {
+      const payload = JSON.parse(r.payload_json) as { text?: unknown };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        return payload.text;
+      }
+    } catch {
+      // malformed row — skip and keep scanning older blocks
+    }
+  }
+  return null;
 }
 
 // Updates an existing assistant_text block's text + updated_at without
@@ -580,6 +727,17 @@ export function upsertAssistantTextBlock(
 // stamp `errorMessage` on error). Looking up by call_id makes the resume
 // path simple: the chat-task loop and the approval-resume path both
 // know the provider-issued call id but not the block id.
+//
+// `taskId` scopes the lookup to the OWNING turn. callId is NOT globally
+// unique within a session: the codex text-backstop synthesizes a
+// deterministic, content-derived id (`call_textbackstop_<hash>`) that
+// recurs across turns when the same gated call is re-emitted. Without the
+// task filter, a LATE settle for an old turn (e.g. an approved action that
+// was aborted by a cancel, or a resume-terminal bail) would match the
+// NEWEST `(session_id, callId)` row by ordinal and overwrite a fresh
+// turn's tool_call with a stale status. Scoping by `task_id` confines each
+// settle to its own turn's row. Omitting `taskId` keeps the legacy
+// session+callId behavior for callers (and tests) without task context.
 export function updateToolCallBlock(
   instance: Instance,
   callId: string,
@@ -589,19 +747,31 @@ export function updateToolCallBlock(
     errorMessage?: string;
     errorSeverity?: "info" | "error";
     runningHint?: string;
-  }
+  },
+  taskId?: string
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
   const at = now();
-  const row = db
-    .query<ChatBlockRow, [string, string]>(
-      `SELECT * FROM chat_blocks
-       WHERE session_id = ? AND kind = 'tool_call'
-         AND json_extract(payload_json, '$.callId') = ?
-       ORDER BY ordinal DESC
-       LIMIT 1`
-    )
-    .get(sessionId, callId);
+  const row = taskId !== undefined
+    ? db
+        .query<ChatBlockRow, [string, string, string]>(
+          `SELECT * FROM chat_blocks
+           WHERE session_id = ? AND kind = 'tool_call'
+             AND json_extract(payload_json, '$.callId') = ?
+             AND task_id = ?
+           ORDER BY ordinal DESC
+           LIMIT 1`
+        )
+        .get(sessionId, callId, taskId)
+    : db
+        .query<ChatBlockRow, [string, string]>(
+          `SELECT * FROM chat_blocks
+           WHERE session_id = ? AND kind = 'tool_call'
+             AND json_extract(payload_json, '$.callId') = ?
+           ORDER BY ordinal DESC
+           LIMIT 1`
+        )
+        .get(sessionId, callId);
   if (!row) return null;
   let payload: Record<string, unknown> = {};
   try {

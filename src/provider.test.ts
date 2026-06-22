@@ -16,6 +16,7 @@ import {
   generateToolCallingResponse,
   generateVisionAnalysis,
   anthropicNeedsHttps,
+  isAbortError,
   isAuthExpiredError,
   isContextOverflowError,
   isProviderConfigured,
@@ -2657,6 +2658,53 @@ describe("provider", () => {
     }
   });
 
+  test("codex cancel during the pre-retry wait skips attempt 2 at the source", async () => {
+    // The pre-retry settle wait now honors the turn's AbortSignal: a user
+    // cancel landing in that 50ms window must abort the retry rather than
+    // run the full delay and fire a second (already-doomed) request. Attempt
+    // 1 returns a session-expired 401; the signal is aborted as soon as that
+    // first fetch is observed, so the abortable wait rejects immediately and
+    // attempt 2 is never constructed.
+    const { restore } = installCodexAuth("codex-retry-cancel-skips-attempt-2");
+    const originalFetch = globalThis.fetch;
+    const controller = new AbortController();
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      // Cancel the turn the instant attempt 1 is in flight — models the user
+      // tapping Stop while the first request is being rejected.
+      controller.abort();
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      ));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools,
+        undefined,
+        undefined,
+        controller.signal
+      ).catch((e) => e);
+      // The cancel aborted the wait, so only attempt 1 ever ran.
+      expect(attempts).toBe(1);
+      // The surfaced error is the abort (AbortError-shaped), not the
+      // session-expired one — the retry path bailed before re-attempting.
+      expect(isAbortError(err)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   // ----- Local codex credential failures -----
   // Steady-state local credential failures (auth.json missing — the
   // post-`codex logout` state — wrong-shape file, or persistently
@@ -4291,13 +4339,55 @@ describe("anthropic provider", () => {
             { type: "tool_result", tool_use_id: "toolu_y", content: "result-2" }
           ]
         },
-        { role: "assistant", content: [{ type: "text", text: "array text" }] },
-        { role: "assistant", content: [{ type: "text", text: "" }] },
+        // The two adjacent assistant turns ("array text" and the empty one)
+        // are merged into one — the Messages API requires strict alternation
+        // and rejects consecutive same-role turns (see mergeConsecutiveSameRole).
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "array text" },
+            { type: "text", text: "" }
+          ]
+        },
         { role: "user", content: "" }
       ]);
       // No tools passed → no tools/tool_choice in the body.
       expect(sent.tools).toBeUndefined();
       expect(sent.tool_choice).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("merges consecutive user messages (cancelled-prompt + interrupt marker + new prompt) into one — the Messages API requires alternation", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      // The exact replay shape after a cancel: prior user prompt (no assistant
+      // answer), the interrupt marker, then the new turn's user prompt.
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "first question" },
+        { role: "user", content: "[Request interrupted by user]" },
+        { role: "user", content: "second question" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // Three adjacent user turns collapse into ONE, content blocks concatenated
+      // in order — no consecutive same-role turns reach the API.
+      expect(sent.messages).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "first question" },
+            { type: "text", text: "[Request interrupted by user]" },
+            { type: "text", text: "second question" }
+          ]
+        }
+      ]);
     } finally {
       fetchStub.restore();
       restoreEnv();
@@ -5235,6 +5325,38 @@ describe("anthropic provider", () => {
         (m) => m.role === "assistant" && m.content.some((b) => b.text === "thinking out loud")
       );
       expect(survived).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: merges consecutive user messages (cancel-replay shape) — Converse requires alternation", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "first question" },
+        { role: "user", content: "[Request interrupted by user for tool use]" },
+        { role: "user", content: "second question" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // Exactly one user message, with all three texts as ordered blocks.
+      expect(body.messages.length).toBe(1);
+      expect(body.messages[0]!.role).toBe("user");
+      expect(body.messages[0]!.content).toEqual([
+        { text: "first question" },
+        { text: "[Request interrupted by user for tool use]" },
+        { text: "second question" }
+      ]);
     } finally {
       fetchStub.restore();
       restoreSk();

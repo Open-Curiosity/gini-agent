@@ -1,22 +1,19 @@
 // CLI surface for the browser-connect capability:
 //   gini browser status
-//   gini browser connect [--url WSURL]
+//   gini browser connect [--url ws://127.0.0.1:9222/devtools/browser/abc]
 //   gini browser disconnect
 //
-// Thin client over /api/browser*. All subcommands print the JSON response
-// so users can pipe it into jq / scripts; the underlying capability
-// already shapes the response with a `connected` boolean for quick checks.
+// Thin client over /api/browser*. All subcommands print the JSON response so
+// users can pipe it into jq / scripts; the underlying capability shapes the
+// response with a `connected` boolean for quick checks.
 //
-// Note on persistence: connect/disconnect toggle visibility only — the
-// agent always drives the same per-instance profile so sign-ins persist
-// across cycles. To clear saved logins, rm -rf the per-instance profile
-// dir manually.
-//
-// Note on --port: managed mode launches Chromium via
-// chromium.launchPersistentContext, which doesn't take a user-supplied
-// debugging port. CDP-attach mode never used a port either — the user
-// pastes a full ws:// URL. The flag is gone; older scripts that pass it
-// will get the usage error below.
+// Transport (issue #420): with no `--url`, the runtime drives its own spawned
+// per-instance Chrome — `connect` is a no-op acknowledgement and sign-in
+// happens through the in-chat screencast modal, not the CLI. Passing `--url`
+// attaches the runtime to your OWN already-running external Chrome over that
+// CDP websocket URL (an opt-in transport for users who run their own Chrome).
+// To clear saved logins from the spawned profile, rm -rf the per-instance
+// profile dir manually.
 import type { CliContext } from "../context";
 import { flagValue, restAfter } from "../args";
 import { api } from "../api";
@@ -34,12 +31,12 @@ export async function browser(ctx: CliContext): Promise<void> {
   if (sub === "connect") {
     const rest = restAfter(cliArgs, "connect");
     const url = flagValue(rest, "--url");
-    const body: Record<string, unknown> = {};
-    if (url) body.cdpUrl = url;
+    const requestBody: Record<string, unknown> = {};
+    if (url) requestBody.cdpUrl = url;
     print(
       await api(config, "/api/browser/connect", {
         method: "POST",
-        body: JSON.stringify(body)
+        body: JSON.stringify(requestBody)
       })
     );
     return;
@@ -54,7 +51,5 @@ export async function browser(ctx: CliContext): Promise<void> {
     return;
   }
 
-  throw new Error(
-    "Usage: gini browser status | connect [--url WSURL] | disconnect"
-  );
+  throw new Error("Usage: gini browser status | connect [--url WSURL] | disconnect");
 }

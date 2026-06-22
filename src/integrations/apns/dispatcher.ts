@@ -1,7 +1,7 @@
 // APNs dispatcher. Subscribes to the chat-blocks instance-wide emitter
 // and translates two kinds of blocks into APNs pushes:
-//   - `approval_requested` → alert push (always sent; the user needs to
-//     decide and may not be in the app).
+//   - `authorization_requested` → alert push (always sent; the user needs
+//     to decide and may not be in the app).
 //   - `phase` with a terminal label → routed by label and by whether the
 //     task produced a user-visible message:
 //       * `Completed` AND the task emitted ≥1 non-empty `assistant_text`
@@ -17,6 +17,13 @@
 //     when that device has an active SSE subscription on the session —
 //     the open stream delivers the block directly and the wake-up is
 //     redundant.
+//     Separately, an alert push is DOWNGRADED to a silent badge refresh
+//     (across every phone) when a tokenless web/CLI client is
+//     live-watching the session: the human is reading the chat on the web
+//     app, so a banner on their phone for that same message is just
+//     noise. The badge still ticks (web reads don't clear a phone's
+//     per-device read cursor), but the phone doesn't buzz. Send-then-close
+//     leaves no web entry, so the phone gets its normal alert.
 //
 // Privacy: every alert payload carries ids + a generic title only.
 // Never the message text, the approval summary, or any user-authored
@@ -33,6 +40,7 @@
 
 import {
   isDeviceWatching,
+  isSessionWebWatched,
   listAllDevices,
   removeDevice,
   subscribeAllChatBlocks,
@@ -68,6 +76,13 @@ export interface DispatcherDeps {
   // block's sessionId; the implementation should return true when
   // that specific device has an open SSE stream on the session.
   isWatching?: (instance: Instance, deviceToken: string, sessionId: string) => boolean;
+  // Override the web-watch predicate — tests pin "a web/CLI client is
+  // reading this session" without touching the pushless registry's
+  // process state. True when a tokenless (web/CLI) client has a live SSE
+  // stream open on the session; the dispatcher uses it to downgrade an
+  // alert completion push to a silent badge refresh so the user's phone
+  // doesn't buzz for a message they're already reading on the web app.
+  isWebWatched?: (instance: Instance, sessionId: string) => boolean;
   // Override the "did this task produce an assistant_text block" lookup
   // — tests pin alert-vs-silent routing on Completed phase blocks
   // without seeding chat_blocks rows.
@@ -137,28 +152,31 @@ export function buildMessageCompletedPayload(
       // Group multiple message notifications for the same chat under
       // one stack on the lock screen (same convention as approvals).
       "thread-id": block.sessionId,
-      // `mutable-content: 1` keeps the door open for a future NSE that
-      // wants to enrich the payload (e.g. attach a preview snippet from
-      // a privileged on-device fetch). The current NSE is approval-only
-      // and treats this as a no-op.
+      // `mutable-content: 1` makes iOS invoke the NSE before display, which
+      // fetches the real message text from /api/push/preview on-device and
+      // rewrites this banner — the text never rides the wire payload.
       "mutable-content": 1
     },
     // Routing fields under `body` so expo-notifications surfaces them
     // as `content.data` on the client (see comment in
     // buildApprovalPayload). `silent: false` lets the client classifier
-    // branch uniformly on `data.silent`.
+    // branch uniformly on `data.silent`. `threadId` rides along when the
+    // completed turn was in a thread so the NSE's preview fetch can
+    // resolve the THREAD's own reply (the main-chat lookup would surface
+    // stale main-chat text); absent for ordinary main-chat completions.
     body: {
       sessionId: block.sessionId,
       blockId: block.id,
       event: "message_completed",
-      silent: false
+      silent: false,
+      ...(block.threadId ? { threadId: block.threadId } : {})
     }
   };
 }
 
-// Builds the per-call APNs payload + headers for an approval_requested
-// block. Exported for tests that want to assert payload shape without
-// mocking the entire dispatcher.
+// Builds the per-call APNs payload + headers for an authorization_requested
+// (or setup_requested) prompt block. Exported for tests that want to assert
+// payload shape without mocking the entire dispatcher.
 type PendingPromptBlock =
   | (ChatBlock & { kind: "authorization_requested" })
   | (ChatBlock & { kind: "setup_requested" });
@@ -169,27 +187,32 @@ function promptIdOf(block: PendingPromptBlock): string {
 
 export function buildApprovalPayload(block: PendingPromptBlock): APNsPayload {
   const isSetup = block.kind === "setup_requested";
-  return {
-    aps: {
-      alert: {
-        title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
-        body: "Tap to review"
-      },
-      sound: "default",
-      // `thread-id` groups multiple notifications under a single
-      // stack in iOS's notification center. Using sessionId means a
-      // chat with several approvals collapses to one stack instead
-      // of flooding the lock screen.
-      "thread-id": block.sessionId,
-      // `mutable-content: 1` lets the Notification Service Extension
-      // (Step 4) modify the payload before display — required for
-      // the inline Approve/Deny actions to be wired up later.
-      "mutable-content": 1,
-      // `category` ties the notification to the iOS-side
-      // UNNotificationCategory that defines the Approve/Deny
-      // actions. The mobile app registers the category on launch.
-      category: "APPROVAL_REQUEST"
+  const aps: Record<string, unknown> = {
+    alert: {
+      title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
+      body: "Tap to review"
     },
+    sound: "default",
+    // `thread-id` groups multiple notifications under a single
+    // stack in iOS's notification center. Using sessionId means a
+    // chat with several approvals collapses to one stack instead
+    // of flooding the lock screen.
+    "thread-id": block.sessionId,
+    // `mutable-content: 1` lets the Notification Service Extension
+    // modify the payload before display — required both for the
+    // inline Approve/Deny actions and for the on-device preview fetch.
+    "mutable-content": 1
+  };
+  // `category` ties the notification to the iOS-side
+  // UNNotificationCategory that defines the Approve/Deny actions —
+  // attach it ONLY for authorization_requested. A setup_requested is a
+  // user-action flow (open a browser, fill a form) with no approve/deny
+  // semantics, and its id is a setup id that the Approve/Deny handler's
+  // POST /api/authorizations/:id route can't resolve. Setup pushes
+  // deep-link into the app on tap instead.
+  if (!isSetup) aps.category = "APPROVAL_REQUEST";
+  return {
+    aps,
     // expo-notifications reads remote-push custom data from
     // userInfo["body"], not top-level userInfo keys — top-level fields
     // are dropped on the client. Wrapping our routing payload in a
@@ -213,6 +236,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
   const onTokenInvalidated = deps?.onTokenInvalidated ?? ((inst, token) => { removeDevice(inst, token); });
   const subscribe = deps?.subscribe ?? subscribeAllChatBlocks;
   const isWatching = deps?.isWatching ?? isDeviceWatching;
+  const isWebWatched = deps?.isWebWatched ?? isSessionWebWatched;
   const hasAssistantText = deps?.hasAssistantText ?? taskProducedAssistantText;
   const warn = deps?.warn ?? ((message: string, detail?: unknown) => {
     if (detail !== undefined) console.warn(`[apns-dispatcher] ${message}`, detail);
@@ -306,7 +330,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     // when the block has no taskId — without a task to query, we can't
     // know whether a user-visible message was emitted, so we fall back
     // to the conservative silent path.
-    const sendAlert =
+    const wouldAlert =
       block.label === "Completed" &&
       typeof block.taskId === "string" &&
       block.taskId.length > 0 &&
@@ -318,6 +342,27 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
           return false;
         }
       })();
+
+    // Downgrade an alert to a silent badge refresh when a web/CLI client
+    // is live-watching this session: the human is reading the chat on the
+    // web app, so a banner on their phone for the same message is just
+    // noise. The badge still ticks (web reads don't advance the phone's
+    // per-device read cursor, so the message genuinely is unread there),
+    // but the phone doesn't buzz. A pure-silent push (Failed, or Completed
+    // with no assistant_text) is unaffected — it carries no banner to
+    // suppress. Evaluated live: the predicate is true only while a web
+    // stream is open, so a user who sends then closes the tab leaves no
+    // entry and the phone gets its normal alert.
+    let webWatched = false;
+    if (wouldAlert) {
+      try {
+        webWatched = isWebWatched(instance, block.sessionId);
+      } catch (error) {
+        warn("isWebWatched failed", error instanceof Error ? error.message : String(error));
+        webWatched = false;
+      }
+    }
+    const sendAlert = wouldAlert && !webWatched;
 
     const payload = sendAlert
       ? buildMessageCompletedPayload(block)
@@ -332,7 +377,10 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     // is per-device (keyed by APNs token) because two iOS installs
     // of the same human can be in different app states; the
     // backgrounded install still needs the silent wake (or alert)
-    // even when the foregrounded one is already watching.
+    // even when the foregrounded one is already watching. The device
+    // POSTs /api/push/unwatch when it backgrounds to clear its
+    // watch-state, so a relay holding the SSE socket open past
+    // backgrounding can't leave a stale entry that over-suppresses.
     await Promise.all(devices.map((device) => {
       if (isWatching(instance, device.token, block.sessionId)) {
         return Promise.resolve();

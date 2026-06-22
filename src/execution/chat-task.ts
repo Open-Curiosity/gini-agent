@@ -37,6 +37,7 @@ import {
   ProviderAuthError,
   generateAuxText,
   generateToolCallingResponse,
+  isAbortError,
   isAuthExpiredError,
   isContextOverflowError,
   providerAuthNote,
@@ -117,6 +118,7 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
 import { parseLeadingRouteDirective } from "./route-directive";
+import { registerTurn, releaseTurn } from "./turn-abort";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn, dispatchNextPendingChatMessage } from "./chat";
@@ -626,6 +628,29 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
   await updateRunFromTask(config, task);
 
+  // Resume-path stuck-cursor heal. A boot-resumed orphan (reconcileInFlightTasks
+  // re-dispatches an interrupted running/queued chat task back through here)
+  // left a streaming:true assistant_text block from the dead process. The loop
+  // below mints a FRESH block per iteration and never adopts that orphan, so
+  // without this it would stay stuck at streaming:true forever (the "stuck
+  // cursor"). Settle it now — task-scoped (this task's own block only),
+  // text preserved verbatim, idempotent (no-op when nothing is streaming). This
+  // runs after the task is already flipped to running, so it cannot race a live
+  // writer: the prior process that owned the block is gone, and this turn's
+  // fresh writer hasn't started.
+  const staleStreaming = findInFlightAssistantTextForTask(config.instance, taskId);
+  if (staleStreaming) {
+    const healCtx = resolveEmitContext(config, taskId);
+    if (healCtx) {
+      finalizeAssistantText(healCtx, staleStreaming.blockId, staleStreaming.text);
+      appendTrace(config.instance, taskId, {
+        type: "task",
+        message: "Settled a stale streaming assistant_text block left by a prior process before resuming",
+        data: { blockId: staleStreaming.blockId }
+      });
+    }
+  }
+
   appendTrace(config.instance, taskId, {
     type: "task",
     message: "Chat task started",
@@ -911,7 +936,16 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     }
   });
 
-  return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
+  // Register the per-turn AbortController so cancelTask can abort the in-flight
+  // model call at the source (see src/execution/turn-abort.ts). Released in the
+  // finally on every runLoop exit (completion / pause / cancel / throw) so the
+  // registry never leaks an entry across turns.
+  const turnController = registerTurn(config.instance, taskId);
+  try {
+    return await runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent, turnController.signal);
+  } finally {
+    releaseTurn(config.instance, taskId, turnController);
+  }
 }
 
 // Capture the runtime identity exposed to the model via the ephemeral
@@ -1788,7 +1822,12 @@ async function runLoop(
   messages: ToolCallingMessage[],
   iterationsSoFar: number,
   pendingIdentitySnapshot?: { conversationId: string; snapshot: IdentitySnapshotRecord },
-  inheritedEffective?: EffectiveContext
+  inheritedEffective?: EffectiveContext,
+  // Per-turn abort signal, threaded into every model/aux call so cancelTask
+  // stops the in-flight provider request at the source. The caller owns the
+  // controller's lifecycle via the turn-abort registry (register before this
+  // call, release in a finally); runLoop only reads the signal.
+  turnSignal?: AbortSignal
 ): Promise<Task> {
   // Build the tool catalog once per loop entry. If the user toggles a
   // toolset mid-pause we'll pick up the change on resume — that's a
@@ -1971,6 +2010,14 @@ async function runLoop(
   const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
     if (!emitCtx) return "no-parent";
     if (emitCtx.threadId) return "already-threaded";
+    // Don't re-route (or emit the main-chat "Completed" phase below) once the
+    // task is terminal. finalizeTurnRoute calls this AFTER the model returns,
+    // which is reachable post-cancel: a mid-stream cancel makes the flush bail
+    // before resolving the route, leaving routeResolved false so the route
+    // fires here instead. Without this guard a cancelled routed turn appends a
+    // "Completed" phase after cancelTask's "Cancelled" phase.
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
+    if (!task || isTerminalTaskStatus(task.status)) return "no-parent";
     const parent = getMainChatUserTextBlockForTask(config.instance, emitCtx.sessionId, taskId);
     if (!parent) return "no-parent"; // No human message to branch from — stay in the main/channel timeline.
     const threadId = makeId("thread");
@@ -2132,6 +2179,28 @@ async function runLoop(
     return exhausted;
   };
 
+  // Bail-out for a turn whose in-flight model/aux call rejected with an
+  // AbortError because the turn AbortSignal fired. The abort is raised by
+  // recordInFlightAborted, shared by every terminal-status flip — cancel,
+  // failTask, and sibling-deny — so the bail is NOT cancel-specific. Whichever
+  // caller fired the abort already owns the terminal status flip and the
+  // terminal block emission (Cancelled / Failed) inside its own mutateState,
+  // so this helper just reads the now-terminal task back and returns it —
+  // mirroring the loop's other terminal-status bail-outs. It never overwrites
+  // status. If the task somehow isn't terminal yet (the abort raced ahead of
+  // the commit), the row is still returned as-is; the caller's terminal guards
+  // and the caller's own emission converge on the same state.
+  const bailOnTurnAbort = async (): Promise<Task> => {
+    const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+    appendTrace(config.instance, taskId, {
+      type: "task",
+      message: `Chat task bail-out: in-flight model call aborted (task ${stale?.status ?? "terminal"})`,
+      data: { iterations, status: stale?.status }
+    });
+    await syncSubagentFromTask(config, stale ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
+    return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+  };
+
   while (iterations < cap) {
     iterations += 1;
     // The leading `<route>` directive can only appear on the very first model
@@ -2189,6 +2258,28 @@ async function runLoop(
     routeResolved = !(isFirstModelCall && threadDetectionEnabled());
     const flush = async (): Promise<void> => {
       if (!pending) return;
+      // Cancel-during-stream guard (defense-in-depth). The provider call now
+      // carries the turn AbortSignal, so cancelTask aborts it at the source —
+      // but a few buffered deltas can still arrive in the brief window before
+      // the abort unwinds the stream reader. Without this check, such a
+      // post-cancel flush would open a fresh assistant_text block (or keep
+      // growing one) that the cancelled bail-out path never settles — leaving a
+      // block stuck at streaming:true (the "stuck cursor") and surfacing text
+      // the user asked to stop. Once the task is terminal, drop the buffered
+      // deltas and stop painting. cancelTask already settled whatever block
+      // existed at cancel time via findInFlightAssistantTextForTask; this
+      // closes the window where a new block would otherwise be born AFTER the
+      // cancel. A missing task row counts as terminal too, matching the
+      // top-of-loop guard.
+      const flushTask = readState(config.instance).tasks.find((t) => t.id === taskId);
+      if (!flushTask || isTerminalTaskStatus(flushTask.status)) {
+        pending = "";
+        // Bump lastFlush so onDelta's debounce doesn't re-enqueue a guarded
+        // flush (and its readState) on every subsequent delta while a
+        // cancelled provider keeps streaming until its call returns.
+        lastFlush = Date.now();
+        return;
+      }
       const delta = pending;
       pending = "";
       lastFlush = Date.now();
@@ -2218,17 +2309,32 @@ async function runLoop(
       const cleanedFull = routeRawText.slice(routeStrippedPrefix);
       const cleanedDelta = cleanedFull.slice(routeSurfacedLen);
       routeSurfacedLen = cleanedFull.length;
-      if (cleanedDelta) {
-        await mutateState(config.instance, (state) => {
-          appendTaskPartial(state, taskId, cleanedDelta);
-        });
-      }
+      // The early terminal guard at the top of flush() is lock-free, so a
+      // cancel can still land in the window between that read and this write.
+      // Re-check terminal
+      // status INSIDE the mutateState — which the per-instance lock serializes
+      // with cancelTask's status flip — and skip the append when the task went
+      // terminal. `wrote` reports whether the partial actually landed; the
+      // block emit below is gated on it, so a post-cancel flush can NEVER open
+      // or grow an assistant_text block after the cancel. This closes the race
+      // at the source rather than relying on the boot-time heal to settle a
+      // leaked streaming block later.
+      // Nothing new to surface this flush (e.g. the accreted text was all
+      // route-directive prefix) — no partial write, no block emit.
+      if (!cleanedDelta) return;
+      const wrote = await mutateState(config.instance, (state) => {
+        const t = state.tasks.find((task) => task.id === taskId);
+        if (!t || isTerminalTaskStatus(t.status)) return false;
+        appendTaskPartial(state, taskId, cleanedDelta);
+        return true;
+      });
       // Mirror the same flush boundary to the assistant_text block so
       // SSE subscribers see the same cadence the partialSummary path
       // exposes today. The block carries the FULL accreted (cleaned) text
       // (not the delta), so a reconnect always observes a monotonically
-      // growing string and never needs to splice deltas itself.
-      if (emitCtx && cleanedFull) {
+      // growing string and never needs to splice deltas itself. Gated on
+      // `wrote`: once the task is terminal, no block is born or grown.
+      if (wrote && emitCtx && cleanedFull) {
         inFlightAssistantText = cleanedFull;
         if (!inFlightAssistantBlockId) {
           const block = emitAssistantTextStart(emitCtx, inFlightAssistantText);
@@ -2368,12 +2474,23 @@ async function runLoop(
                 user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
                 maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
               },
-              providerOverride
+              providerOverride,
+              turnSignal
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
             void recordUsage(config.instance, { ...usageBaseCtx, source: "aux" }, aux.cost).catch(() => {});
             summaryText = aux.text.trim();
           } catch (error) {
+            // Turn-abort: the in-flight compaction aux call was cancelled. Bail
+            // to the cancelled terminal path rather than the partial-result
+            // exit (which would wrongly mark the task completed). Gate on our
+            // OWN turnSignal so an unrelated AbortError (a provider aborting
+            // for its own reasons) isn't mistaken for a turn cancel — that
+            // would return the loop while the task is still non-terminal.
+            if (isAbortError(error) && turnSignal?.aborted) {
+              await flushChain;
+              return bailOnTurnAbort();
+            }
             // No usable aux model — compaction is impossible, and pruning
             // already failed to bring the projection under the mark.
             appendTrace(config.instance, taskId, {
@@ -2441,9 +2558,21 @@ async function runLoop(
           workingMessages,
           providerTools,
           onDelta,
-          providerOverride
+          providerOverride,
+          turnSignal
         );
       } catch (error) {
+        // Turn-abort: cancelTask aborted the in-flight model call. Drain any
+        // queued flush, then bail to the cancelled terminal path — the abort is
+        // NOT a context overflow (don't compact-and-retry) nor an auth failure
+        // (don't record needs-reauth). cancelTask owns the terminal status flip
+        // and the "Cancelled" block emission; we just stop the loop here. Gate
+        // on our OWN turnSignal so an unrelated AbortError isn't mistaken for a
+        // turn cancel (which would return the loop on a still-running task).
+        if (isAbortError(error) && turnSignal?.aborted) {
+          await flushChain;
+          return bailOnTurnAbort();
+        }
         // Tag a provider auth failure with the provider that actually served
         // this turn, so failTask names the right credential even if the active
         // agent switched while the call was in flight (issue #205).
@@ -3383,9 +3512,17 @@ async function runLoop(
         summaryMessages,
         [],
         undefined,
-        providerOverride
+        providerOverride,
+        turnSignal
       );
     } catch (error) {
+      // Turn-abort: the exhaustion-summary call was cancelled. Bail to the
+      // cancelled terminal path — this runs after the main loop, so there is no
+      // in-flight flush to drain. Gate on our OWN turnSignal so an unrelated
+      // AbortError isn't mistaken for a turn cancel.
+      if (isAbortError(error) && turnSignal?.aborted) {
+        return bailOnTurnAbort();
+      }
       // Same provider-auth tagging as the main loop call, so an expired token
       // on the final summary turn surfaces a named re-auth note instead of a
       // raw failure (issue #205).
@@ -3653,6 +3790,28 @@ export async function resumeChatTask(
       message: "Resume request ignored: task is terminal",
       data: { toolCallId, taskStatus: stage.task.status }
     });
+    // The task was cancelled (or failed) while this approved tool's side effect
+    // was running, but the side effect ran to COMPLETION (not aborted): an
+    // aborted action never reaches here — executeApprovedAction inspects the
+    // action's own abort verdict and settles its row `denied` itself instead
+    // of routing the abort-result string through this bail. So a resume that
+    // does land here is a genuine success whose result the loop won't re-enter
+    // to surface, and cancelTask deliberately leaves approved-but-unsettled
+    // rows to this site. Settle to `ok` and surface the result; without it the
+    // row stays stuck `running` after "Cancelled" for a tool that succeeded
+    // (issue #395). Best-effort.
+    try {
+      const termCtx = resolveEmitContext(config, taskId);
+      if (termCtx) {
+        emitToolCallStatus(termCtx, { callId: toolCallId, status: "ok" });
+        emitToolResult(termCtx, { callId: toolCallId, result: toolResult });
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.resume_terminal_block.emit_failed", {
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     return stage.task;
   }
   if (!stage.hasState) {
@@ -3731,7 +3890,16 @@ export async function resumeChatTask(
     data: { resumedAt: snapshot.iterations }
   });
 
-  const finished = await runLoop(config, taskId, messages, snapshot.iterations);
+  // Register a fresh per-turn AbortController for the resumed turn so a cancel
+  // landing during the resumed model call aborts it at the source, same as a
+  // first turn. Released in the finally on every exit.
+  const turnController = registerTurn(config.instance, taskId);
+  let finished: Task;
+  try {
+    finished = await runLoop(config, taskId, messages, snapshot.iterations, undefined, undefined, turnController.signal);
+  } finally {
+    releaseTurn(config.instance, taskId, turnController);
+  }
   // Drain the per-session queue after an approval resume settles (ADR
   // chat-message-queue.md). The submitTask `.finally` chokepoint only fires
   // for the original runTask promise, which already resolved when the turn

@@ -1,4 +1,4 @@
-# ADR: Mobile Push Notifications (APNs + NSE + Inline Actions)
+# ADR: Mobile Push Notifications (APNs + NSE Enrichment + Inline Actions)
 
 - **Status:** Accepted
 - **Date:** 2026-05-26
@@ -13,17 +13,27 @@ intermediate relay — the gateway holds the `.p8` signing key and posts
 straight to `api.push.apple.com`.
 
 Pushes carry **ids only** (sessionId, blockId, approvalId, event tag).
-The notification body is a generic string (`"Tap to review"` for
-approvals; silent payload for completions). The mobile client fetches
-full content via the existing `/api/*` surface on tap, action, or
-foreground refresh.
+The APNs wire body is a generic string (`"Tap to review"` for approvals,
+`"Tap to read"` for completions; silent payload for badge-only
+completions) — Apple's servers never see chat content.
 
-Lock-screen Approve / Deny action buttons on approval pushes are
-implemented as an iOS **Notification Service Extension** (NSE) plus a
-`UNNotificationCategory` registered by the main app. The NSE attaches
-the category id on incoming `approval_requested` payloads; the OS
-renders the action buttons; tapping an action posts directly to
-`/api/approvals/:id/approve` or `/deny` without opening the app.
+The lock-screen banner is then **enriched on-device** by the iOS
+**Notification Service Extension** (NSE). On a `mutable-content: 1` push,
+the NSE fetches the real preview from the gateway's
+`GET /api/push/preview` over the device's own authenticated connection
+and rewrites the title + body before display. The message text reaches
+the device out-of-band; it never transits Apple. On any failure (no
+shared creds, network error, non-200, timeout) the NSE falls back to the
+generic as-sent banner, so the user always sees a notification.
+
+Lock-screen Approve / Deny action buttons are also implemented by the NSE
+plus a `UNNotificationCategory` registered by the main app. The category
+is attached only to `authorization_requested` pushes (the dispatcher sets
+it server-side; the NSE re-asserts it); the OS renders the action buttons;
+tapping an action posts directly to `/api/authorizations/:id/approve` or
+`/deny` without opening the app. Setup requests need the app (open a
+browser, fill a form), so they carry no action buttons and deep-link on
+tap instead.
 
 The mobile build moves from purely managed Expo to a **dev client +
 `expo prebuild`** workflow on iOS to host the NSE. The plugin
@@ -46,11 +56,14 @@ The chosen design uses two transports in concert:
   transitions arrive frame-by-frame with `Last-Event-ID` resume on
   reconnect. This is the canonical streaming path while the user is
   watching a chat. See ADR [Chat Block Protocol](./chat-block-protocol.md).
-- **APNs** for wake-ups: `approval_requested` (always) and
-  `phase: Completed | Failed` (only when no active SSE subscription
-  for the credential). Completions fire as `content-available: 1`
-  silent pushes that update the badge count without surfacing an
-  alert; approvals fire as visible alerts with inline action buttons.
+- **APNs** for wake-ups: `authorization_requested` / `setup_requested`
+  (always) and `phase: Completed | Failed` (only when no active SSE
+  subscription for the device — see the per-device suppression note under
+  Trigger policy). A `Completed` turn that produced a
+  user-visible message fires a visible alert; a `Completed` with no
+  message and `Failed` fire as `content-available: 1` silent pushes that
+  update the badge without surfacing a banner. Authorization pushes carry
+  inline Approve/Deny action buttons.
 
 ## Trust + privacy
 
@@ -64,22 +77,28 @@ The chosen design uses two transports in concert:
   `APNS_KEY_P8_PATH` from env. The key never leaves the gateway
   process. ES256 JWT is cached for 50 minutes and rotated on demand.
 - **Payload scope**: APNs alert payloads contain `{ sessionId, blockId,
-  approvalId, event }` and a fixed `{ title: "Gini needs your
-  approval", body: "Tap to review" }`. No chat text, no tool name, no
-  approval summary. Silent payloads carry the same routing fields and
-  `content-available: 1`. The exhaustive privacy assertion is pinned
-  in `src/integrations/apns/dispatcher.test.ts` — any future regression
-  that adds user content to the wire surface fails the suite.
+  approvalId, event }` — plus `threadId` when the completed block belongs
+  to a thread — and a fixed `{ title, body }` generic string. No chat
+  text, no tool name, no approval summary. The routing ids (including
+  `threadId`) are opaque identifiers, not user content. Silent payloads
+  carry the same routing fields and `content-available: 1`. The
+  exhaustive privacy assertion is pinned in
+  `src/integrations/apns/dispatcher.test.ts` — any future regression that
+  adds user content to the **wire** surface fails the suite. The rich
+  preview the user sees is fetched on-device by the NSE (see "NSE
+  enrichment" below), never placed on the wire.
 - **Apple sees**: sessionId-shaped opaque strings, app bundle id, and
   the generic title. Apple does not see the chat content, the agent
-  name, or any user-authored text.
+  name, or any user-authored text — even though the user reads a rich
+  preview on their lock screen.
 
 ## Trigger policy
 
 | Event | Push | Rationale |
 | ----- | ---- | --------- |
-| `approval_requested` | Always (alert + inline actions) | The runtime can't make progress without user input; the user may not be in the app. |
-| `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device | Background and scheduled work that produces a real reply is exactly what the user wants to know about. |
+| `authorization_requested` | Always (alert + inline Approve/Deny actions) | The runtime can't make progress without user input; the user may not be in the app. |
+| `setup_requested` | Always (alert, no action buttons — deep-links on tap) | The user must complete a step (sign in, fill a form) in the app; surface it but don't offer approve/deny. |
+| `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device; **downgraded to a silent badge tick** while a web/CLI client is reading the session (see "Cross-client presence") | Background and scheduled work that produces a real reply is exactly what the user wants to know about — unless the user is already reading it elsewhere. |
 | `phase: Completed` with no `assistant_text` (only tool calls / system notes) | Silent (badge tick), only if no active SSE subscription | Nothing for the user to read — bump the badge so the chat list is accurate, but don't surface a banner. |
 | `phase: Failed` | Silent (badge tick), only if no active SSE subscription | Failure noise shouldn't yell at the user; tapping the chat surfaces the error. |
 | `phase: Cancelled` | Never | User-initiated terminal state; the user is already in the app. |
@@ -88,15 +107,114 @@ The chosen design uses two transports in concert:
 
 The `message_completed` alert payload carries the same routing fields
 as the silent variant (`sessionId`, `blockId`, `event: "message_completed"`,
-`silent: false`) plus a generic `aps.alert` envelope. No `category` is
-attached — the only action is the default tap, which deep-links to the
-chat detail via the existing response listener.
+`silent: false`, and `threadId` when the completed block is threaded) plus
+a generic `aps.alert` envelope. The `threadId` lets the NSE ask the
+gateway for the **thread's** own latest reply instead of the main chat's,
+so a notification fired by threaded work previews the right text. No
+`category` is attached — the only action is the default tap, which
+deep-links to the chat detail (see "Tap routing + cold-start recovery").
 
 The "no active subscription" check is per-device, not per-credential:
 two iOS installs of the same human can be in different app states
 (one watching, one backgrounded). The backgrounded install still gets
 the wake-up (alert or silent) so its badge and visible state stay in
 sync.
+
+## Cross-client presence (web/CLI reading downgrades the phone alert)
+
+The per-device suppression above only knows about clients that carry an
+APNs device token — i.e. iOS installs. A web or CLI client opens the same
+`/api/chat/:id/stream` but sends no `X-Device-Token`, so it can never
+appear in the per-device registry. Without more, a turn the user finishes
+in the web app still fires the "Gini has a new message" banner to their
+phone — a buzz for a message they're already reading.
+
+So the gateway tracks tokenless stream presence in a second, per-session
+registry (`addPushlessSubscription` / `isSessionWebWatched` in
+`src/state/sse-subscriptions.ts`). When a `Completed`-with-`assistant_text`
+push would fire an alert, the dispatcher first checks whether a web/CLI
+client is live-watching that session; if so it **downgrades the alert to a
+silent badge tick** for every phone (`sendAlert = wouldAlert &&
+!webWatched` in `src/integrations/apns/dispatcher.ts`). The badge still
+ticks — web reads do not advance a phone's per-device read cursor, so the
+message is genuinely unread on the phone — but the phone does not buzz.
+
+Three properties make this safe:
+
+- **Live, not latched.** Presence is the open stream itself, evaluated at
+  push time. A user who sends a message and then closes the tab leaves no
+  entry, so the phone receives its normal alert.
+- **Header-absent only.** `deviceTokenFromRequest` returns `null` for an
+  absent header AND for a present-but-invalid/mismatched token. Only a
+  genuinely absent header registers pushless presence. A real phone whose
+  persisted token went stale (the mobile client primes a possibly-stale
+  token onto the handshake on cold launch before it re-registers) is NOT
+  misclassified as web — it registers nothing and keeps its own alert.
+- **Non-destructive.** The downgrade only ever turns an alert into a
+  silent badge refresh. A pure-silent push (`Failed`, or `Completed` with
+  no `assistant_text`) carries no banner and is unaffected.
+
+Liveness mirrors the per-device path's normal close: the stream's
+`cancel()` clears the entry. Web/CLI clients reach the gateway over a
+loopback hop (the Next.js BFF, or `next start` → BFF), not the mobile
+relay, so a client disconnect propagates to `cancel()` and there is no
+relay-buffered stale-socket case to need an explicit unwatch beacon. The
+registry is per-process in-memory, so a gateway restart resets it.
+
+## NSE enrichment (rich previews without leaking text to Apple)
+
+The default banner is intentionally content-free on the wire. To let the
+user read a notification without tapping in — while keeping chat text off
+Apple's servers — the NSE fetches the real preview on-device after the
+push arrives:
+
+1. **Server**: `GET /api/push/preview?sessionId=&event=&approvalId=&threadId=`
+   (`src/http.ts`) returns a notification-ready `{ title, body }` built by
+   `src/integrations/apns/preview.ts`. The optional `threadId` is forwarded
+   from the push payload by the NSE. Three event kinds resolve:
+   - `message_completed` → the **latest** non-empty `assistant_text` in
+     the session (`latestAssistantTextForSession`), or in the thread when
+     `threadId` is present (`latestAssistantTextForThread`) so a threaded
+     completion previews the thread's own reply rather than stale main-chat
+     text. Reading the newest block — not a specific one — is what makes a
+     banner collapsed onto a single session entry track the last message
+     across multiple agent turns.
+   - `authorization_requested` → the approval's risk + reason
+     (`[high] <reason>`), titled `Approve in <chat>?`.
+   - `setup_requested` → the setup ask, titled `Finish a step in <chat>`.
+   The route is bearer-gated like every other `/api/*` route; a resolved
+   approval, deleted session, or not-yet-persisted message returns 404 so
+   the NSE keeps the generic banner.
+
+2. **Credential bridge**: the NSE runs in its own process and cannot read
+   the app's AsyncStorage. The main app mirrors `{ baseUrl, token,
+   deviceToken }` into an **App Group** shared container
+   (`group.<bundleId>`) via `expo-file-system`'s
+   `Paths.appleSharedContainers` (`mobile/src/shared-credentials.ts`),
+   written on credential save and after push registration, cleared on
+   sign-out. The NSE reads the same file via
+   `FileManager.containerURL(forSecurityApplicationGroupIdentifier:)` —
+   the two APIs resolve to the same on-disk container. The config plugin
+   grants the App Group entitlement to both the app target
+   (`withEntitlementsPlist`) and the NSE target (a dedicated
+   `.entitlements` linked via `CODE_SIGN_ENTITLEMENTS`).
+
+3. **NSE** (`NotificationService.swift`): reads the shared creds, reads
+   the routing fields from `userInfo["body"]`, calls the preview endpoint
+   (20s budget, under Apple's 30s NSE ceiling), and rewrites `title` /
+   `body`. On any failure it hands back the original generic content via
+   `contentHandler` / `serviceExtensionTimeWillExpire`.
+
+**Privacy invariant preserved**: the enriched text travels gateway →
+device over the device's own authenticated connection. APNs still only
+ever carries ids + the generic string. The credential file holds the
+gateway bearer (never chat content) in the app's own sandboxed App Group
+container.
+
+**Update-across-turns**: completion pushes collapse by `sessionId`
+(`apns-collapse-id`), so a later push **replaces** the earlier banner
+rather than stacking; combined with the latest-message lookup, the single
+lock-screen entry always reflects the newest assistant reply.
 
 ## NSE + category model
 
@@ -106,32 +224,99 @@ sync.
   be mutated before display, and the category id never attaches.
 - The main app calls `Notifications.setNotificationCategoryAsync` on
   every push registration, registering the `APPROVAL_REQUEST` category
-  with two actions:
-  - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: false`
-  - `DENY` — `opensAppToForeground: false`, `isDestructive: true`
+  with two actions (specs live in `mobile/src/push-dispatch.ts` as
+  `APPROVAL_CATEGORY_ACTIONS` so the invariant below is unit-testable):
+  - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: true`.
+    Approving grants the high-risk action the agent paused on, so iOS must
+    require Face ID / Touch ID / passcode (an unlock) before the handler
+    runs — otherwise anyone holding the locked phone could authorize a
+    dangerous operation from the lock screen. The unlock requirement does
+    not foreground the app; the gateway POST still runs in the background.
+  - `DENY` — `opensAppToForeground: false`, `isDestructive: true`. No auth
+    gate: denying is fail-safe (it cancels the pending action, never
+    grants), and the destructive flag gives it the red lock-screen styling.
 - When the user taps an action, `mobile/src/push-dispatch.ts` extracts
-  `approvalId` from the payload and POSTs to the existing
-  `/api/approvals/:id/approve|deny` route. The app never foregrounds.
-  Failures schedule a follow-up local notification ("Failed to approve
-  — open the app to retry") so a network blip doesn't silently lose
-  the action.
-- iOS only invokes the response listener if the app is at least
-  suspended. If the user has killed the app from the app switcher,
-  iOS doesn't run JS — the user must open the app and approve from
-  there. The approval remains pending in the runtime until acted on
-  (the runtime has no retry loop that re-emits approval requests).
+  `approvalId` (the authorization id) from the payload and POSTs to the
+  existing `/api/authorizations/:id/approve|deny` route. The app never
+  foregrounds (Approve runs only after the OS-required unlock). Failures
+  schedule a follow-up local notification ("Failed to approve — open the
+  app to retry") so a network blip doesn't silently lose the action.
+- iOS only invokes the response listener for an **action button** if the
+  app is at least suspended. If the user has killed the app from the app
+  switcher, iOS doesn't run JS — the user must open the app and approve from
+  there. The approval remains pending in the runtime until acted on (the
+  runtime has no retry loop that re-emits approval requests). This killed-app
+  limitation is specific to the non-foregrounding Approve / Deny actions; a
+  plain **tap** launches the app and is recovered separately (see "Tap
+  routing + cold-start recovery").
 
 ## Action endpoints
 
-The action handler reuses the **existing** approval routes:
+The action handler reuses the **existing** authorization routes:
 
-- `POST /api/approvals/:id/approve` — pre-dates the push surface.
-- `POST /api/approvals/:id/deny` — pre-dates the push surface.
+- `POST /api/authorizations/:id/approve` — pre-dates the push surface.
+- `POST /api/authorizations/:id/deny` — pre-dates the push surface.
 
 Both already enforce authentication, idempotency, and the audit-trail
 semantics from [Approval And Audit Substrate](./approval-and-audit-substrate.md).
 Adding push as a new caller required zero changes to the action
 endpoints themselves — the new surface is purely a delivery layer.
+
+## Tap routing + cold-start recovery
+
+A default tap (no action button) on any alert push must open the chat the
+push names — `/chat/:sessionId`, or `/chat/:sessionId/thread/:threadId`
+when the payload carries a `threadId` (the main chat filters threaded
+blocks out, so a threaded completion has to open the thread view or it
+would hide the very reply the banner previewed). The `sessionId` /
+`threadId` parse and the route construction are shared by both delivery
+paths below, so a tap routes identically regardless of app state:
+
+- **App alive (foreground or suspended)**: iOS delivers the tap through
+  `addNotificationResponseReceivedListener`. The listener
+  (`mobile/src/push.ts`) hands the response to
+  `dispatchNotificationResponse` (`mobile/src/push-dispatch.ts`), whose
+  default-tap branch calls `navigateToChat`. The listener is installed at
+  root (`app/_layout.tsx` via `installNotificationResponseListener`) on every
+  launch — it needs no notification permission — so a tap that arrives while
+  the app is suspended routes even if the user never opened a chat detail
+  this process. (`registerForPushAsync` also calls the same idempotent
+  installer, so the listener exists whichever path runs first.)
+- **App killed (cold start)**: iOS does **not** replay the launch tap
+  through the response listener — there is no live JS runtime at tap time,
+  and the listener installed during the subsequent launch only sees taps
+  that arrive *after* it subscribes. The launch tap is recoverable only via
+  `Notifications.getLastNotificationResponse()`. The authed landing screen
+  (`channels`) calls `consumeLaunchNotificationRoute()` on mount: it reads
+  that stored response, routes it through the shared `resolveLaunchTapRoute`
+  (same id-parse as the live path), clears the stored response
+  (`Notifications.clearLastNotificationResponse()`) so a later remount can't
+  navigate a second time off the same tap, then pushes the named chat on top
+  of the channels list (a natural channels → chat back stack). The clear runs
+  before the navigate (and before the no-route gate) so even a non-navigable
+  stored response is dropped rather than re-evaluated on the next mount. The `index`
+  auth gate is presence-only (it routes a MISSING credential to `/setup` but
+  lets a stale/expired one through), so a dead token here pushes the chat
+  optimistically — exactly like tapping an agent/channel row — and the chat
+  screen's own 401 handler (`clearCredentials` → `/setup`, mirrored on the
+  thread screen) clears the token; the next cold start then skips straight to
+  `/setup`. Sign-out / credential-swap also clears the stored launch response
+  (`__resetRegistrationForSignOut`) so an un-consumed tap can't replay across
+  a credential boundary, and the live listener clears it after handling a tap
+  so an already-handled tap isn't replayed by a later consume.
+
+`resolveLaunchTapRoute` returns null (no navigation) for an `APPROVE` /
+`DENY` action launch and for any payload without a `sessionId` (a silent
+wake or malformed payload), so only genuine deep-link taps navigate. Both
+the live-tap and launch-tap paths funnel through the single `navigateToChat`
+helper and the single id-parse (`readRouting`), so the two app states can
+never drift to different routes.
+
+Note this is distinct from the killed-app **Approve / Deny** limitation
+below: those actions are non-foregrounding and resolve the authorization in
+a background handler that iOS won't run for a killed app. The default-tap
+deep-link, by contrast, *does* launch the app, and the launch-tap consume
+recovers it.
 
 ## Token lifecycle
 
@@ -144,11 +329,15 @@ endpoints themselves — the new surface is purely a delivery layer.
   or revoked notifications) deletes the row so subsequent fan-outs
   skip the dead token. Other non-2xx statuses are logged but the row
   stays — they may recover or require human intervention.
-- **De-registration on logout**: future work. The DELETE endpoint
-  exists (`DELETE /api/push/devices/:token`) but the mobile setup-flow
-  doesn't currently fire it. A user who hard-resets the app continues
-  to receive pushes until the next install does so via NSE delivery
-  failure or until the 410 path triggers.
+- **De-registration on logout**: sign-out (and credential swap) fires a
+  best-effort `DELETE /api/push/devices/:token` via `clearCredentials` →
+  `tryDeregisterCachedDevice` (`mobile/src/auth.ts`), draining any
+  in-flight registration first (bounded wait) so the delete can't race a
+  late register. Sign-out also clears the shared App Group credentials so
+  a backgrounded NSE can't keep fetching previews with the signed-out
+  bearer. The remaining gap is a hard app-reset (process killed without an
+  in-app logout), which never runs the JS path; that token is pruned
+  reactively by the 410 Unregistered cleanup above on the next fan-out.
 
 ## Build flow consequences
 
@@ -178,7 +367,11 @@ endpoints themselves — the new surface is purely a delivery layer.
 - **Foregrounding action buttons**: rejected. Forcing the app to
   foreground for every Approve / Deny would defeat the lock-screen UX
   goal. The killed-app edge case (where the action button doesn't run
-  our JS) is mitigated by the runtime re-emitting approval requests.
+  our JS) is an accepted limitation: the approval stays pending in the
+  runtime until the user opens the app and acts on it — the runtime does
+  not re-emit approval requests (see "NSE + category model"). A plain
+  tap, unlike an action button, launches the app and is recovered via the
+  cold-start consume (see "Tap routing + cold-start recovery").
 
 ## Consequences
 

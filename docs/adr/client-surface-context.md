@@ -6,7 +6,7 @@ Every inbound chat message resolves to an optional **client surface** — `"web"
 
 ## Context
 
-The agent's browser tools run on the gateway machine. Some completion paths only work when the user is physically at that machine (a visible-Chrome handoff opens a window there), while others work from anywhere (secure value fill, step-by-step instructions). Before this decision the runtime knew the bridge kind for Telegram/Discord sessions but never told the model, and web/mobile/CLI messages were indistinguishable — so the model could not tailor sensitive-step completion choices to where the user actually is.
+The agent's browser is a headless spawned Chrome on the gateway machine. A sign-in or sensitive-step handoff surfaces it as a LIVE IN-CHAT SCREENCAST that only the web app renders, so a browser handoff only works for a user on the web app (or one at the gateway machine who can open it), while other completion paths work from anywhere (secure value fill, step-by-step instructions). Before this decision the runtime knew the bridge kind for Telegram/Discord sessions but never told the model, and web/mobile/CLI messages were indistinguishable — so the model could not tailor sensitive-step completion choices to where the user actually is.
 
 ## Per-message, not per-session
 
@@ -28,10 +28,10 @@ Validation is deliberately lenient: an unrecognized `client` value resolves to u
 
 The rendered lines:
 
-- `web` — messaging from the web app on a computer, likely at the gateway machine where a visible browser window would be visible to them.
-- `cli` — messaging from the CLI on the gateway machine; a visible browser window would be visible to them.
-- `mobile` — messaging from the mobile app on their phone; NOT at the gateway machine, so a visible browser window opened there is useless to them.
-- `telegram` / `discord` / `openclaw` — names the bridge; same not-at-the-machine caveat as mobile.
+- `web` — messaging from the web app on a computer; the in-chat sign-in / handoff screencast of the agent's headless browser renders here, so a browser handoff can reach them.
+- `cli` — messaging from the CLI on the gateway machine; they can open the web app there to use the in-chat screencast, so a browser handoff can reach them.
+- `mobile` — messaging from the mobile app on their phone; the in-chat browser screencast isn't available there, so a browser handoff can't reach them.
+- `telegram` / `discord` / `openclaw` — names the bridge; same screencast-unavailable caveat as mobile.
 - unknown — no line at all.
 
 Subagents are excluded (they keep their single override prompt and don't drive user-facing surface choices).

@@ -246,15 +246,16 @@ persist, where a skill ends up).
 
 ## Browser
 
-The runtime drives Playwright Chromium against a per-instance profile at
-`~/.gini/instances/<inst>/chrome-profile/`. Sign-ins land on disk and
-survive Connect/Disconnect cycles and runtime restarts. The same profile
-backs both modes:
-
-- Default: headless Chromium, invisible to the user.
-- `managed`: same profile, `headless: false` — a visible window so the
-  user can sign in once. The next tool call after disconnect goes back to
-  headless against the now-authenticated profile.
+By DEFAULT the runtime drives a single per-instance headless Chrome it spawns
+itself, against a per-instance profile at `~/.gini/instances/<inst>/chrome-profile/`.
+It launches lazily on the first browser tool call. Sign-ins land on disk and
+survive runtime restarts. When a site needs a sign-in, the user signs in through
+a live in-chat screencast of that same headless Chrome (`browser_connect`), so
+the user and the agent act on one browser the whole time. As a power-user
+option the user can instead attach the runtime to their OWN already-running
+external Chrome over CDP (POST `/api/browser/connect` with `{cdpUrl}`); the
+runtime drives that Chrome but never starts or stops the process. (The old
+visible managed-window mode was removed — issue #420.)
 
 Tool surface, grouped by role:
 
@@ -276,18 +277,21 @@ bytes.
 
 When a site needs a sign-in the user hasn't completed:
 
-1. Try `browser.navigate` headlessly. If the page requires sign-in,
-   propose opening the visible window.
-2. `POST /api/browser/connect` with an empty body — managed mode opens a
-   visible Chrome window against the same profile dir.
-3. Ask the user to sign in once. The cookies persist on disk.
-4. `POST /api/browser/disconnect` — the next tool call goes back to
-   headless against the now-signed-in profile.
+1. Navigate with `browser.navigate` (headless). If the page is a sign-in /
+   OAuth / auth wall, call the `browser_connect` tool with the target URL —
+   do NOT report "sign-in needed" as a blocker.
+2. The user gets a Connect button in chat. Clicking it opens a live
+   screencast of the agent's headless Chrome at that page; they sign in once
+   and click "I've signed in". The cookies persist on disk.
+3. The agent continues against the now-signed-in profile — no relaunch, no
+   visible window. The sign-in survives later tasks and runtime restarts.
 
 Human-operator CLI mirror (the same calls a person might run from a
-terminal — not Gini's path): `gini browser {status|connect|disconnect|wipe-profile --yes}`.
-For CDP attach (rare; flaky under Playwright + Bun), pass
-`{ "cdpUrl": "ws://..." }` to `/api/browser/connect`. Prefer managed mode.
+terminal — not Gini's path): `gini browser {status | connect [--url WSURL] |
+disconnect}`. A bare `connect` is a no-op for the default spawned browser
+(sign-in is the in-chat screencast, not a CLI flow); `connect --url ws://...`
+attaches to the user's own external Chrome over CDP. To clear saved logins from
+the spawned profile, `rm -rf` the per-instance profile dir.
 
 ## Scheduled Jobs
 
@@ -653,21 +657,20 @@ from BotFather and recreate the bridge. (Human-operator CLI mirror:
 `gini messaging health`, then
 `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.)
 
-**Headless browser launch fails with "Failed to launch Chromium"** — the
-error message ends with `Run \`bunx playwright install chromium\` to
-install the browser.` Run that command and retry; Playwright's bundled
-Chromium isn't present until then.
+**Spawned browser launch fails with "Failed to launch Chromium"** — the
+error names what to do (`Confirm Chrome / Chromium is installed (or set
+GINI_CHROME_PATH), or run \`bunx playwright install chromium\``). The runtime
+auto-installs Playwright's Chromium when no browser is on disk; if that fails,
+install Chrome or set `GINI_CHROME_PATH` to a Chromium-compatible executable
+and retry the browser tool call. (This applies to the default spawned
+transport; a `cdp` attach instead fails with a "Failed to attach over CDP"
+message — disconnect and let the agent use its own spawned browser.)
 
-**Managed-mode (visible) browser launch fails with "Failed to launch
-Chromium"** — the error message ends with `Confirm Chrome / Chromium is
-installed (or set GINI_CHROME_PATH) and retry.` Install Chrome, or set
-`GINI_CHROME_PATH` to a Chromium-compatible executable, and retry the
-`/api/browser/connect` call.
-
-**CDP attach hangs or times out** — CDP attach is flaky under
-playwright-core + Bun. The error wraps `Failed to attach over CDP: …` and
-recommends managed mode. Prefer `POST /api/browser/connect` with an empty
-body (managed Chrome window) over passing a `cdpUrl`.
+**Sign-in screencast won't open ("The agent's browser isn't running")** —
+the spawned Chrome wasn't live when Connect was clicked (e.g. after a gateway
+restart). With a recorded page URL the runtime relaunches headless and
+navigates there automatically; if it still can't, navigate to the page again
+(`browser.navigate`) and re-call `browser_connect`.
 
 **User says a high-risk action is "stuck"** — it is sitting in the
 approval queue. Fetch `GET /api/authorizations` to see pending items, then
@@ -690,8 +693,9 @@ land in the queue, and wait for the user's decision.
    self-config tools (`load_tools` them first: `get_self`, `list_providers`,
    `set_provider`, `use_agent`, …)).
 3. Never read `~/.gini/instances/<inst>/*.json` directly — call `/api/*`.
-4. Persistent browser cookies are a feature. For sign-in, open managed
-   mode once; do not ask the user to re-authenticate on every run.
+4. Persistent browser cookies are a feature. For sign-in, call
+   `browser_connect` once (the in-chat screencast); do not ask the user to
+   re-authenticate on every run.
 5. When the user asks Gini to remember to do something later, create a
    scheduled job — the runtime auto-binds it to a dedicated thread so
    future fires don't bury the current conversation.

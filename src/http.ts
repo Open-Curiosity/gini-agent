@@ -5,10 +5,16 @@ import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
+  addPushlessSubscription,
+  clearDeviceWatch,
+  clearSessionWatch,
+  clearStreamWatch,
   appendTrace,
   assertInsideWorkspace,
   createSetupRequest,
   getDevice,
+  latestAssistantTextForSession,
+  latestAssistantTextForThread,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -33,11 +39,19 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { browserNavigate, safetyCheck } from "./tools/browser";
+import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import {
+  getOrStartBridge,
+  hasLiveBridgeForOwner,
+  stopActiveBridge,
+  type ScreencastBridge,
+  type ScreencastInput
+} from "./execution/browser-screencast";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
+import { buildNotificationPreview, type PreviewEvent } from "./integrations/apns/preview";
 import { dailyUsage, mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
@@ -100,7 +114,7 @@ import {
 } from "./runtime/identity-files";
 import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
+import { BROWSER_CONNECT_SPAWNED_RESULT, completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAVAILABLE, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
@@ -201,6 +215,96 @@ async function emitConnectorRequestAudit(
 }
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
+  // Ensure a spawned Chrome is live for a browser.connect sign-in, relaunching
+  // it headless and navigating to the recorded target page when it isn't (a
+  // gateway restart / Chrome crash drops the in-process handle while the
+  // durable setup row survives). Returns null on success, or a JSON error
+  // Response. The navigate runs the same SSRF / domain-policy gate as any tool
+  // navigation. Shared by /open-browser (stage 1) and the frames/input recovery
+  // path (a reconnect after a restart skips /open-browser). Refuses when the
+  // user's own Chrome is attached over CDP (no spawned browser to screencast).
+  async function ensureSpawnedBrowserForSignIn(
+    setup: { id: string; taskId?: string; payload: Record<string, unknown> }
+  ): Promise<Response | null> {
+    // The persisted cdp record is the authoritative transport signal — check it
+    // FIRST, before the spawned-screencast fast path. When the user has
+    // attached their OWN Chrome over CDP, there is no spawned screencast to
+    // show, and relaunch/navigate would drive their external Chrome to the
+    // recorded URL (a stale Connect card racing a cdp attach). A narrow window
+    // exists where a cdp record is persisted but a previously-spawned handle is
+    // still live (getScreencastPort would briefly report non-null); checking cdp
+    // first makes the record win deterministically rather than screencasting a
+    // soon-to-be-torn-down spawned Chrome. The dispatch guard stops NEW cards on
+    // cdp; this covers an already-minted card hitting /open-browser or a stamped
+    // card's frames/input reconnect.
+    if ((readState(config.instance).browser?.mode ?? null) === "cdp") {
+      return json(
+        { error: "Your own Chrome is attached over CDP, so there's no in-chat browser to open. Complete this step directly in your Chrome window, then continue." },
+        409
+      );
+    }
+    if (getScreencastPort() !== null) return null;
+    const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
+    if (!targetUrl) {
+      return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." }, 409);
+    }
+    const navResult = JSON.parse(await browserNavigate(setup.taskId ?? `browser-connect-${setup.id}`, { url: targetUrl }, config)) as {
+      success?: boolean;
+      error?: string;
+    };
+    if (!navResult.success || getScreencastPort() === null) {
+      return json({ error: navResult.error ?? "Could not start the agent's browser for sign-in." }, 409);
+    }
+    return null;
+  }
+
+  // Resolve the live screencast bridge for an active browser.connect setup,
+  // relaunching the headless spawned Chrome first when it isn't running. Both
+  // the frames SSE and the input relay call this: an already-stamped sign-in
+  // card (signInStarted + screencast) skips /open-browser on a reconnect and
+  // hits these endpoints directly, so the relaunch recovery can't live only in
+  // /open-browser — a gateway restart / Chrome crash would otherwise leave the
+  // modal reconnecting into a permanent 409. Returns the bridge, or a JSON
+  // error Response.
+  async function resolveScreencastBridgeOrError(
+    setup: { id: string; taskId?: string; payload: Record<string, unknown> }
+  ): Promise<ScreencastBridge | Response> {
+    // Only relaunch when there's genuinely no browser to screencast: a live (or
+    // still-starting) bridge already held by this setup is reusable even if
+    // getScreencastPort() momentarily reads null, so skip the relaunch and let
+    // getOrStartBridge hand back the existing bridge.
+    if (!hasLiveBridgeForOwner(setup.id)) {
+      const relaunchError = await ensureSpawnedBrowserForSignIn(setup);
+      if (relaunchError) return relaunchError;
+    }
+    const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+    const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
+    let bridge: ScreencastBridge;
+    try {
+      bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    // Re-check the setup is STILL the active sign-in after the relaunch +
+    // bridge-build awaits: a /complete or /cancel can commit in that window,
+    // flipping the row terminal (and a cancel's stopActiveBridge bumps the
+    // generation BEFORE getOrStartBridge captured it, so the stale-start guard
+    // doesn't fire). Without this re-check we'd hand back a freshly-built bridge
+    // for a cancelled/completed setup — an orphaned CDP socket nothing tears
+    // down. Stop it and 404 so the caller (modal) stops reconnecting.
+    const current = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    if (
+      !current ||
+      current.status !== "pending" ||
+      current.payload.screencast !== true ||
+      current.payload.signInStarted !== true
+    ) {
+      await stopActiveBridge(setup.id);
+      return json({ error: "Screencast setup request not active" }, 404);
+    }
+    return bridge;
+  }
+
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     // `updateInProgress` reports the gateway's single-flight update guard.
@@ -346,30 +450,67 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!meta) return new Response(null, { status: 404 });
       return new Response(null, {
         status: 200,
-        headers: { "content-type": meta.mimeType, "content-length": String(meta.size) }
+        headers: {
+          "content-type": meta.mimeType,
+          "content-length": String(meta.size),
+          // Advertise range support so a probing client (iOS AVPlayer issues a
+          // HEAD/ranged GET before streaming) knows it can request byte ranges.
+          "accept-ranges": "bytes"
+        }
       });
     }],
-    ["GET", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+    ["GET", /^\/api\/uploads\/([^/]+)$/, (request, params) => {
       const upload = readUpload(config.instance, params[0]);
       if (!upload) return json({ error: "Upload not found" }, 404);
+      // Common headers shared by the full-body (200) and partial (206)
+      // responses. `accept-ranges` tells the client ranged GETs are honored;
+      // iOS AVPlayer refuses to start a remote AVURLAsset that streams audio
+      // unless the server answers a `Range` request with 206 + Content-Range,
+      // which is why an audio bubble's play button was inert (issue: voice
+      // playback). Arbitrary MIME is accepted, so force a download + no-sniff:
+      // a text/html or SVG upload must never execute as a top-level document on
+      // the app origin. The bytes still render inline in <img>/<audio>
+      // (subresource loads ignore Content-Disposition). Bare `attachment` (no
+      // filename= param) avoids header injection from the stored name.
+      const commonHeaders: Record<string, string> = {
+        "content-type": upload.mimeType,
+        "cache-control": "private, max-age=31536000, immutable",
+        "content-disposition": "attachment",
+        "x-content-type-options": "nosniff",
+        "accept-ranges": "bytes"
+      };
+      const total = upload.bytes.byteLength;
+      const range = parseByteRange(request.headers.get("range"), total);
+      if (range === "unsatisfiable") {
+        // A syntactically valid range that falls outside the file: RFC 7233
+        // requires 416 with a Content-Range stating the full length.
+        return new Response(null, {
+          status: 416,
+          headers: { ...commonHeaders, "content-range": `bytes */${total}` }
+        });
+      }
+      if (range) {
+        const slice = upload.bytes.subarray(range.start, range.end + 1);
+        const buffer = slice.buffer.slice(
+          slice.byteOffset,
+          slice.byteOffset + slice.byteLength
+        ) as ArrayBuffer;
+        return new Response(buffer, {
+          status: 206,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(slice.byteLength),
+            "content-range": `bytes ${range.start}-${range.end}/${total}`
+          }
+        });
+      }
       const buffer = upload.bytes.buffer.slice(
         upload.bytes.byteOffset,
-        upload.bytes.byteOffset + upload.bytes.byteLength
+        upload.bytes.byteOffset + total
       ) as ArrayBuffer;
       return new Response(buffer, {
         status: 200,
-        headers: {
-          "content-type": upload.mimeType,
-          "content-length": String(upload.bytes.length),
-          "cache-control": "private, max-age=31536000, immutable",
-          // Arbitrary MIME is now accepted, so force a download + no-sniff: a
-          // text/html or SVG upload must never execute as a top-level document
-          // on the app origin. The bytes still render inline in <img>/<audio>
-          // (subresource loads ignore Content-Disposition). Bare `attachment`
-          // (no filename= param) avoids header injection from the stored name.
-          "content-disposition": "attachment",
-          "x-content-type-options": "nosniff"
-        }
+        headers: { ...commonHeaders, "content-length": String(total) }
       });
     }],
     // Read a workspace file by relative path so the web app can show the
@@ -555,13 +696,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!credential) return json({ error: "Unauthorized" }, 401);
       // X-Device-Token is optional — mobile clients send it after
       // they've registered their APNs token via POST /push/devices, so
-      // the dispatcher can per-device suppress completion silent pushes
-      // while they're watching. Web/CLI clients don't send it (they
-      // have no APNs token); they simply aren't tracked in the
-      // suppression registry, which is correct — no push is ever sent
-      // to them anyway.
+      // the dispatcher can per-device suppress a redundant completion push
+      // to THIS device while it's watching. Web/CLI clients don't send it
+      // (they have no APNs token), so they aren't in the per-device
+      // registry — but the stream factory below DOES record them in the
+      // pushless (per-session) registry, which lets the dispatcher
+      // downgrade the user's OTHER devices' completion alert to a silent
+      // badge refresh while the chat is open on the web.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
-      return chatBlockStream(config, request, params[0], deviceToken);
+      // Optional client-named stream id. When present it's woven into the
+      // watch handle so POST /push/unwatch?streamId= can clear exactly
+      // this stream (the screen that opened it) without disturbing a
+      // sibling stream the client holds on the same session.
+      const streamId = (new URL(request.url).searchParams.get("streamId") ?? "").trim() || null;
+      return chatBlockStream(config, request, params[0], deviceToken, streamId);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -962,8 +1110,31 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
 
       if (setup.action === "browser.connect") {
-        const { ok, result } = await completeBrowserConnectSetup(config, setup);
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+        // Screencast path (the only sign-in path): the agent never left its
+        // headless spawned Chrome — the user just signed in through the modal,
+        // so cookies are already in the shared context. Tear down the screencast
+        // bridge and resume the task headless with no relaunch.
+        if (setup.payload.screencast === true) {
+          const result = JSON.stringify({ success: true, connected: true, mode: "screencast" });
+          // Mark the setup terminal BEFORE tearing the bridge down: a frames /
+          // input request racing this completion would otherwise pass the
+          // status==="pending" gate in the teardown gap and recreate an orphaned
+          // bridge. Resolving first makes that racer 404 instead.
+          await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+          await stopActiveBridge(setupId);
+          return json({ ok: true });
+        }
+        // Non-screencast fallback (the user finished acting directly in the
+        // spawned Chrome). Claim the row terminal BEFORE writing the rich
+        // `browser.connect` audit row, mirroring the screencast path above and
+        // the connector/skill branches: a double-submit's loser (or a complete
+        // racing a cancel) throws ApprovalRaceLostError at the claim and writes
+        // ZERO side effects, so the audit row can't be duplicated. The shared
+        // result constant is the claim's toolResult; completeBrowserConnectSetup
+        // writes the audit row (and returns the same constant, which we already
+        // staged here).
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: BROWSER_CONNECT_SPAWNED_RESULT, awaitResume: false });
+        const { ok } = await completeBrowserConnectSetup(config, setup);
         return json({ ok });
       }
 
@@ -1071,19 +1242,37 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
     }],
-    ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) =>
-      json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false }))],
+    ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) => {
+      // If this cancels an active sign-in screencast, tear the bridge down so
+      // the raw-CDP socket to the headless Chrome doesn't dangle. The agent's
+      // browser itself stays up (the bridge is only the screencast channel).
+      // Resolve (mark terminal) BEFORE stopping the bridge so a racing
+      // frames/input request fails the status==="pending" gate instead of
+      // recreating an orphaned bridge in the teardown gap.
+      const cancelResult = await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false });
+      // Stop the bridge unconditionally for the cancelled setup id rather than
+      // gating on a pre-claim screencast read: payload.screencast can flip true
+      // (via /open-browser) in the window between reading and the atomic claim,
+      // so a stale read could skip a teardown that's actually needed.
+      // stopActiveBridge(owner) is owner-scoped — a no-op when nothing or a
+      // DIFFERENT setup holds the bridge — so calling it always is safe.
+      await stopActiveBridge(params[0]);
+      return json(cancelResult);
+    }],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:
     //   1. Validate the setup-request is browser.connect and pending.
-    //   2. Launch the per-instance managed Chrome (visible) via the same
-    //      connectBrowser capability. Idempotent — re-clicking is a no-op.
-    //   3. If the payload carries a url, navigate the visible window so
-    //      the user lands directly on the sign-in form.
-    //   4. Mark payload.signInStarted = true while keeping the row
-    //      pending. The UI re-renders with "I've signed in" / "Cancel"
-    //      buttons; "I've signed in" POSTs to /complete which switches
-    //      the browser to headless and resumes.
+    //   2. Confirm the agent's spawned headless Chrome is live (it usually is
+    //      by this point — the agent asks to sign in only after hitting a wall
+    //      while browsing; if not, the relaunch path below revives it). Open an
+    //      in-chat screencast of that headless Chrome over its CDP debug port.
+    //      There is NO visible-window fallback (the managed-window mode was
+    //      removed — issue #420). This screencast path is for the SPAWNED
+    //      browser; a user on the cdp transport signs in on their own Chrome.
+    //   3. Mark payload.signInStarted = true while keeping the row pending. The
+    //      UI re-renders with "I've signed in" / "Cancel" buttons; "I've signed
+    //      in" POSTs to /complete which tears the screencast bridge down and
+    //      resumes the task headless (cookies already in the shared profile).
     ["POST", /^\/api\/setup-requests\/([^/]+)\/open-browser$/, async (_request, params) => {
       const setupId = params[0];
       const before = readState(config.instance);
@@ -1100,52 +1289,38 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const blocked = safetyCheck(targetUrl);
         if (blocked) return json({ error: blocked }, 400);
       }
-      // skipAudit so the capability does not write a reasonless row;
-      // we write a setup-aware row below that carries the originating
-      // setup id and reason.
-      const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
-      if (!status.connected) {
-        return json({ ok: false, error: "Browser failed to launch." }, 500);
-      }
-      let openedUrl: string | undefined;
-      let navigateError: string | undefined;
-      if (targetUrl && setup.taskId) {
-        try {
-          // browserNavigate returns a JSON envelope rather than
-          // throwing on a soft failure (safetyCheck refusal of a
-          // loopback redirect target, an unsupported URL, etc.).
-          // The previous code only caught throws and set openedUrl
-          // unconditionally — so a refused navigation falsely
-          // reported "user landed on the page." Parse the envelope
-          // and treat success:false as an error path so the
-          // setup-request row records the navigateError truthfully.
-          const navResult = await browserNavigate(setup.taskId, { url: targetUrl });
-          let parsed: { success?: boolean; error?: string } | undefined;
-          try {
-            parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
-          } catch {
-            // Non-JSON return: treat as success for back-compat
-            // with any caller that might not stringify.
-            parsed = { success: true };
-          }
-          if (parsed && parsed.success === false) {
-            navigateError = parsed.error ?? "browser navigation refused";
-          } else {
-            openedUrl = targetUrl;
-          }
-        } catch (error) {
-          navigateError = error instanceof Error ? error.message : String(error);
-        }
-      }
+      // Screencast is the ONLY sign-in path: the user signs in through the
+      // in-chat modal that screencasts the agent's headless spawned Chrome over
+      // its CDP debug port. Usually the spawned Chrome is already live (the
+      // agent just hit a sign-in wall while browsing). But a gateway restart /
+      // Chrome crash / `gini browser disconnect` drops the in-process handle
+      // while the durable setup row survives — relaunch it headless and navigate
+      // to the recorded page rather than stranding the user on a card that can
+      // never open (shared with the frames/input reconnect recovery).
+      const relaunchError = await ensureSpawnedBrowserForSignIn(setup);
+      if (relaunchError) return relaunchError;
+      let stamped = false;
       await mutateState(config.instance, (state) => {
         const item = state.setupRequests.find((s) => s.id === setupId);
-        if (!item) return;
+        // Re-check status INSIDE the mutation, not just existence: a /cancel
+        // (or /complete) can commit between the pre-read pending check above and
+        // this lock, and stamping signInStarted/screencast onto an already
+        // terminal row would mark a cancelled sign-in as live.
+        if (!item || item.status !== "pending") return;
+        // Idempotency guard: /open-browser keeps the row pending, so two
+        // concurrent opens (double-click / retry) would both pass the pending
+        // check and each write a duplicate stage:open-browser audit row + trace.
+        // Skip when already stamped so the audit/trace fire exactly once.
+        if (item.payload.signInStarted === true) {
+          stamped = true;
+          return;
+        }
+        stamped = true;
         item.payload = {
           ...item.payload,
           signInStarted: true,
-          openedAt: new Date().toISOString(),
-          openedUrl: openedUrl ?? null,
-          navigateError: navigateError ?? null
+          screencast: true,
+          openedAt: new Date().toISOString()
         };
         const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
           ? setup.payload.reason
@@ -1160,31 +1335,158 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             taskId: setup.taskId,
             runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
             approvalId: setup.id,
-            evidence: {
-              stage: "open-browser",
-              mode: status.record?.mode,
-              headless: status.record?.headless ?? false,
-              pid: status.record?.pid ?? null,
-              openedUrl: openedUrl ?? null,
-              navigateError: navigateError ?? null
-            }
+            evidence: { stage: "open-browser", mode: "screencast", headless: true }
           },
-          setup.taskId
-            ? { taskId: setup.taskId }
-            : setup.agentId
-              ? { agentId: setup.agentId }
-              : { system: true }
+          setup.taskId ? { taskId: setup.taskId } : setup.agentId ? { agentId: setup.agentId } : { system: true }
         );
         if (item.taskId) {
           appendTrace(config.instance, item.taskId, {
             type: "approval",
-            message: "Browser connect: visible window opened, awaiting sign-in",
-            data: { setupRequestId: setupId, openedUrl, navigateError }
+            message: "Browser connect: sign-in screencast opened, awaiting sign-in",
+            data: { setupRequestId: setupId }
           });
         }
       });
-      const refreshed = readState(config.instance).setupRequests.find((s) => s.id === setupId);
-      return json({ ok: true, setupRequest: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
+      if (!stamped) {
+        // The row was completed/cancelled by a racing request between the
+        // pre-read check and the mutation lock — don't report a live sign-in.
+        const raced = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+        return json({ error: `Setup request is already ${raced?.status ?? "gone"}` }, 410);
+      }
+      const refreshedScreencast = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      return json({ ok: true, setupRequest: refreshedScreencast, screencast: true });
+    }],
+
+    // Live sign-in screencast: stream JPEG frames of the agent's headless
+    // browser to the in-chat modal as Server-Sent Events. Mirrors the
+    // chatBlockStream auth/lifecycle pattern; the bearer gate above already
+    // accepted the request, and the BFF injects that bearer server-side so the
+    // browser never holds the gateway token. The screencast attaches to the
+    // ALREADY-running spawned Chrome (raw CDP over its debug port) — it never
+    // launches a browser and never accepts a port from the client.
+    ["GET", /^\/api\/browser\/screencast\/([^/]+)\/frames$/, async (_request, params) => {
+      const setupId = params[0];
+      const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      // Gate on the live approval window, not just existence: a completed /
+      // cancelled / not-yet-started setup must not (re)open a screencast. This
+      // also closes the stale-EventSource-reconnect path — after /complete
+      // stops the bridge, a lingering reconnect can't rebuild a live drive
+      // channel because the setup is no longer pending.
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
+      }
+      // Resolve the bridge, relaunching the headless Chrome first if it isn't
+      // running (a reconnect after a gateway/Chrome restart lands here, not on
+      // /open-browser). Binds to the exact page the requesting task drove via
+      // the helper's preferUrl/preferTargetId.
+      const resolved = await resolveScreencastBridgeOrError(setup);
+      if (resolved instanceof Response) return resolved;
+      const bridge = resolved;
+      const encoder = new TextEncoder();
+      let keepalive: ReturnType<typeof setInterval> | undefined;
+      let unsubscribe: (() => void) | undefined;
+      const stream = new ReadableStream({
+        start(controller) {
+          const sendFrame = (frame: { data: string; meta: Record<string, unknown> }) => {
+            try {
+              controller.enqueue(
+                encoder.encode(`event: frame\ndata: ${JSON.stringify(frame)}\n\n`)
+              );
+            } catch {
+              // controller already closed — drop the frame
+            }
+          };
+          // onUrl: stream the gateway-sourced page URL so the modal shows the
+          // operator which origin they're signing into (it has no address bar).
+          const sendUrl = (url: string) => {
+            try {
+              controller.enqueue(encoder.encode(`event: url\ndata: ${JSON.stringify({ url })}\n\n`));
+            } catch {
+              // controller already closed — drop it
+            }
+          };
+          // Allocate the keepalive interval BEFORE subscribing: subscribe() can
+          // fire onClose SYNCHRONOUSLY when the bridge is already closed (the
+          // closed-state short-circuit), and that handler clears `keepalive`.
+          // If we set the interval up after subscribe(), a synchronous onClose
+          // would run while keepalive is still undefined, then we'd install an
+          // interval nothing ever clears — a leaked timer on a closed stream.
+          // Comment keepalive so proxies don't idle-close the stream between
+          // frames (a static page emits no frames until it changes).
+          keepalive = setInterval(() => {
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+            } catch {
+              // closed
+            }
+          }, 15_000);
+          if (typeof keepalive.unref === "function") keepalive.unref();
+          // onClose: when the CDP bridge dies, close the stream so the modal's
+          // EventSource reconnects (and re-hits the gate, 404ing if the setup is
+          // gone) instead of dangling on a stale frame behind keepalives.
+          unsubscribe = bridge.subscribe(
+            sendFrame,
+            () => {
+              if (keepalive) clearInterval(keepalive);
+              try {
+                controller.close();
+              } catch {
+                // already closed
+              }
+            },
+            sendUrl
+          );
+        },
+        cancel() {
+          unsubscribe?.();
+          if (keepalive) clearInterval(keepalive);
+        }
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive"
+        }
+      });
+    }],
+
+    // Relay one operator input event (click / move / scroll / drag / key) from
+    // the sign-in modal to the headless browser via the screencast bridge.
+    // Deliberately has no "navigate" kind: free navigation would bypass the
+    // agent's SSRF / domain-policy gate (which lives on browser_navigate).
+    ["POST", /^\/api\/browser\/screencast\/([^/]+)\/input$/, async (request, params) => {
+      const setupId = params[0];
+      const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      if (
+        !setup ||
+        setup.action !== "browser.connect" ||
+        setup.status !== "pending" ||
+        setup.payload.screencast !== true ||
+        setup.payload.signInStarted !== true
+      ) {
+        return json({ error: "Screencast setup request not active" }, 404);
+      }
+      let body: ScreencastInput;
+      try {
+        body = (await request.json()) as ScreencastInput;
+      } catch {
+        return json({ error: "Invalid JSON body" }, 400);
+      }
+      const resolved = await resolveScreencastBridgeOrError(setup);
+      if (resolved instanceof Response) return resolved;
+      const bridge = resolved;
+      // Relay the remote page's selection back (present for copy/cut/selectall
+      // and double/drag selection) so the modal can serve it to the operator's
+      // clipboard on a native copy/cut event.
+      const { selection } = await bridge.dispatchInput(body);
+      return json(selection !== undefined ? { ok: true, selection } : { ok: true });
     }],
 
     ["GET", /^\/api\/audit$/, (request) => {
@@ -1709,6 +2011,84 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!removed) return json({ error: "Device not found" }, 404);
       return json({ ok: true });
     }],
+    // Notification-preview endpoint for the iOS Notification Service
+    // Extension (NSE). When a `mutable-content: 1` push lands, the NSE
+    // runs on-device and calls this to fetch the real, human-readable
+    // title + body, then rewrites the lock-screen banner before display.
+    // The APNs wire payload carries only ids + a generic string, so this
+    // is the path that surfaces the actual message text WITHOUT it ever
+    // transiting Apple's servers (see ADR mobile-push-notifications.md).
+    // Bearer-gated like every other /api route; the NSE reads the bearer
+    // from the App Group shared container the main app writes on auth.
+    ["GET", /^\/api\/push\/preview$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const event = (params.get("event") ?? "").trim();
+      const approvalId = (params.get("approvalId") ?? "").trim() || undefined;
+      const threadId = (params.get("threadId") ?? "").trim() || undefined;
+      if (!sessionId) return json({ error: "sessionId is required" }, 400);
+      if (event !== "message_completed" && event !== "authorization_requested" && event !== "setup_requested") {
+        return json({ error: "event must be message_completed, authorization_requested, or setup_requested" }, 400);
+      }
+      // Validate the session belongs to this instance so a stale or
+      // foreign sessionId 404s rather than leaking a generic empty preview.
+      const state = readState(config.instance);
+      const session = state.chatSessions.find((s) => s.id === sessionId);
+      if (!session) return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      const preview = buildNotificationPreview(
+        config.instance,
+        { event: event as PreviewEvent, sessionId, approvalId, threadId },
+        {
+          latestAssistantText: latestAssistantTextForSession,
+          latestAssistantTextForThread,
+          sessionTitle: (_inst, id) =>
+            readState(config.instance).chatSessions.find((s) => s.id === id)?.title ?? null,
+          authorization: (_inst, id) =>
+            readState(config.instance).authorizations.find((a) => a.id === id && a.status === "pending") ?? null,
+          setupRequest: (_inst, id) =>
+            readState(config.instance).setupRequests.find((s) => s.id === id && s.status === "pending") ?? null
+        }
+      );
+      // No preview ⇒ the underlying content is gone (resolved approval,
+      // not-yet-persisted message). 404 tells the NSE to keep the generic
+      // as-sent banner instead of blanking it.
+      if (!preview) return json({ error: "No preview available" }, 404);
+      return json(preview);
+    }],
+    // Explicit "I've stopped watching" beacon. The SSE stream's own
+    // cancel() clears a device's watch-state on disconnect, but behind a
+    // relay the gateway-side socket can stay open after the phone is gone
+    // (keepalive writes keep succeeding into the relay buffer), so cancel()
+    // may never fire and the stale entry permanently suppresses completion
+    // pushes for that session. Three callers, narrowest-scope-wins:
+    //   - background: app posts with NO sessionId → clear the whole device
+    //     bucket (it's watching nothing).
+    //   - screen unmount: app posts WITH ?sessionId&streamId → clear only
+    //     the one stream that screen opened, leaving a sibling stream on the
+    //     SAME session (e.g. the main chat under a Thread View card) intact.
+    //   - ?sessionId without streamId (legacy/web): clear the whole session
+    //     for the device.
+    // Best-effort and idempotent; device-scoped like /read and /badge.
+    ["POST", /^\/api\/push\/unwatch$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const streamId = (params.get("streamId") ?? "").trim();
+      let cleared: number;
+      if (sessionId && streamId) {
+        cleared = clearStreamWatch(config.instance, dev.token, sessionId, streamId);
+      } else if (sessionId) {
+        cleared = clearSessionWatch(config.instance, dev.token, sessionId);
+      } else {
+        cleared = clearDeviceWatch(config.instance, dev.token);
+      }
+      return json({ ok: true, cleared });
+    }],
     // Chat read-state + badge endpoints. The mobile app POSTs to
     // /read every time the user lands on a chat detail so the gateway
     // can compute the cross-session badge count; GET /badge returns
@@ -1773,7 +2153,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // Badge totals are per-device (see /read endpoint comment).
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const unread = unreadCountForDevice(config.instance, dev.token);
+      const unread = unreadCountForDevice(config.instance, dev.token, unreachableSessionIds(config));
       return json({ unread });
     }],
     // Per-session unread counts for the calling device. Powers the
@@ -1786,7 +2166,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!credential) return json({ error: "Unauthorized" }, 401);
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const counts = unreadCountsByDevice(config.instance, dev.token);
+      const counts = unreadCountsByDevice(config.instance, dev.token, unreachableSessionIds(config));
       return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
@@ -3104,8 +3484,98 @@ function requireDeviceToken(
   return { ok: true, token };
 }
 
+// Session ids the user has no surface to open, and therefore no way to
+// mark read. The badge / unread endpoints exclude these so they don't
+// count blocks that can never be cleared — otherwise the iOS app-icon
+// badge pins at a number with no UI to drain it. Two ways a session
+// becomes unreachable, both hidden by every client's list filters:
+//   1. The session itself is archived (`archivedAt`) — e.g. a deleted
+//      recurring-job channel. Hidden by the `!archivedAt` filter on the
+//      web rail and mobile channel list, regardless of `kind`.
+//   2. A non-channel session whose owning agent is archived — the agent's
+//      own chat: its canonical `kind: "agent"` session AND any hidden
+//      legacy `kind: undefined` session it still owns (Resolved Decision A
+//      keeps demoted legacy sessions kind-less and hidden, never deleted).
+//      The session keeps no `archivedAt` of its own (archiveAgent stamps
+//      only the agent), but both clients render archived agents in a
+//      Restore-only group with no affordance to open their chats, so the
+//      chat is unreachable until the agent is restored. This deliberately
+//      EXCLUDES a job CHANNEL (`kind: "channel"` / `origin: "job"`): the
+//      rails list channels by kind/origin + `!archivedAt`, never by agent
+//      state, so a channel stays visible and openable even when its owning
+//      agent is archived and must keep counting until archived in its own
+//      right. Hence the predicate is `!isJobChannel`, not `kind === "agent"`
+//      — narrowing it to `=== "agent"` would re-pin the badge on hidden
+//      legacy sessions of archived agents.
+// Reachability state lives in the JSON store (chatSessions + agents),
+// not memory.db, so it's resolved here and passed to the SQLite
+// accounting as an exclusion set.
+function unreachableSessionIds(config: RuntimeConfig): string[] {
+  const state = readState(config.instance);
+  const archivedAgentIds = new Set(
+    state.agents.filter((agent) => agent.archivedAt).map((agent) => agent.id)
+  );
+  const ids = new Set<string>();
+  for (const session of state.chatSessions) {
+    if (session.archivedAt) {
+      ids.add(session.id);
+      continue;
+    }
+    // A job channel stays on the rail (clients key on kind/origin +
+    // !archivedAt, never on agent state), so it's still reachable even
+    // when its owning agent is archived — leave it counting. Only the
+    // agent's own chat disappears with the agent.
+    const isJobChannel = session.kind === "channel" || session.origin === "job";
+    if (!isJobChannel && session.agentId && archivedAgentIds.has(session.agentId)) {
+      ids.add(session.id);
+    }
+  }
+  return [...ids];
+}
+
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+// Parse a single HTTP Range header against a known total byte length. Handles
+// the three forms that matter for media streaming: `bytes=start-end`,
+// `bytes=start-` (open-ended, to EOF), and `bytes=-suffix` (the last N bytes).
+// Returns the resolved inclusive [start, end] for a satisfiable range,
+// "unsatisfiable" for a syntactically valid range that lies past the file (→
+// 416), or null when there's no/unsupported Range header (→ serve the full
+// body). Multi-range requests (a comma in the spec) are intentionally declined
+// to null — AVPlayer never sends them, and serving the whole body is a valid
+// response to any Range request.
+function parseByteRange(
+  header: string | null,
+  total: number
+): { start: number; end: number } | "unsatisfiable" | null {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+  const [, rawStart, rawEnd] = match;
+  // An empty file can't satisfy any range; RFC 7233 maps that to 416.
+  if (total === 0) return "unsatisfiable";
+  let start: number;
+  let end: number;
+  if (rawStart === "") {
+    // Suffix form `bytes=-N`: the final N bytes. `bytes=-0` is unsatisfiable.
+    if (rawEnd === "") return null;
+    const suffix = Number(rawEnd);
+    if (suffix === 0) return "unsatisfiable";
+    start = Math.max(0, total - suffix);
+    end = total - 1;
+  } else {
+    start = Number(rawStart);
+    // A start at or past EOF is a valid-but-unsatisfiable range (→ 416). Check
+    // this before clamping `end`, otherwise an open-ended `bytes=<past-eof>-`
+    // collapses to start > end and would be misread as a malformed range.
+    if (start >= total) return "unsatisfiable";
+    end = rawEnd === "" ? total - 1 : Number(rawEnd);
+    if (start > end) return null;
+    end = Math.min(end, total - 1);
+  }
+  return { start, end };
 }
 
 // Parse the `?agentId=` filter shared by GET endpoints that return per-agent
@@ -3151,15 +3621,16 @@ function statusFromErrorMessage(message: string): number {
   // agent is active. Map to 400 so callers see a clean user-input error
   // rather than a 500.
   if (message.includes("no active agent")) return 400;
-  // Browser-connect surfaces user-input failures with these prefixes;
-  // forward them to 400 so the webapp can surface the original error text
-  // rather than a generic "internal error". Connectivity failures
-  // (unreachable CDP) and discovery failures (no Chrome on PATH) are also
-  // user-correctable, not internal errors.
+  // Browser-connect user-input failures: a bad cdpUrl (malformed, unsupported
+  // protocol, blocked SSRF target) and an unreachable CDP endpoint are all
+  // user-correctable, so forward them to 400 with the original text rather than
+  // a generic "internal error".
   if (message.startsWith("Invalid cdpUrl")) return 400;
   if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
-  if (message.startsWith("Invalid port")) return 400;
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
+  // Browser discovery failures (no Chrome and no bundled Chromium to fall
+  // back to) are user-correctable, so forward them to 400 with the original
+  // text rather than a generic "internal error".
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
   // updateRuntime's single-flight guard: a second POST /api/update while one
@@ -3301,7 +3772,8 @@ function chatBlockStream(
   config: RuntimeConfig,
   request: Request,
   sessionId: string,
-  deviceToken: string | null
+  deviceToken: string | null,
+  streamId: string | null = null
 ): Response {
   let closed = false;
   let keepalive: Timer | undefined;
@@ -3338,13 +3810,35 @@ function chatBlockStream(
       // (rare, but possible on certain client disconnects), the
       // registry doesn't pick up a phantom entry.
       //
-      // Web/CLI clients (no X-Device-Token) skip registration: there's
-      // no APNs device behind them, so per-device suppression doesn't
-      // apply. Registering under a credential key would also incorrectly
-      // suppress pushes to a foregrounded mobile device sharing the
-      // same credential.
+      // Mobile clients (with a valid X-Device-Token) register on the
+      // per-device registry so the dispatcher can skip a redundant
+      // completion push to THIS device — its open stream delivers the
+      // block directly. Registering under a credential key instead would
+      // wrongly suppress pushes to a foregrounded sibling device sharing
+      // the same credential, so the device token is load-bearing here.
+      //
+      // Web/CLI clients carry NO X-Device-Token header. They register on
+      // the pushless (per-session) registry so the dispatcher knows a
+      // human is reading this chat on the web and can downgrade the OTHER
+      // devices' completion alert to a silent badge refresh (no buzz for a
+      // message the user is already looking at). The entry lives only
+      // while the stream is open, so a client that sends and then closes
+      // the tab leaves nothing behind and the phone gets its normal alert.
+      //
+      // The header-PRESENT-but-invalid case (a stale rotated token, or a
+      // token paired to a different credential) is neither: deviceToken is
+      // null, but treating it as web presence would let a real phone whose
+      // persisted token went stale silence its OWN completion alerts on
+      // cold launch (the mobile client primes a possibly-stale token onto
+      // the handshake before it re-registers). So we register nothing for
+      // that case — no per-device skip, no pushless downgrade — which is
+      // the safe default (the phone keeps getting its alert).
+      const rawDeviceHeader = request.headers.get("x-device-token");
+      const deviceHeaderAbsent = !rawDeviceHeader || !rawDeviceHeader.trim();
       if (deviceToken) {
-        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId, streamId ?? undefined);
+      } else if (deviceHeaderAbsent) {
+        unregisterSubscription = addPushlessSubscription(config.instance, sessionId);
       }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay

@@ -17,6 +17,8 @@ import {
   deleteChatBlocksForSession,
   getMemoryDb,
   insertChatBlock,
+  latestAssistantTextForSession,
+  latestAssistantTextForThread,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -180,6 +182,55 @@ describe("chat-blocks persistence", () => {
       expect(err.status).toBe("error");
       expect(err.errorMessage).toBe("boom");
     }
+  });
+
+  test("updateToolCallBlock with taskId scopes to the owning turn — a stale settle can't hit a newer same-callId row", () => {
+    const instance = "chat-blocks-toolcall-taskscope";
+    // callId is NOT unique across turns: the codex text-backstop synthesizes a
+    // deterministic content-derived id, so the SAME gated call re-emitted in a
+    // later turn carries the SAME callId. Two tool_call blocks, same session,
+    // same callId, DIFFERENT task_ids — turn 2's is higher-ordinal (latest).
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_ts",
+      taskId: "task_1",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo hi",
+      argsFull: { command: "echo hi" },
+      status: "running",
+      callId: "call_dup"
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_ts",
+      taskId: "task_2",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo hi",
+      argsFull: { command: "echo hi" },
+      status: "running",
+      callId: "call_dup"
+    });
+
+    // A LATE settle for turn 1 (e.g. an approved action aborted by cancel)
+    // scoped to task_1 must touch ONLY turn 1's row, even though turn 2's row
+    // is the latest-ordinal match for (session, callId).
+    const settled = updateToolCallBlock(instance, "call_dup", "chat_ts", { status: "denied" }, "task_1");
+    expect(settled?.kind === "tool_call" && settled.status).toBe("denied");
+    expect(settled?.kind === "tool_call" && settled.taskId).toBe("task_1");
+
+    const blocks = listChatBlocks(instance, "chat_ts");
+    const turn1 = blocks.find((b) => b.kind === "tool_call" && b.taskId === "task_1");
+    const turn2 = blocks.find((b) => b.kind === "tool_call" && b.taskId === "task_2");
+    // Turn 1 settled; turn 2 (the newer, latest-ordinal row) is untouched.
+    expect(turn1?.kind === "tool_call" && turn1.status).toBe("denied");
+    expect(turn2?.kind === "tool_call" && turn2.status).toBe("running");
+
+    // Without the taskId scope, the legacy lookup hits the latest-ordinal row
+    // (turn 2) — the exact cross-turn clobber the scope prevents.
+    const legacy = updateToolCallBlock(instance, "call_dup", "chat_ts", { status: "ok" });
+    expect(legacy?.kind === "tool_call" && legacy.taskId).toBe("task_2");
   });
 
   test("listChatBlocksAfter honors cursor and falls back when unknown", () => {
@@ -562,6 +613,126 @@ describe("chat-blocks persistence", () => {
 
     // Idempotent: second delete returns zero, listChatBlocks still empty.
     expect(deleteChatBlocksForSession(instance, "chat_d1")).toBe(0);
+  });
+
+  test("latestAssistantTextForSession returns the newest non-empty assistant reply", () => {
+    const instance = "chat-blocks-latest-assistant";
+    const sessionId = "chat_latest";
+    insertChatBlock(instance, { kind: "user_text", sessionId, text: "first question" });
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "first answer", streaming: false });
+    insertChatBlock(instance, { kind: "user_text", sessionId, text: "second question" });
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "second answer", streaming: false });
+    // Newest assistant_text by ordinal wins — this is what makes a
+    // collapsed notification track the last message across turns.
+    expect(latestAssistantTextForSession(instance, sessionId)).toBe("second answer");
+  });
+
+  test("latestAssistantTextForSession skips whitespace-only blocks and tool calls", () => {
+    const instance = "chat-blocks-latest-skip";
+    const sessionId = "chat_skip";
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "real answer", streaming: false });
+    // A later assistant_text that is whitespace-only must NOT shadow the
+    // real one — the lookup keeps scanning to an older non-empty block.
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "   ", streaming: false });
+    // A tool_call after it is ignored entirely (wrong kind).
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId,
+      toolName: "file_read",
+      displayLabel: "Read file",
+      argsPreview: "x.md",
+      argsFull: { path: "x.md" },
+      status: "ok",
+      callId: "call_skip"
+    });
+    expect(latestAssistantTextForSession(instance, sessionId)).toBe("real answer");
+  });
+
+  test("latestAssistantTextForSession ignores threaded assistant replies", () => {
+    const instance = "chat-blocks-latest-thread";
+    const sessionId = "chat_thread_latest";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: "main chat answer",
+      streaming: false
+    });
+    // A threaded reply added later must not leak into the main-chat
+    // preview — the notification deep-links to the main chat.
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: "threaded reply",
+      streaming: false,
+      threadId: "thread_1",
+      parentBlockId: root.id
+    });
+    expect(latestAssistantTextForSession(instance, sessionId)).toBe("main chat answer");
+  });
+
+  test("latestAssistantTextForSession returns null when the session has no assistant text", () => {
+    const instance = "chat-blocks-latest-empty";
+    const sessionId = "chat_empty";
+    insertChatBlock(instance, { kind: "user_text", sessionId, text: "only a question" });
+    expect(latestAssistantTextForSession(instance, sessionId)).toBeNull();
+    // And null for a session that doesn't exist at all.
+    expect(latestAssistantTextForSession(instance, "chat_nonexistent")).toBeNull();
+  });
+
+  test("latestAssistantTextForSession ignores a newer in-flight (streaming) reply", () => {
+    const instance = "chat-blocks-latest-streaming";
+    const sessionId = "chat_streaming";
+    // Turn N: a finalized reply.
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "completed turn", streaming: false });
+    // Turn N+1: already mid-stream when the NSE fetches the preview for
+    // turn N's completion push. Its partial text must NOT shadow the
+    // finalized turn — the banner would otherwise show a half-streamed
+    // fragment of a different turn under the older turn's "new message".
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "partial in-flight", streaming: true });
+    expect(latestAssistantTextForSession(instance, sessionId)).toBe("completed turn");
+  });
+
+  test("latestAssistantTextForSession returns null when the only reply is still streaming", () => {
+    const instance = "chat-blocks-latest-only-streaming";
+    const sessionId = "chat_only_streaming";
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "still typing", streaming: true });
+    // No finalized reply yet → no preview (the generic banner stands until
+    // the turn completes and its own push lands).
+    expect(latestAssistantTextForSession(instance, sessionId)).toBeNull();
+  });
+
+  test("latestAssistantTextForThread returns the thread's own finalized reply", () => {
+    const instance = "chat-blocks-thread-latest";
+    const sessionId = "chat_threaded";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "main chat reply", streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "thread reply one", streaming: false,
+      threadId: "thread_1", parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "thread reply two", streaming: false,
+      threadId: "thread_1", parentBlockId: root.id
+    });
+    // Newest reply WITHIN the thread — never the main-chat block.
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_1")).toBe("thread reply two");
+    // And it doesn't bleed across threads.
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_other")).toBeNull();
+  });
+
+  test("latestAssistantTextForThread skips an in-flight streaming thread reply", () => {
+    const instance = "chat-blocks-thread-streaming";
+    const sessionId = "chat_threaded_stream";
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "finalized thread reply", streaming: false,
+      threadId: "thread_2"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "partial", streaming: true,
+      threadId: "thread_2"
+    });
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_2")).toBe("finalized thread reply");
   });
 
   test("rows persist taskId, runId, and agentId for indexable joins", () => {

@@ -2,11 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import "./hooks/builtins"; // the email-watch routes provision a backing job, which validates isKnownHook("skill-script")
 import { createHandler } from "./http";
-import { logDir, webPortPath } from "./paths";
+import { logDir, uploadsDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
 import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, recordProviderAuthFailure, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { getOrCreateAgentChat } from "./execution/chat";
+import { createScheduledJob } from "./jobs";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -2675,6 +2676,577 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("screencast frames + input endpoints 404 for an unknown setup request", async () => {
+    const config = testConfig("screencast-404");
+    const handler = createHandler(config);
+    const frames = await rawCall(handler, config, "/api/browser/screencast/nope/frames", {}, config.token);
+    expect(frames.status).toBe(404);
+    const input = await rawCall(handler, config, "/api/browser/screencast/nope/input", {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(input.status).toBe(404);
+  });
+
+  test("screencast frames returns 409 when no spawned browser is running", async () => {
+    // A real browser.connect setup exists, but there's no live spawned Chrome
+    // in this unit-test context, so the bridge fails to start and the endpoint
+    // surfaces 409 rather than opening an empty stream.
+    const config = testConfig("screencast-no-browser");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in to continue",
+        payload: { toolCallId: "call_sc", signInStarted: true, screencast: true }
+      })
+    );
+    const frames = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(frames.status).toBe(409);
+    const input = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(input.status).toBe(409);
+  });
+
+  test("open-browser 409s with the no-URL message when no browser is live and no page URL is recorded", async () => {
+    // A pending browser.connect with no live spawned Chrome AND no recorded url
+    // can't relaunch anything to screencast, so it 409s with the distinct
+    // no-URL message rather than attempting a blind navigate.
+    const config = testConfig("open-browser-no-url-no-browser");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_no_url" }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+    // The row stays pending so a later retry (once a browser is live) works.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("open-browser attempts a headless relaunch+navigate when a URL is recorded but no browser is live", async () => {
+    // Restart/crash/disconnect drops the in-process spawned handle while the
+    // durable card survives. With a recorded url, open-browser relaunches the
+    // headless Chrome and navigates to it (the spawn-only replacement for the
+    // removed managed relaunch) instead of stranding the user. We STUB the spawn
+    // launcher to throw so the relaunch fails deterministically (no dependence
+    // on ambient "is real Chrome installed?"), proving the recovery path was
+    // taken and surfaces a 409 with the row left pending for a later real retry.
+    const config = testConfig("open-browser-relaunch-attempt");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const browserMod = await import("./tools/browser");
+    const browserTest = browserMod.__test;
+    browserMod.setBrowserInstance(config.instance);
+    browserTest.setSpawnChromeForTest(async () => {
+      throw new Error("stubbed: no Chrome in this unit test");
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "Sign in",
+          reason: "Sign in",
+          payload: { toolCallId: "call_relaunch", url: "https://example.com/login" }
+        })
+      );
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      // Distinct from the no-URL message: this 409 came from the relaunch attempt.
+      expect(body.error).not.toContain("no page URL is recorded");
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    } finally {
+      browserTest.setSpawnChromeForTest(null);
+      browserTest.uninstallFakeBrowserForTest();
+      browserTest.resetBrowserInstanceForTest();
+    }
+  });
+
+  test("open-browser refuses (no relaunch/navigate) when the user's Chrome is attached over CDP", async () => {
+    // A stale Connect card racing a later cdp attach: the screencast streams the
+    // SPAWNED Chrome, but the user is on cdp. /open-browser must NOT relaunch +
+    // navigate the user's external Chrome to the recorded URL — it refuses with
+    // the cdp-specific 409 BEFORE any navigation. (The dispatch guard stops NEW
+    // cards on cdp; this covers an already-minted card hitting /open-browser.)
+    const config = testConfig("open-browser-cdp-refuse");
+    const handler = createHandler(config);
+    const { createSetupRequest, now } = await import("./state");
+    const setup = await mutateState(config.instance, (state) => {
+      // Active cdp transport + a stale card carrying a recorded URL.
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+      return createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_cdp_stale", url: "https://example.com/login" }
+      });
+    });
+    const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(String(body.error)).toContain("attached over CDP");
+    // The card was NOT stamped as a live screencast (no navigation happened).
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    expect(after?.status).toBe("pending");
+    expect(after?.payload.signInStarted).toBeUndefined();
+    expect(after?.payload.screencast).toBeUndefined();
+  });
+
+  test("frames reconnect on an already-stamped card relaunches the browser when none is live", async () => {
+    // After a gateway/Chrome restart, an already-stamped sign-in card (screencast
+    // + signInStarted, still pending) skips /open-browser — the modal reconnects
+    // straight to /frames. So /frames must itself attempt the headless relaunch
+    // when no browser is live and a URL is recorded, or the user is stuck on a
+    // permanent 409. In this unit context there's no real Chrome, so the relaunch
+    // fails fast and 409s — but via the relaunch path (distinct from the no-URL
+    // message), proving the reconnect recovery is wired through /frames.
+    const config = testConfig("frames-reconnect-relaunch");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        // Already stamped (the pre-restart open-browser ran); URL recorded.
+        payload: { toolCallId: "call_frames_relaunch", url: "https://example.com/login", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).not.toContain("no page URL is recorded");
+    // Row stays pending so a real retry (with a live browser) can recover.
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("frames reconnect on a stamped card with NO recorded URL 409s with the no-URL message", async () => {
+    // The relaunch needs a target page; without a recorded URL there's nothing
+    // to navigate to, so /frames 409s with the distinct no-URL message rather
+    // than blindly relaunching.
+    const config = testConfig("frames-reconnect-no-url");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in",
+        reason: "Sign in",
+        payload: { toolCallId: "call_frames_no_url", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("no page URL is recorded");
+  });
+
+  test("screencast endpoints reject a setup that isn't an active sign-in (lifecycle gate)", async () => {
+    // A browser.connect setup that is NOT pending, OR not stamped screencast +
+    // signInStarted, must be refused so a stale EventSource reconnect after
+    // complete/cancel can't rebuild a live drive channel.
+    const config = testConfig("screencast-lifecycle");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    // Pending, but never went through open-browser (no screencast/signInStarted).
+    const notStarted = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ls" }
+      })
+    );
+    const r1 = await rawCall(handler, config, `/api/browser/screencast/${notStarted.id}/frames`, {}, config.token);
+    expect(r1.status).toBe(404);
+    // Stamped screencast but cancelled — no longer pending.
+    const cancelled = await mutateState(config.instance, (state) => {
+      const s = createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ls2", signInStarted: true, screencast: true }
+      });
+      const row = state.setupRequests.find((x) => x.id === s.id);
+      if (row) row.status = "cancelled";
+      return s;
+    });
+    const r2 = await rawCall(handler, config, `/api/browser/screencast/${cancelled.id}/input`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(r2.status).toBe(404);
+  });
+
+  test("open-browser refuses a row cancelled before the stamp mutation (in-mutation status recheck)", async () => {
+    // /open-browser checks pending on a pre-read, then stamps screencast +
+    // signInStarted inside mutateState. A /cancel that commits in that window
+    // must not get a live sign-in stamped on top: the in-mutation status
+    // recheck returns 410 and leaves the cancelled row untouched.
+    const config = testConfig("open-browser-raced-cancel");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    // A live spawned handle so getScreencastPort is non-null (we get past the
+    // 409 no-browser gate and reach the stamp mutation).
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_race" }
+        })
+      );
+      // Cancel the row first — this is the racer that wins.
+      await mutateState(config.instance, (state) => {
+        const row = state.setupRequests.find((s) => s.id === setup.id);
+        if (row) row.status = "cancelled";
+      });
+      const res = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The pre-read pending gate already 410s here; the in-mutation recheck is
+      // the backstop for a cancel that lands AFTER that gate. Either way the
+      // contract is: no live sign-in stamped on a terminal row.
+      expect(res.status).toBe(410);
+      const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+      expect(after?.status).toBe("cancelled");
+      expect(after?.payload.signInStarted).toBeUndefined();
+      expect(after?.payload.screencast).toBeUndefined();
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
+  });
+
+  test("browser.connect /complete claims the row BEFORE writing the audit row (no duplicate on double-submit)", async () => {
+    // The non-screencast fallback must resolve (claim pending->completed) before
+    // writing the rich browser.connect audit row. A second /complete loses the
+    // claim (ApprovalRaceLostError) and writes ZERO side effects, so exactly one
+    // browser.connect audit row exists no matter how many completes race.
+    const config = testConfig("browser-connect-complete-claim-first");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "Sign in to the store",
+        reason: "Sign in to the store",
+        // No screencast marker → the non-screencast fallback path.
+        payload: { toolCallId: "call_complete", reason: "Sign in to the store" }
+      })
+    );
+    const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(first.status).toBe(200);
+    // Second complete on the now-terminal row loses the claim.
+    const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/complete`, { method: "POST" }, config.token);
+    expect(second.status).toBeGreaterThanOrEqual(400);
+    const browserConnectAudits = readState(config.instance).audit.filter((a) => a.action === "browser.connect");
+    expect(browserConnectAudits).toHaveLength(1);
+  });
+
+  test("open-browser is idempotent: a second open on an already-stamped row writes no duplicate audit", async () => {
+    // /open-browser keeps the row pending, so two opens (double-click / retry)
+    // both pass the pending check. The in-mutation already-stamped guard makes
+    // the second a no-op so exactly one stage:open-browser audit row exists.
+    const config = testConfig("open-browser-idempotent");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSpawnedHandleForTest(9333, {
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    try {
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com",
+          reason: "Sign in to continue",
+          payload: { toolCallId: "call_idem", url: "https://example.com/login" }
+        })
+      );
+      const first = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      expect(first.status).toBe(200);
+      const second = await rawCall(handler, config, `/api/setup-requests/${setup.id}/open-browser`, { method: "POST" }, config.token);
+      // The second open succeeds (idempotent) but writes no extra audit/trace.
+      expect(second.status).toBe(200);
+      const openAudits = readState(config.instance).audit.filter(
+        (a) => a.action === "browser.connect" && (a.evidence as Record<string, unknown> | undefined)?.stage === "open-browser"
+      );
+      expect(openAudits).toHaveLength(1);
+    } finally {
+      browserTest.uninstallFakeBrowserForTest();
+    }
+  });
+
+  test("screencast frames stream a frame and input dispatches with a live bridge", async () => {
+    // HTTP success path: install a fake bridge (no real Chrome) so the SSE
+    // envelope + input dispatch wiring is exercised end to end at the gateway.
+    const config = testConfig("screencast-success");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_ok", signInStarted: true, screencast: true }
+      })
+    );
+    // A minimal fake bridge: replays one frame to each subscriber and records
+    // dispatched input. Installed as the live activeBridge so the no-factory
+    // getOrStartBridge inside http.ts reuses it.
+    const dispatched: unknown[] = [];
+    const fakeBridge = {
+      isClosed: () => false,
+      subscribe(
+        onFrame: (f: { data: string; meta: Record<string, unknown> }) => void,
+        _onClose?: () => void,
+        onUrl?: (url: string) => void
+      ) {
+        onUrl?.("https://signin.example.com/login");
+        onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
+        return () => undefined;
+      },
+      dispatchInput: async (m: { kind?: string }) => {
+        dispatched.push(m);
+        // Mirror the real bridge: selection-causing kinds return a selection.
+        return m.kind === "copy" ? { selection: "picked text" } : {};
+      },
+      start: async () => undefined,
+      stop: async () => undefined
+    };
+    sc.__setActiveBridgeForTest(fakeBridge as never, setup.id);
+    try {
+      const framesRes = await handler(
+        new Request(`http://127.0.0.1:${config.port}/api/browser/screencast/${setup.id}/frames`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        })
+      );
+      expect(framesRes.status).toBe(200);
+      expect(framesRes.headers.get("content-type")).toContain("text/event-stream");
+      const reader = framesRes.body!.getReader();
+      // onUrl and onFrame enqueue separate chunks; read both.
+      const decoder = new TextDecoder();
+      const first = decoder.decode((await reader.read()).value);
+      const second = decoder.decode((await reader.read()).value);
+      const text = first + second;
+      // The gateway-sourced origin is streamed as an `event: url` so the modal
+      // can show the operator which site they're signing into.
+      expect(text).toContain("event: url");
+      expect(text).toContain("https://signin.example.com/login");
+      expect(text).toContain("event: frame");
+      expect(text).toContain("QUJD");
+      await reader.cancel();
+
+      const inputRes = await call(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "click", x: 10, y: 20, clickCount: 1 })
+      });
+      expect(inputRes.ok).toBe(true);
+      expect(dispatched).toEqual([{ kind: "click", x: 10, y: 20, clickCount: 1 }]);
+
+      // A copy relays the remote selection back in the response body so the
+      // modal can serve it to the operator's clipboard.
+      const copyRes = await call(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "copy" })
+      });
+      expect(copyRes.ok).toBe(true);
+      expect(copyRes.selection).toBe("picked text");
+    } finally {
+      sc.__resetActiveBridgeForTest();
+    }
+  });
+
+  test("the frames SSE stream closes when the bridge dies (no dangling keepalives)", async () => {
+    const config = testConfig("screencast-frames-close-on-death");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_close", signInStarted: true, screencast: true }
+      })
+    );
+    // A fake bridge that captures the onClose callback so the test can fire it,
+    // simulating the CDP socket dropping.
+    let fireClose: (() => void) | undefined;
+    const fakeBridge = {
+      isClosed: () => false,
+      subscribe(onFrame: (f: { data: string; meta: Record<string, unknown> }) => void, onClose?: () => void) {
+        onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
+        fireClose = onClose;
+        return () => undefined;
+      },
+      dispatchInput: async () => undefined,
+      start: async () => undefined,
+      stop: async () => undefined
+    };
+    sc.__setActiveBridgeForTest(fakeBridge as never, setup.id);
+    try {
+      const framesRes = await handler(
+        new Request(`http://127.0.0.1:${config.port}/api/browser/screencast/${setup.id}/frames`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        })
+      );
+      expect(framesRes.status).toBe(200);
+      const reader = framesRes.body!.getReader();
+      await reader.read(); // first frame
+      expect(fireClose).toBeDefined();
+      fireClose!(); // bridge dies → route should close the stream
+      const next = await reader.read();
+      expect(next.done).toBe(true); // stream ended, not dangling on keepalives
+    } finally {
+      sc.__resetActiveBridgeForTest();
+    }
+  });
+
+  test("completing a screencast browser.connect resolves the setup without a managed relaunch", async () => {
+    // The screencast path keeps the agent on its headless Chrome the whole
+    // time, so /complete just stops the bridge (a no-op here, no live bridge)
+    // and resolves the setup — no connectBrowser relaunch.
+    const config = testConfig("screencast-complete");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc3", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(res.ok).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
+  });
+
+  test("cancelling a screencast browser.connect stops the bridge and cancels the setup", async () => {
+    const config = testConfig("screencast-cancel");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc4", signInStarted: true, screencast: true }
+      })
+    );
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("cancel stops the owner's bridge unconditionally, even if the row isn't yet stamped screencast", async () => {
+    // /cancel must not gate the bridge teardown on a pre-claim screencast read:
+    // payload.screencast can flip true (via /open-browser) in the window between
+    // that read and the atomic claim. Install a live bridge owned by the setup
+    // on a row that is NOT yet stamped screencast, cancel it, and assert the
+    // bridge is torn down anyway — the unconditional owner-scoped stop.
+    const config = testConfig("screencast-cancel-unstamped");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        // Deliberately NOT stamped screencast/signInStarted yet.
+        payload: { toolCallId: "call_sc_unstamped" }
+      })
+    );
+    let stopped = false;
+    const fakeBridge = {
+      isClosed: () => false,
+      stop: async () => {
+        stopped = true;
+      }
+    } as unknown as import("./execution/browser-screencast").ScreencastBridge;
+    sc.__setActiveBridgeForTest(fakeBridge, setup.id);
+    try {
+      await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+      expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+      expect(stopped).toBe(true);
+    } finally {
+      await sc.stopActiveBridge();
+    }
+  });
+
+  test("a frames request after a screencast complete is rejected (no bridge recreation)", async () => {
+    // /complete marks the setup terminal BEFORE stopping the bridge, so a
+    // frames/input request racing the completion sees status!=="pending" and
+    // 404s instead of recreating an orphaned bridge in the teardown gap.
+    const config = testConfig("screencast-complete-then-frames");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc_race", signInStarted: true, screencast: true }
+      })
+    );
+    const done = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(done.ok).toBe(true);
+    const framesRes = await rawCall(
+      handler,
+      config,
+      `/api/browser/screencast/${setup.id}/frames`,
+      { method: "GET" },
+      config.token
+    );
+    expect(framesRes.status).toBe(404);
+  });
+
+  test("screencast input rejects a malformed JSON body with 400", async () => {
+    const config = testConfig("screencast-bad-body");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc2", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+      method: "POST",
+      body: "{not json"
+    }, config.token);
+    expect(res.status).toBe(400);
+  });
+
   test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
     // allowChat's pending-row presence check is gated on `expectedCode`
     // being defined (the legacy CLI's "operator knows what they're
@@ -3188,43 +3760,73 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  // Round-1 review fix: browser-connect throws with prefixes that the
-  // gateway's catch-all previously mapped to 500. The webapp needs them as
-  // 4xx so it can render the original message instead of "internal error".
-  test("browser connect returns 400 for unsupported cdpUrl protocol", async () => {
-    const config = testConfig("browser-bad-proto");
+  // Default transport (issue #420): /api/browser/connect with NO cdpUrl is a
+  // no-op acknowledgement — the spawned Chrome launches lazily on the first
+  // browser tool call, not at connect time, and carries no record.
+  test("browser connect with no cdpUrl returns the stable disconnected status", async () => {
+    const config = testConfig("browser-connect-empty-body");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
       config,
       "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "file:///etc/passwd" })
-      },
+      { method: "POST", body: JSON.stringify({}) },
       config.token
     );
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(201);
     const body = await response.json();
-    expect(body.error).toMatch(/Unsupported/);
+    expect(body.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
-  test("browser connect returns 400 for garbage cdpUrl", async () => {
-    const config = testConfig("browser-bad-url");
+  // A cdpUrl with an unsupported protocol is user-input error → 400, and no
+  // record is written. (Validation happens before any probe/attach.)
+  test("browser connect rejects an unsupported cdpUrl protocol with 400", async () => {
+    const config = testConfig("browser-connect-bad-protocol");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
       config,
       "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "not-a-url" })
-      },
+      { method: "POST", body: JSON.stringify({ cdpUrl: "file:///etc/passwd" }) },
       config.token
     );
     expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.error).toMatch(/Invalid cdpUrl/);
+    expect(String(body.error ?? body.message)).toContain("Unsupported cdpUrl protocol");
+    expect(readState(config.instance).browser ?? null).toBeNull();
+  });
+
+  // An unreachable (but well-formed) loopback CDP endpoint surfaces as 400 with
+  // a clear "Could not reach CDP endpoint" message, and writes no record. The
+  // server-side env knobs shrink the probe deadline so the test doesn't burn
+  // the full 15s budget (they are NOT plumbed from the POST body).
+  test("browser connect surfaces an unreachable cdp endpoint as 400", async () => {
+    const config = testConfig("browser-connect-unreachable-cdp");
+    const handler = createHandler(config);
+    const prevTimeout = process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+    const prevInterval = process.env.GINI_CDP_PROBE_INTERVAL_MS;
+    process.env.GINI_CDP_PROBE_TIMEOUT_MS = "40";
+    process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+    try {
+      const response = await rawCall(
+        handler,
+        config,
+        "/api/browser/connect",
+        // Port 1 is reserved and never listening, so the probe always fails.
+        { method: "POST", body: JSON.stringify({ cdpUrl: "ws://127.0.0.1:1/devtools/browser/abc" }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(String(body.error ?? body.message)).toContain("Could not reach CDP endpoint");
+      expect(readState(config.instance).browser ?? null).toBeNull();
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GINI_CDP_PROBE_TIMEOUT_MS;
+      else process.env.GINI_CDP_PROBE_TIMEOUT_MS = prevTimeout;
+      if (prevInterval === undefined) delete process.env.GINI_CDP_PROBE_INTERVAL_MS;
+      else process.env.GINI_CDP_PROBE_INTERVAL_MS = prevInterval;
+    }
   });
 
   test("PATCH /api/settings/auto-approve rejects out-of-union approvalMode with 400", async () => {
@@ -3265,26 +3867,14 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
-  test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
-    const config = testConfig("browser-unreachable");
+  test("GET /api/browser reports the stable disconnected status", async () => {
+    const config = testConfig("browser-status");
     const handler = createHandler(config);
-    // Port 1 is reserved; probe will time out. The point of this test is
-    // the status mapping, so use a short-lived test by aborting once we
-    // see the response.
-    const response = await rawCall(
-      handler,
-      config,
-      "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "http://127.0.0.1:1/" })
-      },
-      config.token
-    );
-    expect(response.status).toBe(400);
+    const response = await rawCall(handler, config, "/api/browser", {}, config.token);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.error).toMatch(/Could not reach CDP endpoint/);
-  }, 30_000);
+    expect(body.connected).toBe(false);
+  });
 
   test("stamps the active agent on records and filters listings by agentId", async () => {
     const config = testConfig("records-agentid");
@@ -4378,6 +4968,121 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("a tokenless web stream marks the session web-watched until it closes", async () => {
+    // A web client (no X-Device-Token) opening a chat stream registers on
+    // the pushless registry so the dispatcher can downgrade the phone's
+    // completion alert to a silent badge refresh while the human reads on
+    // the web. Closing the stream clears the entry — so a send-then-close
+    // leaves the phone eligible for its normal alert.
+    const config = testConfig("chat-stream-web-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "web presence" })
+    });
+
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+
+    // No X-Device-Token header → treated as a web/CLI client.
+    await withChatStream(handler, config, session.id, {}, () => {
+      // Web presence is recorded; the device registry is untouched (no
+      // token to key on).
+      expect(isSessionWebWatched(config.instance, session.id)).toBe(true);
+      expect(isDeviceWatching(config.instance, config.token, session.id)).toBe(false);
+    });
+
+    // Stream closed → presence cleared (the send-then-close path).
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
+  test("a stream with a valid X-Device-Token registers per-device watch (not pushless)", async () => {
+    // The mobile path: a registered device opens the stream with its
+    // valid token, which lands in the per-device registry so the
+    // dispatcher skips a redundant push to THIS device. It must NOT land
+    // in the pushless registry (that's web-only).
+    const config = testConfig("chat-stream-device-watch");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "device watch" })
+    });
+    // Register the device so deviceTokenFromRequest resolves it for the
+    // caller's credential.
+    const deviceToken = "valid_device_token_wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww";
+    await call(handler, config, "/api/push/devices", {
+      method: "POST",
+      body: JSON.stringify({ token: deviceToken, platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+    });
+
+    await withChatStream(
+      handler,
+      config,
+      session.id,
+      { headers: { "x-device-token": deviceToken } },
+      () => {
+        // Device watch recorded; pushless registry untouched.
+        expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(true);
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+      }
+    );
+    expect(isDeviceWatching(config.instance, deviceToken, session.id)).toBe(false);
+  });
+
+  test("a stream with a present-but-invalid X-Device-Token registers NO presence (not web, not device)", async () => {
+    // Tri-state guard: deviceTokenFromRequest returns null for BOTH an
+    // absent header AND a present-but-unregistered/mismatched token. Only
+    // a truly-absent header is a web/CLI client. A real iPhone whose
+    // persisted token went stale (rotated server-side, or re-paired) primes
+    // that stale token onto the SSE handshake on cold launch — it must NOT
+    // be misclassified as a web client, or it would silence its OWN
+    // completion alerts for the session. With an invalid token present we
+    // register nothing: no pushless downgrade, no per-device skip.
+    const config = testConfig("chat-stream-stale-token");
+    const handler = createHandler(config);
+    const { isSessionWebWatched, isDeviceWatching } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stale token" })
+    });
+
+    const staleToken = "stale_unregistered_token_zzzzzzzzzzzzzzzzzzzzzzzz";
+    await withChatStream(
+      handler,
+      config,
+      session.id,
+      { headers: { "x-device-token": staleToken } },
+      () => {
+        // Neither registry recorded this stream — a stale-token phone keeps
+        // its normal alert.
+        expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+        expect(isDeviceWatching(config.instance, staleToken, session.id)).toBe(false);
+      }
+    );
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
+  test("an unauthenticated stream request 401s and creates no pushless presence", async () => {
+    // The pushless registration is a notification side effect, so it must
+    // sit behind the bearer gate: a request with no Authorization header
+    // 401s before reaching the stream factory, leaving the registry empty.
+    // Pins that the side effect can't be triggered by an unauthenticated
+    // caller who merely knows a session id.
+    const config = testConfig("chat-stream-unauth-no-presence");
+    const handler = createHandler(config);
+    const { isSessionWebWatched } = await import("./state");
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "unauth presence" })
+    });
+
+    // No token argument → no Authorization header.
+    const response = await rawCall(handler, config, `/api/chat/${session.id}/stream`, {});
+    expect(response.status).toBe(401);
+    expect(isSessionWebWatched(config.instance, session.id)).toBe(false);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
@@ -4672,6 +5377,183 @@ describe("runtime api", () => {
       expect(after.unread).toBe(1);
     });
 
+    test("GET /api/badge and /api/unread exclude archived sessions", async () => {
+      // Regression: an archived session (e.g. a deleted recurring-job
+      // channel) is hidden from every client by the `!archivedAt` filter,
+      // so the user can never open it to clear its read-state. The badge
+      // must not count its blocks — otherwise it pins at a number that
+      // can never be drained.
+      const config = testConfig("chat-badge-archived");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const live = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "live chat" })
+      });
+      const stale = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "old job channel" })
+      });
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: live.id, text: "reachable", streaming: false });
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: stale.id, text: "stuck 1", streaming: false });
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: stale.id, text: "stuck 2", streaming: false });
+
+      // Both sessions visible → all three blocks count.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(3);
+
+      // Archive the stale session — it now drops out of the badge.
+      await mutateState(config.instance, (state) => {
+        const session = state.chatSessions.find((s) => s.id === stale.id);
+        if (session) session.archivedAt = new Date().toISOString();
+      });
+
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(1);
+
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[live.id]).toBe(1);
+      expect(afterUnread.counts[stale.id]).toBeUndefined();
+    });
+
+    test("GET /api/badge and /api/unread exclude sessions of archived agents", async () => {
+      // Second unreachable vector: archiving an agent stamps `archivedAt`
+      // on the AGENT, not its chat session. Both clients show archived
+      // agents in a Restore-only group with no way to open the chat, so
+      // the session's blocks can never be marked read. The badge must
+      // exclude them just like a self-archived session.
+      const config = testConfig("chat-badge-archived-agent");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const agent = await call(handler, config, "/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ name: "scratch agent" })
+      });
+      const agentChat = await getOrCreateAgentChat(config.instance, agent.id);
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: agentChat.id,
+        text: "agent reply 1",
+        streaming: false,
+        agentId: agent.id
+      });
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: agentChat.id,
+        text: "agent reply 2",
+        streaming: false,
+        agentId: agent.id
+      });
+
+      // Agent active → its chat is reachable, both blocks count.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(2);
+
+      // Archive the agent (the session keeps no archivedAt of its own).
+      await call(handler, config, `/api/agents/${agent.id}/archive`, { method: "POST" });
+      const sessionStillUnarchived = readState(config.instance).chatSessions.find((s) => s.id === agentChat.id);
+      expect(sessionStillUnarchived?.archivedAt).toBeUndefined();
+
+      // Badge drops to zero — the only session belongs to an archived agent.
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(0);
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[agentChat.id]).toBeUndefined();
+
+      // Restoring the agent makes the chat reachable again → blocks recount.
+      await call(handler, config, `/api/agents/${agent.id}/unarchive`, { method: "POST" });
+      const afterRestore = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterRestore.unread).toBe(2);
+    });
+
+    test("GET /api/badge still counts a job channel owned by an archived agent", async () => {
+      // Over-exclusion guard: a job CHANNEL (kind:"channel" / origin:"job")
+      // stays on the channel rail even when its owning agent is archived —
+      // the client filters key on kind/origin + !archivedAt, never on agent
+      // state. So unless the channel is archived in its own right it is still
+      // reachable and openable, and its blocks must keep counting. Only the
+      // agent's CANONICAL chat vanishes with the agent.
+      const config = testConfig("chat-badge-archived-agent-channel");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const agent = await call(handler, config, "/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ name: "channel owner" })
+      });
+      // A real recurring job with its own dedicated channel (kind:"channel",
+      // origin:"job"), owned by the agent. Going through createScheduledJob
+      // means the job references the channel, so the orphan-channel sweep in
+      // normalizeState leaves it live (a bare hand-built channel would be
+      // archived as orphaned on the next state load).
+      const job = await createScheduledJob(
+        config,
+        {
+          name: "news-watch",
+          prompt: "summarize headlines",
+          intervalSeconds: 600,
+          createDedicatedSession: { title: "news-watch" }
+        },
+        { originatingAgentId: agent.id }
+      );
+      const channelId = job.chatSessionId!;
+      const channelSession = readState(config.instance).chatSessions.find((s) => s.id === channelId);
+      expect(channelSession?.kind).toBe("channel");
+      expect(channelSession?.agentId).toBe(agent.id);
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: channelId,
+        text: "digest 1",
+        streaming: false,
+        agentId: agent.id
+      });
+
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(1);
+
+      // Archive the agent. The channel is still rendered on the rail, so it
+      // must keep counting (unlike the agent's canonical chat).
+      await call(handler, config, `/api/agents/${agent.id}/archive`, { method: "POST" });
+      const sessionStillLive = readState(config.instance).chatSessions.find((s) => s.id === channelId);
+      expect(sessionStillLive?.archivedAt).toBeUndefined();
+
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(1);
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[channelId]).toBe(1);
+
+      // But if the channel itself is archived, it drops out (vector 1).
+      await mutateState(config.instance, (state) => {
+        const s = state.chatSessions.find((x) => x.id === channelId);
+        if (s) s.archivedAt = new Date().toISOString();
+      });
+      const afterChannelArchive = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterChannelArchive.unread).toBe(0);
+    });
+
     test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
       const config = testConfig("chat-read-validate");
       const handler = createHandler(config);
@@ -4960,6 +5842,265 @@ describe("runtime api", () => {
 
       const del = await rawCall(handler, config, "/api/push/devices/tok", { method: "DELETE" });
       expect(del.status).toBe(401);
+    });
+  });
+
+  describe("push preview endpoint", () => {
+    test("GET /api/push/preview returns the latest assistant reply for a completed message", async () => {
+      const config = testConfig("push-preview-message");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Morning briefing" })
+      });
+      const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ content: "what's up" })
+      });
+      await waitForTask(handler, config, submitted.taskId);
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`
+      );
+      expect(preview.title).toBe("Morning briefing");
+      // The echo provider replies with the user's text; the body must be
+      // the actual reply, NOT a generic "Tap to read" string.
+      expect(typeof preview.body).toBe("string");
+      expect(preview.body.length).toBeGreaterThan(0);
+      expect(preview.body).not.toBe("Tap to read");
+    });
+
+    test("GET /api/push/preview 404s when the session has no assistant message yet", async () => {
+      const config = testConfig("push-preview-empty");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Empty chat" })
+      });
+      const res = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`,
+        {},
+        config.token
+      );
+      expect(res.status).toBe(404);
+    });
+
+    test("GET /api/push/preview surfaces a pending authorization's risk + summary", async () => {
+      const config = testConfig("push-preview-approval");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Deploy bot" })
+      });
+      const { createAuthorization } = await import("./state");
+      const approval = await mutateState(config.instance, (state) =>
+        createAuthorization(state, {
+          action: "terminal.exec",
+          target: "rm -rf build",
+          risk: "high",
+          reason: "Clear the stale build cache",
+          payload: {}
+        })
+      );
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=authorization_requested&approvalId=${approval.id}`
+      );
+      expect(preview.title).toBe("Approve in Deploy bot?");
+      expect(preview.body).toBe("[high] Clear the stale build cache");
+    });
+
+    test("GET /api/push/preview surfaces a pending setup request's ask", async () => {
+      const config = testConfig("push-preview-setup");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Email watch" })
+      });
+      const { createSetupRequest } = await import("./state");
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com/login",
+          reason: "Sign in to your email provider",
+          payload: {}
+        })
+      );
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=setup_requested&approvalId=${setup.id}`
+      );
+      expect(preview.title).toBe("Finish a step in Email watch");
+      expect(preview.body).toBe("Sign in to your email provider");
+    });
+
+    test("GET /api/push/preview validates inputs and auth", async () => {
+      const config = testConfig("push-preview-validation");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Validation chat" })
+      });
+
+      // Unauthenticated.
+      const noAuth = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`
+      );
+      expect(noAuth.status).toBe(401);
+
+      // Missing sessionId.
+      const noSession = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?event=message_completed`,
+        {},
+        config.token
+      );
+      expect(noSession.status).toBe(400);
+
+      // Unknown event.
+      const badEvent = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=bogus`,
+        {},
+        config.token
+      );
+      expect(badEvent.status).toBe(400);
+
+      // Unknown session.
+      const badSession = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=chat_nope&event=message_completed`,
+        {},
+        config.token
+      );
+      expect(badSession.status).toBe(404);
+    });
+
+    test("POST /api/push/unwatch (no sessionId) clears the whole device bucket", async () => {
+      const config = testConfig("push-unwatch");
+      const handler = createHandler(config);
+      // Register the device so requireDeviceToken accepts the header.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_unwatch", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Seed two watched sessions for this device (as if it had opened
+        // two chats), plus one for a different device that must survive.
+        addSseSubscription(config.instance, "tok_unwatch", "chat_a");
+        addSseSubscription(config.instance, "tok_unwatch", "chat_b");
+        addSseSubscription(config.instance, "tok_other", "chat_a");
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(true);
+
+        // No sessionId → background beacon → clear everything for the device.
+        const res = await call(handler, config, "/api/push/unwatch", {
+          method: "POST",
+          headers: { "x-device-token": "tok_unwatch" }
+        });
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(2);
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(false);
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_b")).toBe(false);
+        // The other device is untouched.
+        expect(isDeviceWatching(config.instance, "tok_other", "chat_a")).toBe(true);
+      } finally {
+        // Don't leak seeded entries into the process-wide registry.
+        __resetSseSubscriptionsForTests();
+      }
+    });
+
+    test("POST /api/push/unwatch?sessionId clears only that session", async () => {
+      const config = testConfig("push-unwatch-session");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_nav", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Device watches two chats; navigating away from chat_a must leave
+        // chat_b watched (the just-opened chat mustn't be race-cleared).
+        addSseSubscription(config.instance, "tok_nav", "chat_a");
+        addSseSubscription(config.instance, "tok_nav", "chat_b");
+
+        const res = await call(handler, config, "/api/push/unwatch?sessionId=chat_a", {
+          method: "POST",
+          headers: { "x-device-token": "tok_nav" }
+        });
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(1);
+        expect(isDeviceWatching(config.instance, "tok_nav", "chat_a")).toBe(false);
+        expect(isDeviceWatching(config.instance, "tok_nav", "chat_b")).toBe(true);
+      } finally {
+        __resetSseSubscriptionsForTests();
+      }
+    });
+
+    test("POST /api/push/unwatch?sessionId&streamId clears only that stream, not a sibling on the same session", async () => {
+      const config = testConfig("push-unwatch-stream");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_stream", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Thread View (card over the main chat) and the main chat both open
+        // a stream on the SAME session, each with its own streamId. Tearing
+        // down the thread must leave the main chat's watch intact.
+        addSseSubscription(config.instance, "tok_stream", "chat_a", "stream_main");
+        addSseSubscription(config.instance, "tok_stream", "chat_a", "stream_thread");
+
+        const res = await call(
+          handler,
+          config,
+          "/api/push/unwatch?sessionId=chat_a&streamId=stream_thread",
+          { method: "POST", headers: { "x-device-token": "tok_stream" } }
+        );
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(1);
+        // The main chat's stream is still registered → session still watched.
+        expect(isDeviceWatching(config.instance, "tok_stream", "chat_a")).toBe(true);
+      } finally {
+        __resetSseSubscriptionsForTests();
+      }
+    });
+
+    test("POST /api/push/unwatch requires auth + a registered device token", async () => {
+      const config = testConfig("push-unwatch-auth");
+      const handler = createHandler(config);
+      // Unauthenticated.
+      const noAuth = await rawCall(handler, config, "/api/push/unwatch", { method: "POST" });
+      expect(noAuth.status).toBe(401);
+      // Authenticated but no X-Device-Token header.
+      const noDevice = await rawCall(handler, config, "/api/push/unwatch", { method: "POST" }, config.token);
+      expect(noDevice.status).toBe(400);
+      // Authenticated with an unregistered device token.
+      const badDevice = await rawCall(
+        handler,
+        config,
+        "/api/push/unwatch",
+        { method: "POST", headers: { "x-device-token": "tok_ghost" } },
+        config.token
+      );
+      expect(badDevice.status).toBe(403);
     });
   });
 
@@ -5311,6 +6452,185 @@ describe("GET /api/files", () => {
     // never sniffed — a text/html or SVG upload can't execute on the app origin.
     expect(fetched.headers.get("content-disposition")).toBe("attachment");
     expect(fetched.headers.get("x-content-type-options")).toBe("nosniff");
+    // The full-body response advertises range support so a media client knows
+    // it may stream via byte ranges (iOS AVPlayer requires this to play remote
+    // audio at all).
+    expect(fetched.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  // iOS AVPlayer won't start a remote audio AVURLAsset unless the server honors
+  // Range requests (206 + Content-Range). These pin the range semantics of the
+  // upload GET so a regression can't silently break voice-message playback.
+  test("GET /api/uploads honors a bounded Range with 206 + Content-Range", async () => {
+    const config = testConfig("uploads-range-bounded");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 100 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=0-9" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 0-9/100");
+    expect(res.headers.get("content-length")).toBe("10");
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  test("GET /api/uploads serves a mid-file Range slice with exact bytes", async () => {
+    const config = testConfig("uploads-range-mid");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 100 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=10-19" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 10-19/100");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
+  test("GET /api/uploads clamps an over-long Range end to the last byte", async () => {
+    const config = testConfig("uploads-range-clamp");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=40-999" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 40-49/50");
+    expect(res.headers.get("content-length")).toBe("10");
+  });
+
+  test("GET /api/uploads serves an open-ended Range to EOF", async () => {
+    const config = testConfig("uploads-range-open");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=48-" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 48-49/50");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([48, 49]);
+  });
+
+  test("GET /api/uploads serves a suffix Range (last N bytes)", async () => {
+    const config = testConfig("uploads-range-suffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-5" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 45-49/50");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([45, 46, 47, 48, 49]);
+  });
+
+  test("GET /api/uploads returns 416 for a Range starting past EOF", async () => {
+    const config = testConfig("uploads-range-416");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=999-" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */50");
+  });
+
+  test("GET /api/uploads ignores a malformed Range and serves the full 200 body", async () => {
+    const config = testConfig("uploads-range-malformed");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "lines=1-2" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  test("GET /api/uploads treats a reversed Range (start>end) as malformed → full 200", async () => {
+    const config = testConfig("uploads-range-reversed");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=20-10" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+  });
+
+  test("GET /api/uploads treats an empty suffix Range (bytes=-) as malformed → full 200", async () => {
+    const config = testConfig("uploads-range-emptysuffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+  });
+
+  test("GET /api/uploads returns 416 for a zero-length suffix Range (bytes=-0)", async () => {
+    const config = testConfig("uploads-range-zerosuffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-0" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */50");
+  });
+
+  test("GET /api/uploads returns 416 for any Range against a zero-byte upload", async () => {
+    const config = testConfig("uploads-range-empty-file");
+    const handler = createHandler(config);
+    // storeUpload rejects an empty body, so write the manifest+bytes directly to
+    // exercise the total===0 branch (a 0-byte stored file can't satisfy a range).
+    const ref = storeUpload(config.instance, new Uint8Array([1]), "audio/wav");
+    writeFileSync(join(uploadsDir(config.instance), `${ref.id}.wav`), new Uint8Array([]));
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=0-10" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */0");
+  });
+
+  test("HEAD /api/uploads advertises accept-ranges and the content length", async () => {
+    const config = testConfig("uploads-head-range");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 42 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      method: "HEAD"
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+    expect(res.headers.get("content-length")).toBe("42");
   });
 
   test("POST /api/uploads accepts a text/csv file", async () => {
@@ -5954,6 +7274,50 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
   return response;
 }
 
+// Opens a chat SSE stream, pumps frames until the initial `chat_session`
+// frame lands (which only happens inside the stream's start() — i.e. AFTER
+// presence registration), runs the caller's `whileOpen` assertions, then
+// ALWAYS cancels the reader in a finally so a thrown assertion can't leak
+// the stream (its keepalive interval and presence entry would otherwise
+// survive the test). Returns after the reader is cancelled.
+async function withChatStream(
+  handler: ReturnType<typeof createHandler>,
+  config: RuntimeConfig,
+  sessionId: string,
+  init: RequestInit,
+  whileOpen: () => void
+): Promise<void> {
+  const response = await rawCall(handler, config, `/api/chat/${sessionId}/stream`, init, config.token);
+  expect(response.status).toBe(200);
+  const reader = response.body?.getReader();
+  expect(reader).toBeDefined();
+  if (!reader) return;
+  try {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise<{ done: boolean; value: undefined }>((resolve) =>
+          setTimeout(() => resolve({ done: false, value: undefined }), 50)
+        )
+      ]);
+      if (done) break;
+      if (value) buffer += decoder.decode(value);
+      if (buffer.includes("event: chat_session")) break;
+    }
+    expect(buffer).toContain("event: chat_session");
+    whileOpen();
+  } finally {
+    await reader.cancel();
+  }
+  // cancel() runs the stream's cleanup synchronously in-process; give the
+  // microtask queue one turn to settle before the caller asserts the
+  // post-close registry state.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
   process.env.GINI_STATE_ROOT = root;
@@ -5966,13 +7330,6 @@ function testConfig(instance: string): RuntimeConfig {
   // because the inode is gone. removeMemoryDb closes the cached handle
   // AND unlinks the file + WAL/SHM siblings in one shot.
   removeMemoryDb(instance);
-  // The unreachable-CDP test posts to the real /api/browser/connect route,
-  // which omits the in-process probe override by design. Shrink the probe via
-  // the server-side env knob so the test exercises the 400 mapping without
-  // burning the production probe deadline. Server env, not POST body, so the
-  // network-input boundary stays intact.
-  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
-  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
   // resumeChatTask polls for the loop's flip to waiting_approval before
   // staging a tool result. In-process the flip lands within a couple of
   // mutateState boundaries, and several fill_secret / approval tests seed a
