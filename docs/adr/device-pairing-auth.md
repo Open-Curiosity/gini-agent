@@ -245,10 +245,15 @@ admin to anything but the operator's own loopback dev port.
   **no secret** — only an opaque dedup id — so it is not a credential; the
   `gini_session` token remains the entire access decision. Attributes mirror
   `gini_session`, **not** `gini_pair`: `HttpOnly; SameSite=Lax; Path=/`, host-only
-  (no `Domain`), `__Host-` prefix on a secure front (the gate reads `__Host-` first
-  then the plain name), `Max-Age` of 400 days (matching the session cookie cap) and
-  re-issued on document navigation alongside the session so it never lapses behind a
-  slid session. It is in `GATEWAY_ONLY_COOKIES`,
+  (no `Domain`), `__Host-` prefix on a secure front. Unlike `gini_session`, the
+  read does NOT fall back to the plain name on a secure front: `gini_session`'s
+  value is hash-validated server-side (a tossed value fails closed), but
+  `gini_client` is used verbatim as an identity key, so honoring a plain cookie a
+  sibling subdomain tossed onto the shared registrable domain could collapse two
+  browsers to one identity. The plain name is read only on a plain-http front,
+  which cannot use the `__Host-` prefix anyway. `Max-Age` of 400 days (matching the
+  session cookie cap) and re-issued on document navigation alongside the session so
+  it never lapses behind a slid session. It is in `GATEWAY_ONLY_COOKIES`,
   so it is stripped before the inner web child ever sees it. A native client is
   cookieless and instead sends the same id as the `X-Gini-Client-ID` header.
 - `Secure` is conditional (`pairingCookieSecure`): set on relay and
