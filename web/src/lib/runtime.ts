@@ -166,6 +166,16 @@ export const __unreachableLogTestHooks = {
 // BFF typically wants to forward (content-disposition + x-content-type-options
 // to keep served uploads download-only and no-sniff, etag/last-modified for
 // revalidation, vary for cache key correctness).
+// NOTE: deliberately does NOT include `content-encoding` (or `content-length`).
+// This BFF reads the upstream body via `upstream.text()` / streams
+// `upstream.body`, and the underlying fetch (undici) auto-negotiates
+// `Accept-Encoding` and TRANSPARENTLY DECOMPRESSES the body before we ever see
+// it. Forwarding the upstream's `content-encoding` would therefore label an
+// already-decompressed body as gzip/br, which the browser then fails to decode
+// (`ERR_CONTENT_DECODING_FAILED`). Likewise the upstream `content-length` is
+// the compressed length and no longer matches the decompressed bytes. Both are
+// intentionally dropped so the platform recomputes/omit them for the body we
+// actually emit.
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "cache-control",
   "etag",
@@ -173,8 +183,7 @@ const PASSTHROUGH_RESPONSE_HEADERS = [
   "vary",
   "content-disposition",
   "x-content-type-options",
-  "content-language",
-  "content-encoding"
+  "content-language"
 ];
 
 export async function proxyRequest(
@@ -208,6 +217,16 @@ export async function proxyRequest(
   const target = `${options.runtimeUrl}/api/${encodedPath}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
+  // Ask the gateway NOT to compress this loopback hop. Without an explicit
+  // value, the underlying fetch (undici) auto-injects `Accept-Encoding:
+  // gzip, deflate, br`, so the gateway spends brotli/gzip CPU on a response
+  // this BFF immediately decompresses and re-serves — pure waste over
+  // loopback. `identity` makes the gateway's negotiator skip compression at
+  // the source. This does NOT remove the need to strip content-encoding on
+  // the way back (undici still transparently decompresses any upstream that
+  // compresses regardless, leaving a stale header) — see
+  // PASSTHROUGH_RESPONSE_HEADERS; the two work together.
+  headers.set("accept-encoding", "identity");
   const init: RequestInit = { method: request.method, headers };
   const signal = options.signal ?? request.signal;
   if (signal) init.signal = signal;
@@ -271,8 +290,18 @@ export async function proxyRequest(
       const v = upstream.headers.get(name);
       if (v) passthroughHeaders.set(name, v);
     }
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) passthroughHeaders.set("content-length", contentLength);
+    // Content-Length is safe to forward ONLY when the upstream body was not
+    // encoded. If upstream carried Content-Encoding, undici already
+    // transparently decompressed upstream.body, so the upstream length (the
+    // COMPRESSED size) no longer matches the bytes we stream — forwarding it
+    // would truncate/over-read. With no Content-Encoding the length is exact,
+    // and preserving it gives download managers / media players determinate
+    // size + progress on this binary/attachment path. (The BFF sends
+    // Accept-Encoding: identity, so the no-encoding case is the norm.)
+    if (!upstream.headers.has("content-encoding")) {
+      const contentLength = upstream.headers.get("content-length");
+      if (contentLength) passthroughHeaders.set("content-length", contentLength);
+    }
     return new Response(upstream.body, { status: upstream.status, headers: passthroughHeaders });
   }
   const text = await upstream.text();
