@@ -290,10 +290,18 @@ export async function proxyRequest(
       const v = upstream.headers.get(name);
       if (v) passthroughHeaders.set(name, v);
     }
-    // Deliberately NOT forwarding content-length: undici has already
-    // decompressed upstream.body, so the upstream content-length (the
-    // COMPRESSED size) no longer matches the bytes we stream. Letting the
-    // platform frame the response (chunked) avoids a truncated/over-read body.
+    // Content-Length is safe to forward ONLY when the upstream body was not
+    // encoded. If upstream carried Content-Encoding, undici already
+    // transparently decompressed upstream.body, so the upstream length (the
+    // COMPRESSED size) no longer matches the bytes we stream — forwarding it
+    // would truncate/over-read. With no Content-Encoding the length is exact,
+    // and preserving it gives download managers / media players determinate
+    // size + progress on this binary/attachment path. (The BFF sends
+    // Accept-Encoding: identity, so the no-encoding case is the norm.)
+    if (!upstream.headers.has("content-encoding")) {
+      const contentLength = upstream.headers.get("content-length");
+      if (contentLength) passthroughHeaders.set("content-length", contentLength);
+    }
     return new Response(upstream.body, { status: upstream.status, headers: passthroughHeaders });
   }
   const text = await upstream.text();

@@ -481,6 +481,35 @@ describe("proxyRequest — never forwards a stale content-encoding", () => {
     expect(Array.from(out)).toEqual(Array.from(raw));
   });
 
+  test("binary path: a valid content-length IS forwarded when upstream was not encoded", async () => {
+    // No upstream content-encoding (the norm, since the BFF sends
+    // Accept-Encoding: identity), so the upstream content-length matches the
+    // bytes and must be preserved for download/progress metadata.
+    const raw = new Uint8Array([0x68, 0x69, 0xff, 0x0a]);
+    const fetcher = (async () =>
+      new Response(raw, {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "content-length": String(raw.byteLength)
+        }
+      })) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/uploads/y.png", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["uploads", "y.png"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBeNull();
+    expect(res.headers.get("content-length")).toBe(String(raw.byteLength));
+    const out = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(out)).toEqual(Array.from(raw));
+  });
+
   test("sends Accept-Encoding: identity on the loopback hop so the gateway skips compression", async () => {
     // Without this, undici auto-injects gzip/br and the gateway wastes CPU
     // compressing a loopback response the BFF immediately decompresses.
