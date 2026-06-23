@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { createHandler, isPairingBootstrapPath, resetPairingLimiters } from "./http";
 import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "./lib/origin-trust";
-import { createPairingRequest, mutateState } from "./state";
+import { createPairingRequest, mutateState, readState } from "./state";
 
 // The pairing rate limiters are module-level singletons shared across this
 // file's many create calls; reset their buckets before each test so tests stay
@@ -44,6 +44,7 @@ interface CallOpts {
   // Native mobile-client headers: the cookieless pairing path.
   pairClient?: string; // X-Gini-Pair-Client
   pairSecret?: string; // X-Gini-Pair-Secret
+  pairClientId?: string; // X-Gini-Client-ID (native per-install id)
   auth?: string; // Authorization: Bearer <token>
 }
 
@@ -63,6 +64,7 @@ async function pair(handler: ReturnType<typeof createHandler>, path: string, opt
   if (opts.userAgent) headers["user-agent"] = opts.userAgent;
   if (opts.pairClient) headers["x-gini-pair-client"] = opts.pairClient;
   if (opts.pairSecret) headers["x-gini-pair-secret"] = opts.pairSecret;
+  if (opts.pairClientId) headers["x-gini-client-id"] = opts.pairClientId;
   if (opts.auth) headers.authorization = `Bearer ${opts.auth}`;
   return handler(
     new Request(`http://127.0.0.1:7337${path}`, {
@@ -635,11 +637,68 @@ describe("relay session gate (web-bound branch)", () => {
   test("a valid session cookie passes the gate", async () => {
     const { handler, relay, session } = await pairedSession("gate-allow");
     const res = await pair(handler, "/", {
-      host: relay, secFetchDest: "document", cookie: `gini_session=${encodeURIComponent(session)}`
+      host: relay, secFetchDest: "document", cookie: `__Host-gini_session=${encodeURIComponent(session)}`
     });
     // Past the gate → proxyWeb fallback (no web child in tests), never 302/401.
     expect(res.status).not.toBe(302);
     expect(res.status).not.toBe(401);
+  });
+
+  test("a document navigation re-issues the session cookie so the Max-Age window slides forward", async () => {
+    const { handler, relay, session } = await pairedSession("gate-reissue");
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document", cookie: `__Host-gini_session=${encodeURIComponent(session)}`
+    });
+    // The gate re-sets the same token under the secure name with a fresh long
+    // Max-Age — so an actively-used session never hits the 400-day browser cap.
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_session="));
+    expect(cookie).toBeDefined();
+    expect(setCookieValue(res, "__Host-gini_session")).toBe(session);
+    // Exactly the 400-day cap (34560000s) — a shorter slide would still expire an
+    // active session, and a longer one is clamped by the browser anyway.
+    expect(cookie).toContain("Max-Age=34560000");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Path=/");
+  });
+
+  test("a non-document asset request does NOT re-issue the session cookie (per-asset write avoidance)", async () => {
+    const { handler, relay, session } = await pairedSession("gate-noreissue");
+    const res = await pair(handler, "/some-asset.js", {
+      host: relay, secFetchDest: "script", cookie: `__Host-gini_session=${encodeURIComponent(session)}`
+    });
+    expect(setCookieValue(res, "__Host-gini_session")).toBeUndefined();
+  });
+
+  test("a document navigation also slides the gini_client cookie forward when one is present", async () => {
+    const { handler, relay, session } = await pairedSession("gate-slide-client");
+    const clientId = "stable-client-on-nav";
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document",
+      cookie: `__Host-gini_session=${encodeURIComponent(session)}; __Host-gini_client=${encodeURIComponent(clientId)}`
+    });
+    // gini_client must slide on the SAME cadence as gini_session — otherwise a
+    // daily-active browser's client id lapses at the 400-day cap while its session
+    // slides past it, and a later re-pair mints a fresh id that fails to supersede.
+    expect(setCookieValue(res, "__Host-gini_client")).toBe(clientId);
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_client="));
+    // Same 400-day cap as the session, so the two slide in lockstep and the
+    // client id never lapses behind a slid session.
+    expect(cookie).toContain("Max-Age=34560000");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).not.toContain("Domain=");
+  });
+
+  test("a document navigation without a gini_client cookie does NOT mint one (no write-only garbage)", async () => {
+    const { handler, relay, session } = await pairedSession("gate-no-client-nav");
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document", cookie: `__Host-gini_session=${encodeURIComponent(session)}`
+    });
+    // No inbound gini_client (mid-first-pair or pre-upgrade browser) → re-issuing
+    // would mint an id no device row references. The session still slides.
+    expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    expect(setCookieValue(res, "__Host-gini_session")).toBe(session);
   });
 
   test("loopback is never gated", async () => {
@@ -863,6 +922,293 @@ describe("pairing routes — native client (mobile)", () => {
     // ...but it's the browser shape: the binding secret is cookie-only, not in the body.
     expect((await res.json()).bindSecret).toBeUndefined();
     expect(setCookieValue(res, "gini_pair")).toBeTruthy();
+  });
+});
+
+// The shared-subdomain eviction bug, exercised through the real HTTP route.
+// Two distinct browsers (or two distinct mobile installs) pairing on the SAME
+// relay subdomain with the SAME User-Agent must NOT evict each other. Identity
+// is keyed on a stable per-browser gini_client cookie (browsers) / per-install
+// X-Gini-Client-ID header (native), not the User-Agent-derived name.
+describe("pairing routes — per-browser client identity (gini_client)", () => {
+  const SAME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36";
+
+  test("a browser create issues a host-only gini_client cookie", async () => {
+    const { handler } = makeHandler("client-cookie-mint");
+    const relay = RELAY("client-cookie-mint");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: SAME_UA, body: {}
+    });
+    expect(res.status).toBe(201);
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_client="));
+    expect(cookie).toBeDefined();
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Path=/");
+    expect(cookie).toContain("SameSite=Lax");
+    // Host-only is the anti-tossing property: a Domain attribute would let a
+    // sibling relay subdomain set/override this cookie on the shared parent.
+    expect(cookie).not.toContain("Domain=");
+    // 400-day cap (RFC 6265bis): 400 * 24 * 60 * 60 = 34560000 seconds.
+    expect(cookie).toContain("Max-Age=34560000");
+    // A fresh request with no inbound gini_client mints a non-empty id.
+    expect(setCookieValue(res, "__Host-gini_client")).toBeTruthy();
+  });
+
+  test("a create that already carries gini_client reuses the value (no new id minted)", async () => {
+    const { handler } = makeHandler("client-cookie-reuse");
+    const relay = RELAY("client-cookie-reuse");
+    const existing = "client-existing-uuid";
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(existing)}`, body: {}
+    });
+    expect(res.status).toBe(201);
+    // When the browser already holds a gini_client, the server reuses it rather
+    // than minting a fresh id (so identity is stable across re-pairs). It may
+    // re-set the same value (refreshing Max-Age) or omit the Set-Cookie entirely.
+    const reissued = setCookieValue(res, "__Host-gini_client");
+    if (reissued !== undefined) expect(reissued).toBe(existing);
+  });
+
+  test("on a secure front a tossed PLAIN gini_client cookie is ignored (sibling-subdomain poisoning)", async () => {
+    // A sibling relay subdomain could set a Domain-scoped plain `gini_client` on
+    // the shared registrable domain; the browser would also send it here. Unlike
+    // gini_session (whose value is hash-validated and fails closed), the client id
+    // is used verbatim as an identity key — so honoring a tossed plain value on a
+    // secure front would let two browsers collapse to one identity. On a secure
+    // front the gateway must read ONLY __Host-gini_client and mint a fresh id when
+    // that prefixed cookie is absent, ignoring the plain fallback.
+    const { config, handler } = makeHandler("client-cookie-toss");
+    const relay = RELAY("client-cookie-toss");
+    const tossed = "attacker-seeded-shared-id";
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: SAME_UA, cookie: `gini_client=${encodeURIComponent(tossed)}`, body: {}
+    });
+    expect(created.status).toBe(201);
+    // The minted id must NOT be the tossed plain value.
+    const minted = setCookieValue(created, "__Host-gini_client");
+    expect(minted).toBeTruthy();
+    expect(minted).not.toBe(tossed);
+    // And the device that gets claimed must carry the minted id, not the tossed one.
+    const { id } = await created.json();
+    const bind = setCookieValue(created, "gini_pair")!;
+    await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      cookie: `gini_pair=${encodeURIComponent(bind)}; __Host-gini_client=${encodeURIComponent(minted!)}; gini_client=${encodeURIComponent(tossed)}`, body: {}
+    });
+    expect(claimed.status).toBe(200);
+    const device = readState(config.instance).devices.find((d) => d.status === "active")!;
+    expect(device.clientId).toBe(minted);
+    expect(device.clientId).not.toBe(tossed);
+  });
+
+  test("native create does NOT set a gini_client cookie (cookieless)", async () => {
+    const { handler } = makeHandler("client-cookie-native");
+    const relay = RELAY("client-cookie-native");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", pairClientId: "install-uuid-1",
+      userAgent: "GiniMobile/1.0 (iOS)", body: {}
+    });
+    expect(res.status).toBe(201);
+    expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    expect(setCookieValue(res, "gini_client")).toBeUndefined();
+  });
+
+  test("over a plain-http trusted front the gini_client cookie is plain-named and omits Secure", async () => {
+    // A non-relay, non-loopback GINI_TRUSTED_ORIGINS front served over plain http
+    // would have a Secure/__Host- cookie silently dropped — so the gini_client
+    // cookie uses the plain name and no Secure, mirroring gini_session/gini_pair.
+    const front = "client-front.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { handler } = makeHandler("client-cookie-plain");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, body: {}
+      });
+      expect(res.status).toBe(201);
+      const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_client="));
+      expect(cookie).toBeDefined();
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).not.toContain("Secure");
+      expect(cookie).not.toContain("__Host-");
+      // No __Host- variant is set on a plain front.
+      expect(setCookieValue(res, "__Host-gini_client")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
+  test("a plain-named gini_client cookie is read back (plain fallback) and reused on re-pair", async () => {
+    // Mirrors the secure-front reuse test but exercises clientCookieValue's plain
+    // fallback: a request carrying only the plain gini_client (no __Host-) reuses it.
+    const front = "client-front2.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { config, handler } = makeHandler("client-cookie-plain-reuse");
+      const existing = "plain-client-uuid";
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `gini_client=${encodeURIComponent(existing)}`, body: {}
+      });
+      expect(created.status).toBe(201);
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; gini_client=${encodeURIComponent(existing)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const device = readState(config.instance).devices.find((d) => d.status === "active")!;
+      expect(device.clientId).toBe(existing);
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
+  // End-to-end bug proof for browsers: two distinct browsers, same relay + same
+  // UA, distinct gini_client ids → both sessions stay active.
+  test("two distinct browsers on the same subdomain do not evict each other", async () => {
+    const { config, handler } = makeHandler("client-two-browsers");
+    const relay = RELAY("client-two-browsers");
+
+    async function pairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; __Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const devices = readState(config.instance).devices;
+      return devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const alice = await pairWithClient("client-alice");
+    const bob = await pairWithClient("client-bob");
+    expect(alice).not.toBe(bob);
+    const devices = readState(config.instance).devices;
+    // Both sessions remain active — neither evicted the other.
+    expect(devices.filter((d) => d.status === "active").length).toBe(2);
+    expect(devices.find((d) => d.id === alice)!.status).toBe("active");
+    expect(devices.find((d) => d.id === bob)!.status).toBe("active");
+  });
+
+  // The same browser re-pairing (same gini_client) still supersedes its own
+  // prior session — one active session per browser.
+  test("the same browser re-pairing supersedes its own prior session", async () => {
+    const { config, handler } = makeHandler("client-same-browser-repair");
+    const relay = RELAY("client-same-browser-repair");
+
+    async function pairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        userAgent: SAME_UA, cookie: `__Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}; __Host-gini_client=${encodeURIComponent(clientId)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      return readState(config.instance).devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const first = await pairWithClient("client-stable");
+    const second = await pairWithClient("client-stable");
+    expect(first).not.toBe(second);
+    const devices = readState(config.instance).devices;
+    expect(devices.find((d) => d.id === first)!.status).toBe("revoked");
+    expect(devices.find((d) => d.id === second)!.status).toBe("active");
+    expect(devices.filter((d) => d.status === "active").length).toBe(1);
+  });
+
+  // End-to-end bug proof for mobile: two distinct installs, same relay + same UA,
+  // distinct X-Gini-Client-ID → both sessions stay active.
+  test("two distinct mobile installs on the same subdomain do not evict each other", async () => {
+    const { config, handler } = makeHandler("client-two-mobiles");
+    const relay = RELAY("client-two-mobiles");
+
+    async function nativePairWithClient(clientId: string): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, pairClient: "native", pairClientId: clientId,
+        userAgent: "GiniMobile/1.0 (iOS)", body: {}
+      });
+      const { id, bindSecret } = await created.json();
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, pairClient: "native", pairClientId: clientId, pairSecret: bindSecret, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      return readState(config.instance).devices.find((d) => d.clientId === clientId && d.status === "active")!.id;
+    }
+
+    const phoneA = await nativePairWithClient("install-aaaa");
+    const phoneB = await nativePairWithClient("install-bbbb");
+    expect(phoneA).not.toBe(phoneB);
+    const devices = readState(config.instance).devices;
+    expect(devices.filter((d) => d.status === "active").length).toBe(2);
+  });
+
+  // A native client that sends NO X-Gini-Client-ID (an older mobile build, or one
+  // whose id hasn't primed yet) must keep the legacy origin+name supersede: the
+  // gateway must NOT mint a throwaway server-side clientId the cookieless client
+  // can never echo back, or a re-pair would stack a second active session forever.
+  test("a header-less native re-pair still supersedes its prior session (legacy origin+name)", async () => {
+    const { config, handler } = makeHandler("client-native-noheader");
+    const relay = RELAY("client-native-noheader");
+
+    async function nativePairNoHeader(): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, pairClient: "native", userAgent: "GiniMobile/1.0 (iOS)", body: {}
+      });
+      const { id, bindSecret } = await created.json();
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, pairClient: "native", pairSecret: bindSecret, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const { devices } = readState(config.instance);
+      return devices.find((d) => d.status === "active")!.id;
+    }
+
+    const first = await nativePairNoHeader();
+    const second = await nativePairNoHeader();
+    expect(first).not.toBe(second);
+    const devices = readState(config.instance).devices;
+    // No clientId was minted onto either device — identity falls back to origin+name.
+    expect(devices.find((d) => d.id === second)!.clientId).toBeUndefined();
+    expect(devices.find((d) => d.id === first)!.status).toBe("revoked");
+    expect(devices.find((d) => d.id === second)!.status).toBe("active");
+    expect(devices.filter((d) => d.status === "active").length).toBe(1);
   });
 });
 

@@ -216,7 +216,10 @@ describe("claimPairingRequest", () => {
     expect(result.device.status).toBe("active");
     expect(result.device.origin).toBe(request.relayHost);
     expect(result.device.userAgent).toBe(SAFARI_IPHONE);
-    expect(result.device.expiresAt).toBeDefined();
+    // A paired session never expires on its own — it lives until the operator
+    // revokes it (the same no-expiry contract as code-claimed bearer devices), so
+    // no expiresAt is stamped.
+    expect(result.device.expiresAt).toBeUndefined();
     expect(state.devices[0]?.id).toBe(result.device.id);
     const stored = state.pairingRequests.find((r) => r.id === request.id)!;
     expect(stored.status).toBe("claimed");
@@ -260,6 +263,15 @@ describe("findActiveSessionByToken / touchSessionLastSeen", () => {
     expect(found?.id).toBe(device.id);
     // read-only: lastSeenAt is untouched
     expect(state.devices[0]?.lastSeenAt).toBe(before);
+  });
+
+  test("a freshly-claimed session has no expiry and never times out on its own", () => {
+    const { state, token, device } = mintSession();
+    // No expiresAt was stamped — the session lives until manual revoke.
+    expect(device.expiresAt).toBeUndefined();
+    // The defensive expiry guard is a no-op for an expiry-less row, so the
+    // session resolves no matter how much wall-clock time has passed.
+    expect(findActiveSessionByToken(state, token)?.id).toBe(device.id);
   });
 
   test("returns undefined for an unknown token", () => {
@@ -556,15 +568,21 @@ describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
     };
   }
 
-  test("keys on origin + name", () => {
-    expect(pairedDeviceIdentityKey(device({}))).toBe(`${RELAY_A}\nChrome · Mac`);
+  test("a legacy (no clientId) device keys on origin + name in the name: namespace", () => {
+    expect(pairedDeviceIdentityKey(device({}))).toBe(`${RELAY_A}\nname:Chrome · Mac`);
+  });
+
+  test("a device with a clientId keys on origin + clientId in the client: namespace", () => {
+    expect(pairedDeviceIdentityKey(device({ clientId: "client-123" }))).toBe(`${RELAY_A}\nclient:client-123`);
   });
 
   test("an originless device (legacy code-claimed bearer) keys to null", () => {
     expect(pairedDeviceIdentityKey(device({ origin: undefined }))).toBeNull();
+    // Even with a clientId, no origin means no key (originless bearer stays exempt).
+    expect(pairedDeviceIdentityKey(device({ origin: undefined, clientId: "client-123" }))).toBeNull();
   });
 
-  test("same origin + same name match; differing origin OR name do not", () => {
+  test("legacy rows: same origin + same name match; differing origin OR name do not", () => {
     expect(isSamePairedDevice(device({}), device({ id: "device_y" }))).toBe(true);
     expect(isSamePairedDevice(device({}), device({ origin: RELAY_B }))).toBe(false);
     expect(isSamePairedDevice(device({}), device({ name: "Safari · iPhone" }))).toBe(false);
@@ -572,6 +590,29 @@ describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
 
   test("two originless devices never match (null key is not equal to null key)", () => {
     expect(isSamePairedDevice(device({ origin: undefined }), device({ origin: undefined }))).toBe(false);
+  });
+
+  // Two DISTINCT browsers on the same relay subdomain produce the same
+  // User-Agent-derived name ("Chrome · Mac") but each holds its own per-browser
+  // gini_client id (clientId). They must NOT be treated as the same device, so a
+  // re-pair by one never evicts the other on a shared subdomain.
+  test("same origin + same name but DIFFERENT clientId are NOT the same device", () => {
+    const browserA = device({ id: "device_a", clientId: "client-aaaa" });
+    const browserB = device({ id: "device_b", clientId: "client-bbbb" });
+    expect(isSamePairedDevice(browserA, browserB)).toBe(false);
+    expect(pairedDeviceIdentityKey(browserA)).not.toBe(pairedDeviceIdentityKey(browserB));
+  });
+
+  test("same origin + same clientId ARE the same device (own re-pair still supersedes)", () => {
+    const before = device({ id: "device_old", clientId: "client-same" });
+    const after = device({ id: "device_new", clientId: "client-same" });
+    expect(isSamePairedDevice(before, after)).toBe(true);
+  });
+
+  test("a clientId-bearing row and a legacy (no clientId) row never match, even same origin+name", () => {
+    const legacy = device({ id: "device_legacy", clientId: undefined });
+    const modern = device({ id: "device_modern", clientId: "client-xyz" });
+    expect(isSamePairedDevice(legacy, modern)).toBe(false);
   });
 });
 

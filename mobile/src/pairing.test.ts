@@ -67,6 +67,41 @@ describe("create", () => {
     expect(calls[0]!.init.body).toBe(JSON.stringify({ deviceName: "iPhone 16 Pro" }));
   });
 
+  test("attaches the per-install X-Gini-Client-ID header when an id is available", async () => {
+    const { fn, calls } = fakeFetch(() => ({
+      status: 201,
+      body: { id: "preq_1", code: "123-456", bindSecret: "deadbeef" }
+    }));
+    const client = createPairingClient(RELAY, fn, () => "install-uuid-42");
+    await client.create();
+    expect(headerOf(calls[0]!.init, "x-gini-client-id")).toBe("install-uuid-42");
+  });
+
+  test("omits the client-id header when none is primed yet", async () => {
+    const { fn, calls } = fakeFetch(() => ({
+      status: 201,
+      body: { id: "preq_1", code: "123-456", bindSecret: "deadbeef" }
+    }));
+    const client = createPairingClient(RELAY, fn, () => null);
+    await client.create();
+    expect(headerOf(calls[0]!.init, "x-gini-client-id")).toBeUndefined();
+  });
+
+  test("the client-id header rides poll, claim, and cancel too (every native call)", async () => {
+    const { fn, calls } = fakeFetch((url) => {
+      if (url.endsWith("/claim")) return { status: 200, body: { token: "gini_device_x" } };
+      if (url.endsWith("/cancel")) return { status: 200, body: { ok: true } };
+      return { status: 200, body: { status: "pending" } };
+    });
+    const client = createPairingClient(RELAY, fn, () => "install-uuid-42");
+    await client.poll("preq_1", "secret");
+    await client.claim("preq_1", "secret");
+    await client.cancel("preq_1", "secret");
+    for (const call of calls) {
+      expect(headerOf(call.init, "x-gini-client-id")).toBe("install-uuid-42");
+    }
+  });
+
   test("throws on a malformed create response", async () => {
     const { fn } = fakeFetch(() => ({ status: 201, body: { id: "preq_1", code: "123-456" } }));
     await expect(createPairingClient(RELAY, fn).create()).rejects.toThrow(PairingError);

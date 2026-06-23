@@ -26,7 +26,7 @@ import {
   now,
   PairingCapExceededError,
   readState,
-  SESSION_TTL_MS,
+  SESSION_COOKIE_MAX_AGE_MS,
   unreadCountsByDevice,
   readTrace,
   readUpload,
@@ -2412,6 +2412,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // device-pairing-auth.md ("Relay sessions mirror loopback").
     const webHost = request.headers.get("host") ?? url.host;
     let gatedSessionToken: string | undefined;
+    let reissueSessionDocumentNav = false;
     if (relaySessionGateRequired(webHost, url.pathname)) {
       const sessionToken = sessionCookieValue(request);
       if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
@@ -2426,6 +2427,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // global unhandledRejection handler, which exits the gateway process.
       if (request.headers.get("sec-fetch-dest") === "document") {
         void touchPairedSession(config, sessionToken).catch(() => {});
+        // Re-issue the session cookie on each document navigation so an active
+        // session slides its Max-Age window forward. The server session never
+        // expires (no expiresAt), but browsers cap a persistent cookie at 400
+        // days (RFC 6265bis), so without this slide a daily user would still be
+        // bounced to /pair exactly 400 days after first pairing — expiry in all
+        // but name. Sliding on the same cadence as touchPairedSession keeps an
+        // in-use session's cookie effectively permanent; only a session left
+        // untouched for 400 continuous days drops its cookie.
+        reissueSessionDocumentNav = true;
       }
       // Carry the validated token into proxyWeb so a long-lived SSE stream can be
       // re-validated and torn down if this session is revoked mid-stream — the
@@ -2433,7 +2443,39 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // would outlive a revocation. Loopback (un-gated) needs no such check.
       gatedSessionToken = sessionToken;
     }
-    return proxyWeb(request, url, config, gatedSessionToken);
+    const proxied = await proxyWeb(request, url, config, gatedSessionToken);
+    if (reissueSessionDocumentNav && gatedSessionToken) {
+      const secure = pairingCookieSecure(request, webHost);
+      const refreshed = new Headers(proxied.headers);
+      refreshed.append(
+        "set-cookie",
+        serializeCookie(sessionCookieName(secure), gatedSessionToken, {
+          ...sessionCookieAttributes,
+          secure,
+          maxAge: SESSION_COOKIE_TTL_SECONDS
+        })
+      );
+      // Slide gini_client on the SAME cadence as the session — but only when the
+      // browser already holds one. Both cookies share the 400-day cap, yet the
+      // session slides on navigation while a fixed-lifetime gini_client would
+      // lapse at day 400 for a daily-active browser that never re-pairs; a later
+      // re-pair would then mint a fresh clientId and fail to supersede the slid
+      // session. Re-issuing only when a value is present avoids minting a
+      // write-only id for a mid-first-pair or pre-upgrade browser that sent none.
+      const clientId = clientCookieValue(request, secure);
+      if (clientId) {
+        refreshed.append(
+          "set-cookie",
+          serializeCookie(clientCookieName(secure), clientId, {
+            ...sessionCookieAttributes,
+            secure,
+            maxAge: CLIENT_COOKIE_TTL_SECONDS
+          })
+        );
+      }
+      return new Response(proxied.body, { status: proxied.status, statusText: proxied.statusText, headers: refreshed });
+    }
+    return proxied;
   };
 
   return async (request: Request) => {
@@ -3191,6 +3233,19 @@ const PAIR_BIND_COOKIE = "gini_pair";
 export const SESSION_COOKIE = "gini_session";
 const SESSION_COOKIE_SECURE = `__Host-${SESSION_COOKIE}`;
 
+// Stable per-browser id cookie. Unlike gini_session (which a re-pair re-mints) it
+// persists across re-pairs, so device identity can key on it instead of the
+// fuzzy User-Agent label — two distinct browsers on one relay subdomain with the
+// same User-Agent then no longer evict each other on re-pair. It mirrors
+// gini_session, NOT gini_pair: it is durable and Path=/ (the `__Host-` prefix
+// mandates Path=/, which gini_pair's /api/pairing scope can't use). It carries no
+// secret — only an opaque dedup id — so it is not a credential; the gini_session
+// token remains the entire access decision.
+const CLIENT_COOKIE = "gini_client";
+const CLIENT_COOKIE_SECURE = `__Host-${CLIENT_COOKIE}`;
+// Native (cookieless) clients send the same id in this header instead.
+const CLIENT_ID_HEADER = "x-gini-client-id";
+
 // The session cookie NAME to issue: `__Host-`-prefixed on a secure front (so a
 // sibling-subdomain Domain cookie can't toss it), plain otherwise.
 function sessionCookieName(secure: boolean): string {
@@ -3204,15 +3259,48 @@ export function sessionCookieValue(request: Request): string | undefined {
   return cookieValue(request, SESSION_COOKIE_SECURE) ?? cookieValue(request, SESSION_COOKIE);
 }
 
+// The client-id cookie NAME to issue: `__Host-`-prefixed on a secure front,
+// plain otherwise. Mirrors sessionCookieName so the two stay in lockstep.
+function clientCookieName(secure: boolean): string {
+  return secure ? CLIENT_COOKIE_SECURE : CLIENT_COOKIE;
+}
+
+// Read the per-browser client id. On a secure front read ONLY the un-tossable
+// `__Host-gini_client` — NOT the plain name. Unlike gini_session (whose value is
+// hash-validated and fails closed on a tossed value), the client id is used
+// verbatim as an identity key with no server-side check, so honoring a plain
+// `gini_client` that a sibling subdomain tossed onto the shared registrable domain
+// would let two browsers collapse to one identity (the very eviction this guards
+// against). On a secure front the gateway only ever issues the `__Host-` name, so
+// dropping the plain fallback loses nothing legitimate. The plain name is read
+// only on a plain-http front, which can't use `__Host-` at all.
+export function clientCookieValue(request: Request, secure: boolean): string | undefined {
+  if (secure) return cookieValue(request, CLIENT_COOKIE_SECURE);
+  return cookieValue(request, CLIENT_COOKIE);
+}
+
 // Gateway-owned cookies that must never reach the inner web child: it is
 // relay-agnostic and authenticates via the BFF's owner bearer, never these, so
 // stripping them (in proxyWeb) keeps the pairing credentials from crossing into
-// the inner app. Both session cookie names are stripped.
-const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, SESSION_COOKIE_SECURE, PAIR_BIND_COOKIE]);
-// Derived from the single source of truth so the cookie Max-Age and the
-// server-side device.expiresAt can't drift apart.
-const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
+// the inner app. Both session and client cookie names are stripped.
+const GATEWAY_ONLY_COOKIES = new Set([
+  SESSION_COOKIE,
+  SESSION_COOKIE_SECURE,
+  PAIR_BIND_COOKIE,
+  CLIENT_COOKIE,
+  CLIENT_COOKIE_SECURE
+]);
+// `gini_session` cookie Max-Age, pinned to the browser-max 400 days (the server
+// session itself never expires; see SESSION_COOKIE_MAX_AGE_MS). Re-issued on each
+// document navigation so an active session's window slides forward.
+const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_COOKIE_MAX_AGE_MS / 1000);
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
+// The client id must live at least as long as the session it identifies, so it
+// shares the session cookie's 400-day browser-max lifetime. A shorter lifetime
+// would let gini_client lapse while a still-alive session slides past it (the
+// session cookie is re-issued on navigation), after which a re-pair would mint a
+// fresh clientId and fail to supersede the prior session — a stale duplicate.
+const CLIENT_COOKIE_TTL_SECONDS = SESSION_COOKIE_TTL_SECONDS;
 // Flood control on the public create endpoint. Keyed on the inbound Host (the
 // relay subdomain is un-forgeable — the relay owns its DNS), NOT on
 // X-Forwarded-For, which a client can spoof to mint fresh buckets. A separate
@@ -3458,13 +3546,27 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     // "Unknown device". Absent/blank → undefined, and the state layer falls back
     // to the User-Agent-derived label.
     const deviceName = sanitizeDeviceName((await body(request)).deviceName);
+    // The stable per-browser/per-install id. A browser already paired here re-sends
+    // its gini_client cookie (reused as-is so identity is stable across re-pairs);
+    // a first-time browser sends none, so the gateway mints one and persists it as
+    // the cookie below (always a string for the browser path). A native client owns
+    // its id locally and sends it in the X-Gini-Client-ID header — the gateway must
+    // NEVER mint one for native: a server-minted id is write-only to a cookieless
+    // client (it can't be echoed back), so each re-pair would get a fresh id and
+    // stack a second active session. A native client with no header therefore gets
+    // clientId=undefined and keeps the legacy origin+name supersede. An empty
+    // header/cookie is treated as absent.
+    const cookieSecure = pairingCookieSecure(request, host);
+    const browserClientId = clientCookieValue(request, cookieSecure) || randomBindSecret();
+    const clientId = native ? request.headers.get(CLIENT_ID_HEADER) || undefined : browserClientId;
     let created: Awaited<ReturnType<typeof requestPairing>>;
     try {
       created = await requestPairing(config, {
         userAgent: request.headers.get("user-agent") ?? "",
         relayHost: host,
         bindSecret,
-        deviceName
+        deviceName,
+        clientId
       });
     } catch (error) {
       // Cap enforced atomically inside the create mutation.
@@ -3481,12 +3583,23 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       201
     );
     if (!native) {
+      const secure = cookieSecure;
       response.headers.append(
         "set-cookie",
         serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
           ...bindCookieAttributes,
-          secure: pairingCookieSecure(request, host),
+          secure,
           maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
+        })
+      );
+      // Persist the per-browser id (minted fresh or refreshing an existing one's
+      // Max-Age). Native clients own their id locally and stay cookieless.
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(clientCookieName(secure), browserClientId, {
+          ...sessionCookieAttributes,
+          secure,
+          maxAge: CLIENT_COOKIE_TTL_SECONDS
         })
       );
     }

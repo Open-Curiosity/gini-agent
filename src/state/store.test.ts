@@ -1187,6 +1187,55 @@ describe("dedupeStaleDeviceSessions (stale-duplicate session backfill)", () => {
       twice.audit.filter((e) => e.evidence?.reason === "stale.duplicate.session.backfill").length
     ).toBe(1);
   });
+
+  // At the migration layer: two DISTINCT browsers on one relay subdomain share
+  // the same User-Agent-derived name but each carries its own gini_client id
+  // (clientId). The migration must key on clientId and leave both live sessions
+  // active rather than collapsing one person's session into the other's.
+  test("keeps two distinct browsers (same origin+name, different clientId) both active", () => {
+    const state = createEmptyState("dedupe-distinct-clients");
+    pushDevice(state, { id: "device_alice", clientId: "client-alice", lastSeenAt: "2026-06-10T00:00:00.000Z" });
+    pushDevice(state, { id: "device_bob", clientId: "client-bob", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.every((d) => d.status === "active")).toBe(true);
+    expect(normalized.audit.some((e) => e.evidence?.reason === "stale.duplicate.session.backfill")).toBe(false);
+  });
+
+  test("still collapses one browser's re-pairs (same origin + same clientId)", () => {
+    const state = createEmptyState("dedupe-same-client");
+    pushDevice(state, { id: "device_repair_1", clientId: "client-x", lastSeenAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_repair_2", clientId: "client-x", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.find((d) => d.id === "device_repair_2")!.status).toBe("active");
+    expect(normalized.devices.find((d) => d.id === "device_repair_1")!.status).toBe("revoked");
+    expect(normalized.devices.filter((d) => d.status === "active").length).toBe(1);
+  });
+
+  test("legacy rows without clientId still collapse by name (back-compat)", () => {
+    const state = createEmptyState("dedupe-legacy-noclient");
+    // Rows with no clientId, same origin + name, must still collapse so the
+    // stale-duplicate heal keeps working for sessions minted without a clientId.
+    pushDevice(state, { id: "device_pre_1", clientId: undefined, lastSeenAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_pre_2", clientId: undefined, lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.find((d) => d.id === "device_pre_2")!.status).toBe("active");
+    expect(normalized.devices.find((d) => d.id === "device_pre_1")!.status).toBe("revoked");
+    expect(normalized.devices.filter((d) => d.status === "active").length).toBe(1);
+  });
+
+  test("a legacy (no clientId) row and a clientId row never collapse into each other", () => {
+    const state = createEmptyState("dedupe-mixed-namespace");
+    pushDevice(state, { id: "device_legacy", clientId: undefined, lastSeenAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_modern", clientId: "client-new", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    // Different key namespaces ("name:" vs "client:") → no group of 2 → none revoked.
+    expect(normalized.devices.every((d) => d.status === "active")).toBe(true);
+    expect(normalized.audit.some((e) => e.evidence?.reason === "stale.duplicate.session.backfill")).toBe(false);
+  });
 });
 
 describe("normalizeState task.chatSessionId backfill", () => {
