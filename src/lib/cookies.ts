@@ -1,15 +1,20 @@
 // Minimal cookie parsing + Set-Cookie serialization for the gateway. The
-// gateway is otherwise bearer-only; cookies exist solely for the relay
-// device-pairing session (gini_session) and the per-request binding secret
-// (gini_pair). Kept dependency-free and side-effect-free so it is trivially
+// gateway is otherwise bearer-only; cookies exist for the relay device-pairing
+// session (gini_session), the per-request binding secret (gini_pair), and the
+// per-browser client-id (gini_client) — a non-secret identity value, NOT a
+// credential. Kept dependency-free and side-effect-free so it is trivially
 // unit-tested.
 
 // Parse a `Cookie:` request header into a name→value map. Tolerates missing
 // header, stray whitespace, and `=` inside values (only the first `=` splits a
-// pair). Values are URL-decoded; names are taken verbatim. Later duplicates win
-// — safe here because the credential cookies (gini_session/gini_pair) are
-// validated against hashed server-stored secrets downstream, so a smuggled
-// duplicate can't be forged into a valid value and the gate fails closed.
+// pair). Values are URL-decoded; names are taken verbatim. Later duplicates win.
+// For the credential cookies (gini_session/gini_pair) that's safe because their
+// values are validated against hashed server-stored secrets downstream, so a
+// smuggled duplicate can't be forged into a valid value and the gate fails
+// closed. gini_client is NOT hash-validated (it's a non-secret identity key used
+// verbatim); its anti-tossing safety instead comes from the `__Host-` prefix plus
+// the secure-front no-plain-fallback read in clientCookieValue (see src/http.ts),
+// so a sibling-subdomain-tossed plain duplicate is never honored on a secure front.
 export function parseCookies(header: string | null | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!header) return out;
