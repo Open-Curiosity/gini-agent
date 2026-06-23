@@ -2305,9 +2305,9 @@ export interface PairingRequest {
   createdAt: string;
   expiresAt: string;
   resolvedAt?: string;
-  // Stable per-browser id from the gini_client cookie; survives re-pairs.
-  // Copied onto the PairedDevice on claim so device identity keys on it.
-  // Absent on legacy/mobile rows.
+  // Stable per-client id (browser gini_client cookie or native X-Gini-Client-ID
+  // header). Copied onto the PairedDevice on claim so device identity keys on it.
+  // Absent on legacy code-claimed rows and on native requests that sent no header.
   clientId?: string;
   // Set when a claim mints the session device, linking request → PairedDevice.
   deviceId?: string;
