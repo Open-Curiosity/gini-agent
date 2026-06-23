@@ -427,13 +427,18 @@ pairing screen.
   Sessions list while remaining in durable state.
 - Claiming a second session for the same `(origin, clientId)` revokes the first
   (`supersedePriorDeviceSessions`): the device's prior row reads `revoked`, the
-  new one `active`, leaving exactly one active session per browser/install. A
-  distinct `clientId` (a different browser/install), a distinct origin, or an
-  originless legacy bearer row is left active — so two distinct browsers with the
-  same User-Agent on one relay subdomain coexist. A row with no `clientId` falls
-  back to `(origin, name)` in its own namespace. `normalizeState`'s
-  `dedupeStaleDeviceSessions` collapses a pre-existing duplicate pileup to one
-  active session per identity group and is idempotent.
+  new one `active`, leaving one active session per stable `clientId`. A distinct
+  `clientId` (a different browser/install), a distinct origin, or an originless
+  legacy bearer row is left active — so two distinct browsers with the same
+  User-Agent on one relay subdomain coexist. A row with no `clientId` falls back to
+  `(origin, name)` in its own namespace. Supersession is only as stable as the
+  `clientId`: because sessions no longer expire, anything that loses the id —
+  clearing the `gini_client` cookie, a mobile reinstall, or AsyncStorage loss —
+  mints a fresh `clientId`, so the prior no-expiry row stays `active` until the
+  operator revokes it (the same operator-revocable duplicate as the migration
+  artifact above). `normalizeState`'s `dedupeStaleDeviceSessions` collapses a
+  pre-existing duplicate pileup to one active session per identity group and is
+  idempotent.
 - `/pair` renders with provider setup incomplete and emits no authenticated
   `/api/runtime/*` calls.
 - A native client (opt-in header, no `Sec-Fetch-*`) creates with no `Origin`
