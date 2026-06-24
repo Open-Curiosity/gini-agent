@@ -23,6 +23,10 @@ Gini drives this in chat; you only act at the browser steps.
 
 Your original request then resumes automatically.
 
+## Already have an OAuth client?
+
+If you already created a Desktop OAuth client (you have a **Client ID** and **Client Secret** in hand), you can skip the chat walkthrough: open the **Skills** page, find **Google Workspace setup**, and use **Enter ID & secret** to paste them directly. Gini stores them in the same encrypted secret store and then only needs to sign you in — it won't re-run project creation or API enablement. Re-running setup later is also safe: once a client is stored, Gini goes straight to signing you in.
+
 ## First-time Google Cloud users — no credit card needed
 
 You don't need a paid Google Workspace or a credit card. The Workspace APIs are free, so the project Gini creates for you has no billing attached. If you've never opened Google Cloud, its console pushes a prominent *"Start your free trial — add a card"* banner during the OAuth-client step (Step 5) — **ignore it.** You can configure the consent screen and create the OAuth client without starting the trial or entering any payment method.

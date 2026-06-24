@@ -63,9 +63,19 @@ and its secure card — so provisioning becomes "the agent asks via
 
 ## Considered alternatives
 
-- **Keep credential capture on the settings page.** Rejected: it breaks the
-  in-chat flow and is the friction this ADR removes. The `/skills` page remains
-  a fallback for when the secure card cannot render (non-web surfaces).
+- **Make the settings page the primary capture surface.** Rejected as the
+  *default*: routing every credential through a page breaks the in-chat flow and
+  is the friction this ADR removes. The `/skills` page stays available as a
+  complement — a fallback when the secure card cannot render (non-web surfaces),
+  and a deliberate manual-entry form for a registered provider whose OAuth client
+  was created out-of-band (e.g. a Google OAuth Desktop client the user already
+  holds, entered via the provider's own setup-skill card on `/skills`). It posts
+  the same `provider + secrets` shape to `POST /api/connectors` that the legacy
+  Add Connector dialog already used, so `createConnector` derives the typed
+  record's structure from the server-side provider module — no new trust seam —
+  and the secret follows the same user→BFF→gateway→encrypted-store path, never
+  reaching the model. Chat `request_connector` stays the default agent-driven
+  path.
 
 - **Let the agent collect the secret in chat and POST it to `/api/connectors`.**
   Rejected — this is the one path that leaks the secret to the model. A value on
