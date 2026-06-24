@@ -61,6 +61,11 @@ export function ManualCredentialDialog({
         return;
       }
     }
+    // Send only the provider id, the credential name, and the secrets keyed by
+    // field name. We deliberately do NOT send `type`/`metadata.envMap`:
+    // `createConnector` stamps the typed record's structure (type, name, envMap)
+    // from the server-side provider module, so the browser never shapes the
+    // stored record (ADR chat-credential-provisioning.md).
     const tmpl = provider.credentialTemplate!;
     const secrets: Record<string, string> = {};
     for (const f of provider.fields) {
@@ -70,9 +75,7 @@ export function ManualCredentialDialog({
     onSubmit({
       provider: provider.id,
       name: tmpl.name,
-      type: tmpl.type,
-      secrets,
-      metadata: tmpl.envMap ? { envMap: tmpl.envMap } : undefined
+      secrets
     });
   };
 
