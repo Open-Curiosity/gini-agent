@@ -24,7 +24,7 @@ This skill is idempotent — re-running it re-verifies the install and lets the 
 
 ## The Flow
 
-This is the **exact first-time sequence** (Step 0 short-circuits the re-auth case before you reach it). Within the first-time flow do not branch into shortcuts, do not pre-ask whether they have an existing OAuth client, do not list completed actions retrospectively. Status messages are action-oriented: what the user must do *next*.
+This is the **exact first-time sequence** (Step 0 short-circuits the already-signed-in and stored-client cases before you reach it). Within the first-time flow do not branch into shortcuts, do not pre-ask whether they have an existing OAuth client, do not list completed actions retrospectively. Status messages are action-oriented: what the user must do *next*.
 
 1. The user asks Gini to do a Workspace thing (read mail, check calendar, share a Drive file, etc.).
 2. Confirm setup with the user.
@@ -35,16 +35,22 @@ This is the **exact first-time sequence** (Step 0 short-circuits the re-auth cas
 7. After the user pastes the credentials and clicks **Save**, ask for a tag for this account and call `skill_run google-account-login`, which pops up the user's default browser for OAuth consent and registers the tagged account.
 8. After they sign in, the original ask resumes.
 
-## Step 0 — First-time or re-auth?
+## Step 0 — What state are we in?
 
-Before anything else, call `list_connectors` and look for a connector named `google-workspace-oauth`.
+There are three states. Decide which one you're in **in this order** before doing anything else — each later step is only needed when the earlier check fails. In short: **already signed in? → else is the OAuth client stored? → else obtain it.**
 
-- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6**, which now signs in by calling `skill_run google-account-login` for the relevant account. Re-auth **re-uses the expired account's existing config dir** so it keeps its id and tag — pass that account's `configDir` (and its `tag`), NOT a fresh login (which would mint a duplicate) and NOT `adopt: true` (which skips login and only works on an already-valid session):
-  - A **tagged account** (from the "Connected Google accounts" block) whose session expired → `skill_run google-account-login` with `{ tag: "<that account's tag>", configDir: "<that account's configDir from the block>" }`.
-  - The **default-dir session** (`~/.config/gws`) that has EXPIRED → `{ tag: "<its tag>", configDir: "~/.config/gws" }` (non-adopt, so it actually re-logs in).
+**(a) Already signed in.** If the user just wants to use Workspace, first check whether a registered Google account already has a live session. The "Connected Google accounts" block lists registered accounts; confirm one is valid with `gws auth status` (against that account's `configDir`) — a `token_valid: true` result means you're set. If so, **you're already set up**: skip the rest of this skill and resume the user's original ask. (If the user explicitly wants to connect *another* account, see "Adding another account later".)
 
-  Then run Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If login fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
-- **It does not exist** → true first-time setup. Continue to Step 1.
+**(b) Not signed in, but the OAuth client is already stored.** Call `list_connectors` and look for a connector named `google-workspace-oauth`. If it exists, the OAuth client is already provisioned — **skip all provisioning**: do **not** run `gcloud`, create a project, or call `request_connector`; none of it is needed again. Go straight to signing in via `skill_run google-account-login`. Which way depends on whether an account already exists:
+
+  - **An account exists but its session expired** → re-auth it by re-using its existing config dir so it keeps its id and tag — pass that account's `configDir` (and `tag`), NOT a fresh login (which would mint a duplicate) and NOT `adopt: true` (which skips login and only works on an already-valid session):
+    - A **tagged account** (from the "Connected Google accounts" block) whose session expired → `{ tag: "<that account's tag>", configDir: "<that account's configDir from the block>" }`.
+    - The **default-dir session** (`~/.config/gws`) that has EXPIRED → `{ tag: "<its tag>", configDir: "~/.config/gws" }` (non-adopt, so it actually re-logs in).
+  - **No account registered yet** — the common case when the Client ID/Secret were just entered through the Skills page's **Enter ID & secret** form (or a prior `request_connector`) but nobody has signed in — → a **fresh** login: ask the user for a tag, then call `skill_run google-account-login` with a new `{ tag }` and **no** `configDir` (this is Step 6).
+
+  Either way, finish with Step 8 (smoke test). (Edge cases: if `gws` is not on `$PATH`, run Step 2's install first, then sign in. If login fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
+
+**(c) No stored OAuth client.** True first-time setup. Continue to Step 1 to obtain the client.
 
 ## Step 1 — Confirm setup
 
@@ -354,7 +360,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 
 ## Rules
 
-1. Walk this skill end-to-end on **first-time** setup. Do not skip to `request_connector` or the `google-account-login` skill without the install + project + APIs in place. The one exception is the **re-auth** path (Step 0): when the `google-workspace-oauth` connector already exists, `skill_run google-account-login` alone is the whole job — `gcloud`, project creation, and `request_connector` are provisioning-only and must not re-run.
+1. Walk this skill end-to-end on **first-time** setup. Do not skip to `request_connector` or the `google-account-login` skill without the install + project + APIs in place. The one exception is the **stored-client** path (Step 0 (b)): when the `google-workspace-oauth` connector already exists, `skill_run google-account-login` alone is the whole job — whether re-authing an expired account or doing the first sign-in for a freshly-stored client. `gcloud`, project creation, and `request_connector` are provisioning-only and must not re-run.
 2. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password. `gcloud auth login` and the `google-account-login` script both open the default browser — wait for the command (or `skill_run`) to return.
 3. **Capture credentials through the inline form, not files.** Always use `request_connector { provider: "google-oauth-desktop" }`. Never ask the user for a path to `client_secret.json`, never write a JSON file under `~/.config/gws/`, and never `cat` or echo the credentials back into chat.
 4. **Enable all seven Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
