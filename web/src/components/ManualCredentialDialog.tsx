@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { DocReference } from "@/components/DocReference";
 import type { ProviderDescriptor } from "@/lib/queries";
 import type { CreateConnectorBody } from "@/components/AddConnectorDialog";
 
@@ -112,6 +113,20 @@ export function ManualCredentialDialog({
               ) : null}
             </div>
           ))}
+          {provider.docsUrl ? (
+            <p className="text-[11px] text-muted-foreground">
+              Don&apos;t have these yet? See{" "}
+              <DocReference url={provider.docsUrl}>
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                >
+                  how to create an OAuth client
+                </button>
+              </DocReference>
+              .
+            </p>
+          ) : null}
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
         </div>
         <DialogFooter>

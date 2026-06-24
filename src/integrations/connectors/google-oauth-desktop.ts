@@ -22,6 +22,11 @@ export const googleOauthDesktopProvider: ProviderModule = {
   label: "Google OAuth Desktop client",
   description:
     "Client ID and secret for a Desktop OAuth app in your Google Cloud project. Used by gws for Workspace API authentication.",
+  // Help page surfaced as a "how to obtain these" link under the Connect /
+  // manual-entry forms — covers creating the Desktop OAuth client in Cloud
+  // Console (Step 5) and the common pitfalls (Desktop vs Web app, no card
+  // needed). Rendered inline as a doc slide-over via DocReference.
+  docsUrl: "https://gini.lilaclabs.ai/docs/connectors/google-services/set-up",
   fields: [
     {
       // Marked secret so the request_connector dialog routes it into
