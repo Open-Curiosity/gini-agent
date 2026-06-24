@@ -121,6 +121,7 @@ import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAV
 import { isLoopbackHost, isRelayHost, isRuntimeTunnelHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
+import { signUploadParams, verifyUploadSignature } from "./lib/upload-signing";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, removePendingChatMessageById, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
@@ -155,6 +156,17 @@ const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 function maxUploadBytes(): number {
   const raw = Number(process.env.GINI_MAX_UPLOAD_BYTES);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
+// TTL (seconds) for a minted upload preview signature. Short by default so a
+// signed url that leaks into browser history / a log is dead within minutes;
+// clamped to [30s, 600s] so a caller can't request an effectively-permanent
+// url. Mirrors createPairing's ttl clamping.
+const DEFAULT_UPLOAD_SIGN_TTL_SECONDS = 300;
+function uploadSignTtlSeconds(raw: string | null): number {
+  const requested = Number(raw);
+  if (!Number.isFinite(requested) || requested <= 0) return DEFAULT_UPLOAD_SIGN_TTL_SECONDS;
+  return Math.min(600, Math.max(30, Math.floor(requested)));
 }
 
 // Extensions the browser can safely render inline (PDFs + raster images) when
@@ -486,6 +498,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (bytes.length > cap) return json({ error: "Upload too large." }, 413);
       const stored = storeUpload(config.instance, bytes, mimeType, filename);
       return json(stored, 201);
+    }],
+    // Mint a short-lived SIGNED preview url for an upload. Bearer-gated (it
+    // rides the same authorized() gate as every route), so only an already-
+    // authenticated client — e.g. the mobile app holding its device token —
+    // can presign. The response carries a relative `path` (with `?inline=1`
+    // already applied) plus the absolute `exp`; the client prepends its known
+    // gateway origin. That signed url then authorizes a header-less GET from an
+    // in-app browser until `exp`. Returns 404 for an unknown id so a signature
+    // is never minted for bytes that don't exist.
+    ["POST", /^\/api\/uploads\/([^/]+)\/sign$/, (request, params) => {
+      const id = params[0]!;
+      if (!uploadStat(config.instance, id)) return json({ error: "Upload not found" }, 404);
+      const ttlSeconds = uploadSignTtlSeconds(new URL(request.url).searchParams.get("ttl"));
+      const expUnixSeconds = Math.floor(Date.now() / 1000) + ttlSeconds;
+      const { exp, sig } = signUploadParams(config.token, id, expUnixSeconds);
+      const path = `/api/uploads/${encodeURIComponent(id)}?inline=1&exp=${exp}&sig=${sig}`;
+      return json({ path, exp });
     }],
     ["HEAD", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
       const meta = uploadStat(config.instance, params[0]);
@@ -3713,11 +3742,35 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   return json({ error: "Not found" }, 404);
 }
 
+// A GET (or HEAD) for a single upload may be authorized by a capability
+// SIGNATURE (`?exp=&sig=`) instead of a bearer, so a mobile in-app browser —
+// which can't attach the bearer header or carry the gateway cookie — can open
+// a preview url. The signature is HMAC'd with the owner config token, scoped to
+// the exact upload id in the path, and expires. It authorizes ONLY this route;
+// `authorized` falls through to it only after the bearer check fails. See
+// src/lib/upload-signing.ts and ADR outbound-chat-attachments.md.
+const UPLOAD_GET_PATH = /^\/api\/uploads\/([^/]+)$/;
+function signedUploadAccess(request: Request, config: RuntimeConfig): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  const url = new URL(request.url);
+  const match = url.pathname.match(UPLOAD_GET_PATH);
+  if (!match) return false;
+  return verifyUploadSignature(
+    config.token,
+    match[1]!,
+    url.searchParams.get("exp"),
+    url.searchParams.get("sig"),
+    Date.now()
+  );
+}
+
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
-  return authorizedBearer(config, bearer ?? undefined);
+  if (await authorizedBearer(config, bearer ?? undefined)) return true;
+  // No valid bearer — accept a scoped, unexpired upload capability signature.
+  return signedUploadAccess(request, config);
 }
 
 // Pull the bearer off a request the same way `authorized` does so

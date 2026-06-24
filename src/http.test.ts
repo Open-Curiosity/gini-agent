@@ -6530,6 +6530,91 @@ describe("GET /api/files", () => {
     expect(resolveInlineUpload("1", "application/octet-stream")).toBeNull();
   });
 
+  // A mobile in-app browser can't send the bearer header or the gateway cookie,
+  // so the app mints a short-lived SIGNED url (POST /api/uploads/:id/sign) and
+  // opens that. These pin: the mint is bearer-gated, the signed url authorizes a
+  // header-less GET, and the signature is scoped + expiring.
+  test("POST /api/uploads/:id/sign mints a signed path that authorizes a header-less GET", async () => {
+    const config = testConfig("uploads-sign-ok");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "report.pdf");
+
+    const minted = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }, config.token);
+    expect(minted.status).toBe(200);
+    const body = await minted.json();
+    expect(body.path).toContain(`/api/uploads/${ref.id}?inline=1`);
+    expect(body.path).toMatch(/[?&]exp=\d+/);
+    expect(body.path).toMatch(/[?&]sig=[0-9a-f]{64}/);
+    expect(typeof body.exp).toBe("number");
+
+    // The signed path authorizes a GET with NO Authorization header.
+    const got = await rawCall(handler, config, body.path, {});
+    expect(got.status).toBe(200);
+    expect(got.headers.get("content-type")).toBe("application/pdf");
+    expect(got.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("the mint endpoint itself still requires a bearer", async () => {
+    const config = testConfig("uploads-sign-gated");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }); // no token
+    expect(res.status).toBe(401);
+  });
+
+  test("signing an unknown upload id returns 404 (no signature for absent bytes)", async () => {
+    const config = testConfig("uploads-sign-404");
+    const handler = createHandler(config);
+    const res = await rawCall(handler, config, `/api/uploads/does-not-exist/sign`, { method: "POST" }, config.token);
+    expect(res.status).toBe(404);
+  });
+
+  test("an unsigned, unauthenticated upload GET is rejected 401", async () => {
+    const config = testConfig("uploads-sign-unsigned");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}); // no token, no sig
+    expect(res.status).toBe(401);
+  });
+
+  test("a tampered upload id on a signed url fails (signature is scoped to one id)", async () => {
+    const config = testConfig("uploads-sign-scope");
+    const handler = createHandler(config);
+    const a = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "a.pdf");
+    const b = storeUpload(config.instance, new Uint8Array([4, 5, 6]), "application/pdf", "b.pdf");
+    const minted = await rawCall(handler, config, `/api/uploads/${a.id}/sign`, { method: "POST" }, config.token);
+    const { path } = await minted.json();
+    // Swap a's id for b's id but keep a's signature → must fail.
+    const sig = new URL(`http://x${path}`).searchParams.get("sig");
+    const exp = new URL(`http://x${path}`).searchParams.get("exp");
+    const forged = `/api/uploads/${b.id}?inline=1&exp=${exp}&sig=${sig}`;
+    const res = await rawCall(handler, config, forged, {});
+    expect(res.status).toBe(401);
+  });
+
+  test("an expired signature is rejected 401", async () => {
+    const config = testConfig("uploads-sign-expired");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    // Mint with the minimum TTL clamp (30s), then forge an already-past exp by
+    // re-signing with a past timestamp using the same module the gateway uses.
+    const pastExp = Math.floor(Date.now() / 1000) - 10;
+    const { signUploadParams } = await import("./lib/upload-signing");
+    const { sig } = signUploadParams(config.token, ref.id, pastExp);
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1&exp=${pastExp}&sig=${sig}`, {});
+    expect(res.status).toBe(401);
+  });
+
+  test("a signed HEAD is also authorized (in-app browser preflight)", async () => {
+    const config = testConfig("uploads-sign-head");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "x.pdf");
+    const minted = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }, config.token);
+    const { path } = await minted.json();
+    const res = await rawCall(handler, config, path, { method: "HEAD" });
+    expect(res.status).toBe(200);
+  });
+
   // iOS AVPlayer won't start a remote audio AVURLAsset unless the server honors
   // Range requests (206 + Content-Range). These pin the range semantics of the
   // upload GET so a regression can't silently break voice-message playback.

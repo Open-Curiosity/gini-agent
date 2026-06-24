@@ -9,6 +9,8 @@ const rnShare = mock((_c: { url?: string; message?: string; title?: string }) =>
 const rnAlert = mock((_t: string, _m?: string) => {});
 const fsDownload = mock((_uri: string, dest: string) => Promise.resolve({ uri: `file://${dest}` }));
 const apiSource = mock((id: string) => ({ uri: `https://gw/api/uploads/${id}`, headers: { authorization: "Bearer real" } }));
+const apiSign = mock((id: string) => Promise.resolve(`https://gw/api/uploads/${id}?inline=1&exp=9&sig=ab`));
+const linkOpen = mock((_url: string) => {});
 mock.module("react-native", () => ({
   Platform: { OS: "ios" },
   Share: { share: rnShare },
@@ -18,10 +20,13 @@ mock.module("expo-file-system/legacy", () => ({
   cacheDirectory: "/cache/",
   downloadAsync: fsDownload
 }));
-mock.module("@/src/api", () => ({ uploadRawSource: apiSource }));
+mock.module("@/src/api", () => ({ uploadRawSource: apiSource, signUploadUrl: apiSign }));
+// linkContextMenu pulls expo-web-browser / clipboard at import; stub openLink.
+mock.module("./linkContextMenu", () => ({ openLink: linkOpen }));
 
-const { openUploadAttachment, safeAttachmentName } = await import("./uploadAttachment");
+const { openUploadAttachment, openUploadInBrowser, safeAttachmentName } = await import("./uploadAttachment");
 type UploadAttachmentDeps = import("./uploadAttachment").UploadAttachmentDeps;
+type OpenInBrowserDeps = import("./uploadAttachment").OpenInBrowserDeps;
 
 // Build a deps bundle with spies so the orchestration is exercised without the
 // native FileSystem/Share/Alert bridges. Each field is overridable per test.
@@ -142,5 +147,60 @@ describe("openUploadAttachment", () => {
     fsDownload.mockImplementationOnce(() => Promise.reject(new Error("disk full")));
     await openUploadAttachment("up_defaulterr", "guide.md");
     expect(rnAlert).toHaveBeenCalledWith("Couldn't open attachment", "disk full");
+  });
+});
+
+describe("openUploadInBrowser", () => {
+  function makeBrowserDeps(overrides: Partial<OpenInBrowserDeps> = {}): {
+    deps: OpenInBrowserDeps;
+    calls: { sign: ReturnType<typeof mock>; open: ReturnType<typeof mock>; fallback: ReturnType<typeof mock> };
+  } {
+    const sign = mock((id: string) => Promise.resolve(`https://gw/api/uploads/${id}?inline=1&exp=9&sig=ab`));
+    const open = mock((_url: string) => {});
+    const fallback = mock((_id: string, _f: string) => Promise.resolve());
+    const deps: OpenInBrowserDeps = {
+      sign: sign as unknown as OpenInBrowserDeps["sign"],
+      open,
+      fallback,
+      ...overrides
+    };
+    return { deps, calls: { sign, open, fallback } };
+  }
+
+  test("mints a signed url and opens it in the in-app browser", async () => {
+    const { deps, calls } = makeBrowserDeps();
+    await openUploadInBrowser("up_1", "report.pdf", deps);
+    expect(calls.sign).toHaveBeenCalledWith("up_1");
+    expect(calls.open).toHaveBeenCalledWith("https://gw/api/uploads/up_1?inline=1&exp=9&sig=ab");
+    expect(calls.fallback).not.toHaveBeenCalled();
+  });
+
+  test("falls back to download/share when minting fails", async () => {
+    const { deps, calls } = makeBrowserDeps({
+      sign: mock(() => Promise.reject(new Error("offline"))) as unknown as OpenInBrowserDeps["sign"]
+    });
+    await openUploadInBrowser("up_2", "report.pdf", deps);
+    expect(calls.open).not.toHaveBeenCalled();
+    expect(calls.fallback).toHaveBeenCalledWith("up_2", "report.pdf");
+  });
+
+  test("with no injected deps, the default wiring signs and opens via openLink", async () => {
+    apiSign.mockClear();
+    linkOpen.mockClear();
+    await openUploadInBrowser("up_default", "guide.md");
+    expect(apiSign).toHaveBeenCalledWith("up_default");
+    expect(linkOpen).toHaveBeenCalledWith("https://gw/api/uploads/up_default?inline=1&exp=9&sig=ab");
+  });
+
+  test("with no injected deps, a mint failure falls back to the real download path", async () => {
+    apiSign.mockImplementationOnce(() => Promise.reject(new Error("gateway 500")));
+    fsDownload.mockClear();
+    await openUploadInBrowser("up_defaulterr", "guide.md");
+    // Default fallback === openUploadAttachment → downloads with the bearer.
+    expect(fsDownload).toHaveBeenCalledWith(
+      "https://gw/api/uploads/up_defaulterr",
+      "/cache/guide.md",
+      { headers: { authorization: "Bearer real" } }
+    );
   });
 });

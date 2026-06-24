@@ -15,7 +15,7 @@ import { authHeader, uploadUrl } from "@/src/api";
 import { uploadIdFromRef } from "@/src/upload-ref";
 import { AuthedImage } from "./AuthedImage";
 import { useImagePreview } from "@/src/components/ImagePreview";
-import { openUploadAttachment } from "./uploadAttachment";
+import { openUploadInBrowser } from "./uploadAttachment";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
@@ -286,12 +286,13 @@ export const markdownRules: Record<string, RenderRule> = {
   ),
   link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
-    // A `gini-upload://<id>` link is a non-image attachment. Tapping it can't
-    // open the gateway URL in the system browser — that 401s without the
-    // bearer — so it downloads the bytes WITH the bearer and hands the local
-    // file to the OS preview/share sheet (Quick Look + "Save to Files" on
-    // iOS). Stays an inline <Text> so it can sit mid-prose where the model
-    // placed it; the filename label is recovered from the node text.
+    // A `gini-upload://<id>` link is a non-image attachment. Tapping it mints a
+    // short-lived SIGNED url server-side and opens it in the in-app browser
+    // (SFSafariViewController / Custom Tabs) — the signed url carries its own
+    // auth in the query string, so the header-less browser can load it. If
+    // minting fails it falls back to downloading the bytes with the bearer and
+    // handing them to the OS share/Quick Look sheet. Stays an inline <Text> so
+    // it can sit mid-prose; the filename label is recovered from the node text.
     const uploadId = uploadIdFromRef(href);
     if (uploadId) {
       const filename = nodeText(node).trim() || "attachment";
@@ -300,7 +301,7 @@ export const markdownRules: Record<string, RenderRule> = {
           key={node.key}
           style={styles.link}
           onPress={() => {
-            void openUploadAttachment(uploadId, filename);
+            void openUploadInBrowser(uploadId, filename);
           }}
         >
           {nonSelectable(children)}

@@ -180,19 +180,31 @@ describe("non-image attachment chip (gini-upload:// link)", () => {
     };
   }
 
-  test("tapping the chip downloads with the bearer then shares the local file (iOS)", async () => {
+  test("tapping the chip mints a signed url and opens it in the in-app browser", async () => {
     Platform.OS = "ios";
-    downloadAsync.mockClear();
-    share.mockClear();
+    openBrowserAsync.mockClear();
     const el = rule("link")(uploadLink("report.pdf"), "report.pdf", [], styles);
     expect(typeof el.props.onPress).toBe("function");
     // The chip stays a plain Text node so it can sit mid-prose.
     expect(el.type).toBe(Text);
     el.props.onPress();
-    // onPress fire-and-forgets the async open; await a tick so the download
-    // and share promises resolve before asserting.
+    // onPress fire-and-forgets the async mint+open; await a couple ticks so the
+    // sign promise resolves and openLink fires before asserting.
     await Promise.resolve();
     await Promise.resolve();
+    await Promise.resolve();
+    // signUploadUrl (mocked in chatMockSetup) returns a signed url; openLink
+    // opens it via the in-app browser (openBrowserAsync), NOT a download.
+    expect(openBrowserAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_pdf01?inline=1&exp=9999999999&sig=deadbeef"
+    );
+  });
+
+  test("openUploadAttachment (the fallback) downloads with the bearer then shares (iOS)", async () => {
+    Platform.OS = "ios";
+    downloadAsync.mockClear();
+    share.mockClear();
+    await openUploadAttachment("up_pdf01", "report.pdf");
     expect(downloadAsync).toHaveBeenCalledWith(
       "http://gw.local/api/uploads/up_pdf01",
       "/cache/report.pdf",
@@ -201,16 +213,9 @@ describe("non-image attachment chip (gini-upload:// link)", () => {
     expect(share).toHaveBeenCalledWith({ url: "/cache/report.pdf" });
   });
 
-  test("the upload chip is NOT opened in the system browser (would 401)", () => {
-    openBrowserAsync.mockClear();
-    const el = rule("link")(uploadLink("data.csv"), "data.csv", [], styles);
-    el.props.onPress();
-    expect(openBrowserAsync).not.toHaveBeenCalled();
-  });
-
-  test("a label-less upload chip downloads under the 'attachment' fallback name", async () => {
+  test("a label-less upload chip still opens (filename falls back to 'attachment')", async () => {
     Platform.OS = "ios";
-    downloadAsync.mockClear();
+    openBrowserAsync.mockClear();
     const node: Node = {
       key: "ul2",
       type: "link",
@@ -222,10 +227,9 @@ describe("non-image attachment chip (gini-upload:// link)", () => {
     el.props.onPress();
     await Promise.resolve();
     await Promise.resolve();
-    expect(downloadAsync).toHaveBeenCalledWith(
-      "http://gw.local/api/uploads/up_x",
-      "/cache/attachment",
-      { headers: { authorization: "Bearer t" } }
+    await Promise.resolve();
+    expect(openBrowserAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_x?inline=1&exp=9999999999&sig=deadbeef"
     );
   });
 

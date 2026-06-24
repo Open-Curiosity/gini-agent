@@ -132,7 +132,9 @@ mock.module("@/src/api", () => ({
   uploadRawSource: (id: string) => ({
     uri: `http://gw.local/api/uploads/${id}`,
     headers: { authorization: "Bearer t" }
-  })
+  }),
+  signUploadUrl: (id: string) =>
+    Promise.resolve(`http://gw.local/api/uploads/${id}?inline=1&exp=9999999999&sig=deadbeef`)
 }));
 
 mock.module("@/src/theme", () => ({

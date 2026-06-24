@@ -88,10 +88,24 @@ Specific choices:
   text upload previews as raw text rather than executing as a document.
   Unsafe/unknown mimes (html, svg, xml, octet-stream) ignore the flag and still
   download. The web chip opens the inline URL in a new tab (the browser's own
-  PDF/text viewer). Mobile can't open an authed URL in the system browser (no
-  bearer → 401), so its chip downloads the bytes WITH the bearer
-  (`openUploadAttachment` → `FileSystem.downloadAsync` → OS share/Quick Look
-  sheet — the same flow as the workspace-file preview's download toolbar).
+  PDF/text viewer); the BFF injects the bearer server-side so a bare URL works.
+
+- **Mobile uses a SIGNED capability URL so the chip opens the in-app browser.**
+  A mobile in-app browser (`SFSafariViewController` / Custom Tabs) can't attach
+  the bearer header — and as of iOS 11 `SFSafariViewController` shares no cookies
+  — so it can't open `/api/uploads/:id` directly. Instead the chip mints a
+  short-lived SIGNED url: `POST /api/uploads/:id/sign` (bearer-authed) returns a
+  path carrying `?inline=1&exp=&sig=`, where `sig` is `HMAC-SHA256(<id>.<exp>)`
+  keyed by the owner `config.token` (`src/lib/upload-signing.ts`). The
+  `authorized()` gate (`src/http.ts`) accepts a valid, unexpired signature as an
+  alternative to a bearer, but ONLY for a GET/HEAD of that exact upload id, so a
+  signed url authorizes one file until it expires and nothing else. The mobile
+  chip (`openUploadInBrowser`) mints then opens the signed url via the in-app
+  browser; if minting fails it falls back to the download-then-OS-share path
+  (`openUploadAttachment` → `FileSystem.downloadAsync` → Quick Look). This is an
+  S3-presigned-GET model: permission rides the url, the signing secret never
+  leaves the gateway, and `exp` (clamped to 30–600s) bounds the leak window of a
+  url that lands in browser history or a log.
 
 - **Reuse the upload store + `GET /api/uploads/:id`.** No new media endpoint.
   Bytes are stored via `storeUpload` and served from the existing route. The blob
@@ -157,6 +171,11 @@ Specific choices:
   previewable), while an SVG/HTML upload keeps `content-disposition: attachment`.
 - A promoted `text/markdown` upload (blob on disk as `<id>.md`) is served, not
   404'd — the reader resolves the blob despite the `extensionFor` mismatch.
+- `POST /api/uploads/:id/sign` (bearer-authed) returns a signed `?inline=1&exp=&sig=`
+  path; a GET of that path with NO bearer returns 200 inline, while an unsigned
+  bearer-less GET, an expired signature, a sig for a different id, and an
+  unauthenticated mint all return 401. The mobile chip mints then opens the
+  signed url in the in-app browser.
 - The Telegram mirror sends the image as a photo and strips the tag from the
   text; a `[SILENT]` turn sends nothing.
 - 100% line/function coverage on every touched source file.

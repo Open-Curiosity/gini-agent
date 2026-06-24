@@ -313,6 +313,28 @@ export function uploadRawSource(id: string): { uri: string; headers: Record<stri
   };
 }
 
+// Mint a short-lived SIGNED preview url for an upload and return the absolute
+// url. The mint POST is bearer-authed (via api()); the returned url carries
+// `?inline=1&exp=&sig=` so a header-less in-app browser (SFSafariViewController
+// / Custom Tabs, which can't send the bearer) can open the preview directly.
+// The signing happens server-side — the secret never reaches the client. The
+// gateway returns a relative `path`; we prepend the resolved origin so the url
+// is absolute for the browser.
+export async function signUploadUrl(id: string): Promise<string> {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  // api() prepends `${origin}/api`, so the path passed here omits the `/api`
+  // prefix (mirrors fetchWorkspaceFile). The gateway's response `path` IS
+  // already absolute-from-root (`/api/uploads/...`), so it's joined to the bare
+  // origin, not the /api-prefixed base.
+  const { path } = await api<{ path: string; exp: number }>(
+    `/uploads/${encodeURIComponent(id)}/sign`,
+    { method: "POST" }
+  );
+  return `${parsed.origin}${path}`;
+}
+
 // A workspace file read via GET /api/files. `content` is the utf8 text (null
 // for binary files); `truncated` is set when the file exceeds the gateway's
 // read cap. Mirrors web/src/lib/api.ts's WorkspaceFile.

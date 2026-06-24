@@ -1,6 +1,7 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { Alert, Platform, Share, type ShareContent } from "react-native";
-import { uploadRawSource } from "@/src/api";
+import { signUploadUrl, uploadRawSource } from "@/src/api";
+import { openLink } from "./linkContextMenu";
 
 // Tapping a non-image attachment chip (a `gini-upload://<id>` markdown LINK)
 // must open the file as a preview. The system browser can't attach the bearer
@@ -57,5 +58,38 @@ export async function openUploadAttachment(
     }
   } catch (err) {
     deps.alert("Couldn't open attachment", err instanceof Error ? err.message : String(err));
+  }
+}
+
+// Deps for the in-app-browser open path. Split from UploadAttachmentDeps so the
+// browser path can be unit-tested without the download/share bridges.
+export interface OpenInBrowserDeps {
+  sign: typeof signUploadUrl;
+  open: (url: string) => void;
+  fallback: (uploadId: string, filename: string) => Promise<void>;
+}
+
+const defaultBrowserDeps = (): OpenInBrowserDeps => ({
+  sign: signUploadUrl,
+  open: (url) => openLink(url),
+  fallback: (uploadId, filename) => openUploadAttachment(uploadId, filename)
+});
+
+// Preferred tap action for a non-image attachment chip: mint a short-lived
+// SIGNED url server-side, then open it in the in-app browser
+// (SFSafariViewController / Custom Tabs). The signed url carries its own auth
+// in the query string, so the header-less in-app browser can load it. If
+// minting fails (offline, gateway error), fall back to the
+// download-then-OS-share path so a tap never silently does nothing.
+export async function openUploadInBrowser(
+  uploadId: string,
+  filename: string,
+  deps: OpenInBrowserDeps = defaultBrowserDeps()
+): Promise<void> {
+  try {
+    const url = await deps.sign(uploadId);
+    deps.open(url);
+  } catch {
+    await deps.fallback(uploadId, filename);
   }
 }
