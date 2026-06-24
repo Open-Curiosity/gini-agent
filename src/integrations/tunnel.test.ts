@@ -251,7 +251,8 @@ describe("tunnel integration", () => {
     "GINI_TUNNEL_RESUME_POLL_MS",
     "GINI_TUNNEL_RECONNECT_MAX_ATTEMPTS",
     "GINI_TUNNEL_RECONNECT_BASE_MS",
-    "GINI_TUNNEL_RECONNECT_MAX_MS"
+    "GINI_TUNNEL_RECONNECT_MAX_MS",
+    "GINI_RELAY_PROVISIONED"
   ] as const;
   let prevEnv: Record<string, string | undefined> = {};
 
@@ -396,6 +397,43 @@ describe("tunnel integration", () => {
     expect(settled.status).toBe("connected");
     expect(settled.url).toBe("https://subdom7.relay.test");
     expect(opened).toEqual(["https://relay.test/consent?x=1"]);
+  });
+
+  // A fresh login with GINI_RELAY_PROVISIONED set requests the Workspace
+  // services, so the relay can capture a Calendar/Gmail grant in one consent.
+  test("connectTunnel requests Workspace services on a fresh login when provisioned", async () => {
+    process.env.GINI_RELAY_PROVISIONED = "true"; // restored in afterEach
+    let seen: string[] | undefined = ["sentinel"];
+    setTunnelDeps(
+      depsLogin({
+        loginUrl: (deps) => {
+          seen = deps.services;
+          return Promise.resolve(fakeLoginHandle());
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(seen).toEqual(["calendar", "gmail"]);
+  });
+
+  // Without the flag, a fresh login is identity-only: no services field, so the
+  // relay request is byte-for-byte the prior behavior.
+  test("connectTunnel omits services on a fresh login when not provisioned", async () => {
+    let seen: string[] | undefined = ["sentinel"];
+    setTunnelDeps(
+      depsLogin({
+        loginUrl: (deps) => {
+          seen = deps.services;
+          return Promise.resolve(fakeLoginHandle());
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(seen).toBeUndefined();
   });
 
   // A stored session the relay rejects (revoked) -> connect self-heals by

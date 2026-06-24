@@ -29,7 +29,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "croner": "^10.0.1",
-    "gini-relay": "git+ssh://git@github.com/Lilac-Labs/gini-relay.git#e7418bf0bec0ea1a8fa92e99d78a2daba79e33ae",
+    "gini-relay": "git+ssh://git@github.com/Lilac-Labs/gini-relay.git#ec1fb7bc87082ea49b7bd4135e5d9b3c2ffb2318",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^6.0.227",
     "playwright-core": "^1.61.0",

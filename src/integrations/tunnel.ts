@@ -1514,6 +1514,22 @@ async function runManualConnect(
 //                  guard a fresh connect uses), so it still verifies the port —
 //                  it just loses the no-web-wait fast path. Tests omit it (or
 //                  point the port off config.port) to drive that probe path.
+// Workspace services a provisioned relay login requests extra Google scopes for.
+// The relay validates each name against its own allowlist (and its Google app
+// must be verified for the scope), so this list is a request, not a guarantee.
+const RELAY_PROVISIONED_SERVICES = ["calendar", "gmail"] as const;
+
+// When GINI_RELAY_PROVISIONED is truthy, a FRESH relay login also requests the
+// Workspace scopes above so the captured grant can drive gws — no separate
+// browser consent. Unset/blank (the default) yields an identity-only login,
+// byte-for-byte today's behavior, so existing tunnels are unaffected. Read at
+// call time so a test (or an operator toggling the env) sees the current value.
+function relayProvisionedServices(): string[] {
+  const raw = (process.env.GINI_RELAY_PROVISIONED ?? "").trim().toLowerCase();
+  const enabled = raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+  return enabled ? [...RELAY_PROVISIONED_SERVICES] : [];
+}
+
 async function runConnect(
   config: RuntimeConfig,
   provider: TunnelProviderId,
@@ -1630,10 +1646,14 @@ async function runConnect(
         appendLog(config.instance, "tunnel.resume.no_session", { provider });
         return;
       }
+      const services = relayProvisionedServices();
       const handle = await deps.loginUrl({
         store,
         relayUrl: relay.relayUrl,
-        loopbackPorts: relay.loopbackPorts
+        loopbackPorts: relay.loopbackPorts,
+        // Only set when provisioning is on, so an unprovisioned login's request
+        // is unchanged (the relay treats absent and empty identically).
+        ...(services.length > 0 ? { services } : {})
       });
       // teardown may have landed during loginUrl's await — cancel the freshly
       // minted login (tears down its loopback) instead of opening the browser.
