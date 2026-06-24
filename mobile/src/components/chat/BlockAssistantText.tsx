@@ -15,6 +15,7 @@ import { authHeader, uploadUrl } from "@/src/api";
 import { uploadIdFromRef } from "@/src/upload-ref";
 import { AuthedImage } from "./AuthedImage";
 import { useImagePreview } from "@/src/components/ImagePreview";
+import { openUploadAttachment } from "./uploadAttachment";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
@@ -141,6 +142,15 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
+// Collect the visible text of a markdown node's subtree. Used to recover the
+// chip label (the filename in `[report.pdf](gini-upload://id)`) from a link
+// node so the downloaded attachment gets a sensible filename for the OS
+// preview/share sheet.
+function nodeText(node: MarkdownNode): string {
+  if (node.content) return node.content;
+  return (node.children ?? []).map(nodeText).join("");
+}
+
 // Walk an AST node's subtree for an inline, *interactive* `link`. markdown-it
 // (with `linkify`) collapses `link_open`/`link_close` into a node of type
 // `link`, covering both `[label](url)` and bare autolinked URLs. Only http(s)
@@ -276,16 +286,22 @@ export const markdownRules: Record<string, RenderRule> = {
   ),
   link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
-    // A `gini-upload://<id>` link is a non-image attachment — tapping it opens
-    // the upload (image preview) rather than a web browser. Render it as an
-    // interactive chip-style link.
+    // A `gini-upload://<id>` link is a non-image attachment. Tapping it can't
+    // open the gateway URL in the system browser — that 401s without the
+    // bearer — so it downloads the bytes WITH the bearer and hands the local
+    // file to the OS preview/share sheet (Quick Look + "Save to Files" on
+    // iOS). Stays an inline <Text> so it can sit mid-prose where the model
+    // placed it; the filename label is recovered from the node text.
     const uploadId = uploadIdFromRef(href);
     if (uploadId) {
+      const filename = nodeText(node).trim() || "attachment";
       return (
         <Text
           key={node.key}
           style={styles.link}
-          onPress={() => openLink(uploadUrl(uploadId))}
+          onPress={() => {
+            void openUploadAttachment(uploadId, filename);
+          }}
         >
           {nonSelectable(children)}
         </Text>

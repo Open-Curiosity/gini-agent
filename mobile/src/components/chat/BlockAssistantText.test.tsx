@@ -4,11 +4,14 @@ import { createElement } from "react";
 // the components under test are imported. The same mocks are used by
 // linkContextMenu.test so the two files can run in one process.
 import {
+  alert,
+  downloadAsync,
   effectCleanups,
   loopStart,
   loopStop,
   openBrowserAsync,
   Platform,
+  share,
   Text,
   TextInput,
   View
@@ -16,6 +19,9 @@ import {
 
 const { markdownRules, BlockAssistantText } = await import(
   "@/src/components/chat/BlockAssistantText"
+);
+const { openUploadAttachment } = await import(
+  "@/src/components/chat/uploadAttachment"
 );
 const { SelectableBlockText } = await import(
   "@/src/components/chat/SelectableBlockText"
@@ -160,6 +166,96 @@ describe("link tap and long-press wiring", () => {
       expect(el.props.onPress).toBeUndefined();
       expect(el.props.onLongPress).toBeUndefined();
     }
+  });
+});
+
+describe("non-image attachment chip (gini-upload:// link)", () => {
+  function uploadLink(label: string): Node {
+    return {
+      key: "ul",
+      type: "link",
+      content: "",
+      attributes: { href: "gini-upload://up_pdf01" },
+      children: [{ key: "t", type: "text", content: label, children: [] }]
+    };
+  }
+
+  test("tapping the chip downloads with the bearer then shares the local file (iOS)", async () => {
+    Platform.OS = "ios";
+    downloadAsync.mockClear();
+    share.mockClear();
+    const el = rule("link")(uploadLink("report.pdf"), "report.pdf", [], styles);
+    expect(typeof el.props.onPress).toBe("function");
+    // The chip stays a plain Text node so it can sit mid-prose.
+    expect(el.type).toBe(Text);
+    el.props.onPress();
+    // onPress fire-and-forgets the async open; await a tick so the download
+    // and share promises resolve before asserting.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(downloadAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_pdf01",
+      "/cache/report.pdf",
+      { headers: { authorization: "Bearer t" } }
+    );
+    expect(share).toHaveBeenCalledWith({ url: "/cache/report.pdf" });
+  });
+
+  test("the upload chip is NOT opened in the system browser (would 401)", () => {
+    openBrowserAsync.mockClear();
+    const el = rule("link")(uploadLink("data.csv"), "data.csv", [], styles);
+    el.props.onPress();
+    expect(openBrowserAsync).not.toHaveBeenCalled();
+  });
+
+  test("a label-less upload chip downloads under the 'attachment' fallback name", async () => {
+    Platform.OS = "ios";
+    downloadAsync.mockClear();
+    const node: Node = {
+      key: "ul2",
+      type: "link",
+      content: "",
+      attributes: { href: "gini-upload://up_x" },
+      children: []
+    };
+    const el = rule("link")(node, [], [], styles);
+    el.props.onPress();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(downloadAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_x",
+      "/cache/attachment",
+      { headers: { authorization: "Bearer t" } }
+    );
+  });
+
+  test("openUploadAttachment surfaces a download failure via Alert", async () => {
+    alert.mockClear();
+    downloadAsync.mockImplementationOnce(() => Promise.reject(new Error("offline")));
+    await openUploadAttachment("up_err", "report.pdf");
+    expect(alert).toHaveBeenCalledWith("Couldn't open attachment", "offline");
+  });
+});
+
+describe("inline image rule (gini-upload:// image ref)", () => {
+  test("a gini-upload image ref renders the AuthedImage preview component", () => {
+    const node: Node = { key: "img", type: "image", content: "", attributes: { src: "gini-upload://up_img1" } as never, children: [] };
+    const el = rule("image")(node, [], [], styles);
+    expect(el).not.toBeNull();
+    // The element is the MarkdownUploadImage function component; invoking it
+    // exercises the hook + AuthedImage wiring and its tap handler.
+    const Comp = el.type as (p: { uploadId: string }) => any;
+    const rendered = Comp({ uploadId: "up_img1" });
+    expect(typeof rendered.props.onPress).toBe("function");
+    // Tapping opens the full-screen preview (mocked useImagePreview.open).
+    rendered.props.onPress();
+  });
+
+  test("a non-upload image src is DROPPED (returns null) — SSRF/tracking-pixel guard", () => {
+    const node: Node = { key: "img2", type: "image", content: "", attributes: { src: "https://evil.example/p.gif" } as never, children: [] };
+    expect(rule("image")(node, [], [], styles)).toBeNull();
+    const noSrc: Node = { key: "img3", type: "image", content: "", attributes: {} as never, children: [] };
+    expect(rule("image")(noSrc, [], [], styles)).toBeNull();
   });
 });
 

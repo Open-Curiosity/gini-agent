@@ -46,6 +46,7 @@ const {
   authHeader,
   fetchWorkspaceFile,
   fileRawSource,
+  uploadRawSource,
   resolveStreamEndpoint
 } = await import("@/src/api");
 const { saveCredentials, clearCredentials } = await import("@/src/auth");
@@ -403,6 +404,27 @@ describe("api() helpers", () => {
     const err = (() => {
       try {
         return fileRawSource("x");
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(401);
+  });
+
+  test("uploadRawSource builds the encoded upload URL with auth + device-token headers", () => {
+    deviceToken = "apns-7";
+    const src = uploadRawSource("up id/01");
+    expect(src.uri).toBe("http://127.0.0.1:7421/api/uploads/up%20id%2F01");
+    expect(src.headers.authorization).toBe("Bearer tok");
+    expect(src.headers["X-Device-Token"]).toBe("apns-7");
+  });
+
+  test("uploadRawSource throws ApiError(401) with no credentials", async () => {
+    await clearCredentials();
+    const err = (() => {
+      try {
+        return uploadRawSource("up_x");
       } catch (e) {
         return e;
       }

@@ -112,10 +112,13 @@ describe("MarkdownContent", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
-  test("a gini-upload link ref renders a download chip pointing at the BFF upload URL", () => {
+  test("a gini-upload link ref renders a chip that opens the inline preview URL", () => {
     render(<MarkdownContent text="[report.pdf](gini-upload://up_pdf99)" />);
     const link = screen.getByText("report.pdf").closest("a");
-    expect(link?.getAttribute("href")).toBe("/api/runtime/uploads/up_pdf99");
+    // The chip opens the upload as an inline preview (?inline=1) in a new tab,
+    // not a forced download.
+    expect(link?.getAttribute("href")).toBe("/api/runtime/uploads/up_pdf99?inline=1");
+    expect(link?.getAttribute("target")).toBe("_blank");
   });
 
   test("a normal external link still renders untouched", () => {

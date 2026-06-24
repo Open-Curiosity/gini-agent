@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import "./hooks/builtins"; // the email-watch routes provision a backing job, which validates isKnownHook("skill-script")
-import { createHandler } from "./http";
+import { createHandler, resolveInlineUpload } from "./http";
 import { logDir, uploadsDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
@@ -6456,6 +6456,78 @@ describe("GET /api/files", () => {
     // it may stream via byte ranges (iOS AVPlayer requires this to play remote
     // audio at all).
     expect(fetched.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  // `?inline=1` opts a safe-allowlisted upload into content-disposition: inline
+  // so a file/PDF chip can open it as a preview in a browser tab instead of
+  // forcing a download. These pin the per-mime allowlist decisions (the SSRF /
+  // top-level-script surface lives in the unsafe branches).
+  test("GET /api/uploads?inline=1 serves a PDF inline with its real type", async () => {
+    const config = testConfig("uploads-inline-pdf");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "report.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pdf");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  test("GET /api/uploads?inline=1 serves a PNG inline with its real type", async () => {
+    const config = testConfig("uploads-inline-png");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", "shot.png");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("GET /api/uploads?inline=1 coerces a markdown upload to text/plain inline", async () => {
+    const config = testConfig("uploads-inline-md");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("# Title\n"), "text/markdown", "notes.md");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    // Coerced to text/plain so the browser shows raw text rather than
+    // interpreting/executing the payload as a document.
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("GET /api/uploads?inline=1 never serves an SVG inline — keeps attachment", async () => {
+    const config = testConfig("uploads-inline-svg");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("<svg/>"), "image/svg+xml", "x.svg");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+  });
+
+  test("GET /api/uploads?inline=1 never serves HTML inline — keeps attachment", async () => {
+    const config = testConfig("uploads-inline-html");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("<h1>x</h1>"), "text/html", "x.html");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+  });
+
+  test("resolveInlineUpload returns null without the inline param and gates by mime", () => {
+    // No inline param → always download, regardless of a safe mime.
+    expect(resolveInlineUpload(null, "application/pdf")).toBeNull();
+    expect(resolveInlineUpload("", "application/pdf")).toBeNull();
+    // Safe direct image/pdf → its own type.
+    expect(resolveInlineUpload("1", "application/pdf")).toEqual({ contentType: "application/pdf" });
+    expect(resolveInlineUpload("1", "image/jpeg")).toEqual({ contentType: "image/jpeg" });
+    // Text-like → coerced to text/plain.
+    expect(resolveInlineUpload("1", "text/csv")).toEqual({ contentType: "text/plain; charset=utf-8" });
+    expect(resolveInlineUpload("1", "application/json")).toEqual({ contentType: "text/plain; charset=utf-8" });
+    // Unsafe / unknown → null (download).
+    expect(resolveInlineUpload("1", "image/svg+xml")).toBeNull();
+    expect(resolveInlineUpload("1", "text/html")).toBeNull();
+    expect(resolveInlineUpload("1", "application/octet-stream")).toBeNull();
   });
 
   // iOS AVPlayer won't start a remote audio AVURLAsset unless the server honors

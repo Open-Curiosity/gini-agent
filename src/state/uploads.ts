@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ImageAttachment, Instance } from "../types";
 import { uploadsDir } from "../paths";
@@ -63,6 +63,28 @@ export function extensionFor(mimeType: string): string {
   }
 }
 
+// Resolve the on-disk blob path for a stored upload. The blob's extension is
+// chosen by the WRITER (storeUpload, or the promote-file skill script), and
+// those maps can disagree for a given mime — e.g. text/markdown is written
+// `.md` by promote-file but `extensionFor` derives `markdown`. So try the
+// computed extension first (fast path; correct for every storeUpload write and
+// most promote writes), then fall back to any `<id>.<ext>` blob in the dir,
+// excluding the `.json` manifest and the `.vis-*.jpg` vision-variant caches.
+// Returns null when no blob exists. This keeps the reader tolerant of writer
+// extension drift instead of 404-ing on a file that is plainly on disk.
+function resolveBlobPath(dir: string, id: string, mimeType: string): string | null {
+  const direct = join(dir, `${id}.${extensionFor(mimeType)}`);
+  if (existsSync(direct)) return direct;
+  // Fall back to any `<id>.<ext>` blob in the dir. Every caller has already
+  // confirmed the `<id>.json` manifest exists in this dir, so the read can't
+  // ENOENT. Exclude the manifest itself and the `.vis-*.jpg` vision-variant
+  // caches so neither is mistaken for the blob.
+  const match = readdirSync(dir).find(
+    (name) => name.startsWith(`${id}.`) && !name.endsWith(".json") && !name.includes(`${id}.vis-`)
+  );
+  return match ? join(dir, match) : null;
+}
+
 export function storeUpload(
   instance: Instance,
   bytes: Uint8Array,
@@ -98,9 +120,8 @@ export function readUpload(instance: Instance, id: string): { bytes: Uint8Array;
   } catch {
     return null;
   }
-  const ext = extensionFor(manifest.mimeType);
-  const blobPath = join(dir, `${id}.${ext}`);
-  if (!existsSync(blobPath)) return null;
+  const blobPath = resolveBlobPath(dir, id, manifest.mimeType);
+  if (!blobPath) return null;
   const bytes = readFileSync(blobPath);
   return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType, filename: manifest.filename };
 }
@@ -144,9 +165,8 @@ export function uploadStat(instance: Instance, id: string): { size: number; mime
   if (!existsSync(manifestPath)) return null;
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as UploadManifest;
-    const ext = extensionFor(manifest.mimeType);
-    const blobPath = join(dir, `${id}.${ext}`);
-    const size = existsSync(blobPath) ? statSync(blobPath).size : manifest.size;
+    const blobPath = resolveBlobPath(dir, id, manifest.mimeType);
+    const size = blobPath ? statSync(blobPath).size : manifest.size;
     return { size, mimeType: manifest.mimeType, filename: manifest.filename };
   } catch {
     return null;
@@ -162,8 +182,7 @@ export function uploadPathFor(instance: Instance, id: string): string | null {
   if (!existsSync(manifestPath)) return null;
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as UploadManifest;
-    const blobPath = join(dir, `${id}.${extensionFor(manifest.mimeType)}`);
-    return existsSync(blobPath) ? blobPath : null;
+    return resolveBlobPath(dir, id, manifest.mimeType);
   } catch {
     return null;
   }

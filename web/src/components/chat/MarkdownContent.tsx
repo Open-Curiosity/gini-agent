@@ -6,7 +6,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { Paperclip } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { uploadUrl } from "@/lib/api";
+import { uploadInlineUrl, uploadUrl } from "@/lib/api";
 import { defaultUrlTransform } from "react-markdown";
 import { uploadIdFromRef, UPLOAD_REF_SCHEME } from "@/lib/upload-ref";
 import { EmailDraftCard } from "./EmailDraftCard";
@@ -90,13 +90,15 @@ function makeComponents(linkBaseUrl?: string) {
     },
     a: ({ href, children, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
       // A `gini-upload://<id>` link is a non-image attachment — render a
-      // download chip pointing at the BFF upload URL. Foreign links keep the
-      // standard doc-href resolution below.
+      // chip that opens the upload as an inline PREVIEW in a new tab (PDFs and
+      // images render in the browser's viewer; .md/.csv/.json/.txt show as raw
+      // text; unsafe types fall back to a download server-side). Foreign links
+      // keep the standard doc-href resolution below.
       const uploadId = uploadIdFromRef(href);
       if (uploadId) {
         return (
           <a
-            href={uploadUrl(uploadId)}
+            href={uploadInlineUrl(uploadId)}
             target="_blank"
             rel="noopener noreferrer"
             className="my-1 inline-flex items-center gap-1.5 rounded-lg border bg-background px-3 py-1.5 text-sm hover:bg-accent"

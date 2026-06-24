@@ -174,6 +174,47 @@ const INLINE_MIME: Record<string, string> = {
   ico: "image/x-icon"
 };
 
+// Upload mimes safe to serve as a TOP-LEVEL inline document under `?inline=1`
+// (the file/PDF chip opens the upload in a browser tab as a preview). PDFs +
+// raster images render directly with their real type. Anything outside this
+// set keeps the attachment-download default — an SVG/HTML/XML upload could run
+// script in a top-level navigation, so it is never served inline.
+const INLINE_UPLOAD_DIRECT = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/x-icon"
+]);
+// Text-like upload mimes that are safe to PREVIEW once neutralized to
+// text/plain: the browser shows the raw text instead of interpreting a .md /
+// .csv / .json upload as HTML or executing it. Served inline with a coerced
+// content-type so a `text/html`-adjacent payload can't become a script vector.
+const INLINE_UPLOAD_TEXT = new Set([
+  "text/markdown",
+  "text/csv",
+  "text/plain",
+  "application/json"
+]);
+
+// Decide how to serve an upload GET given the `?inline=` query value and the
+// stored mime. Returns the content-type to serve with `content-disposition:
+// inline`, or null to keep the safe attachment-download default (no inline
+// param, or an unsafe/unknown mime). Exported for direct unit coverage of the
+// allowlist branches.
+export function resolveInlineUpload(
+  inlineParam: string | null,
+  mimeType: string
+): { contentType: string } | null {
+  if (!inlineParam) return null;
+  if (INLINE_UPLOAD_DIRECT.has(mimeType)) return { contentType: mimeType };
+  if (INLINE_UPLOAD_TEXT.has(mimeType)) return { contentType: "text/plain; charset=utf-8" };
+  return null;
+}
+
 // Per-action audit row for connector.request completion. createConnector
 // and checkConnector emit their own connector.create / connector.health
 // rows, but neither carries the originating setup id — the audit trail
@@ -468,15 +509,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // iOS AVPlayer refuses to start a remote AVURLAsset that streams audio
       // unless the server answers a `Range` request with 206 + Content-Range,
       // which is why an audio bubble's play button was inert (issue: voice
-      // playback). Arbitrary MIME is accepted, so force a download + no-sniff:
-      // a text/html or SVG upload must never execute as a top-level document on
-      // the app origin. The bytes still render inline in <img>/<audio>
-      // (subresource loads ignore Content-Disposition). Bare `attachment` (no
-      // filename= param) avoids header injection from the stored name.
+      // playback). Arbitrary MIME is accepted, so the DEFAULT is download +
+      // no-sniff: a text/html or SVG upload must never execute as a top-level
+      // document on the app origin. The bytes still render inline in
+      // <img>/<audio> (subresource loads ignore Content-Disposition). Bare
+      // `attachment` (no filename= param) avoids header injection from the
+      // stored name.
+      //
+      // `?inline=1` opts a SAFE-allowlisted upload (PDF + raster image served
+      // with its real type; .md/.csv/.json/.txt coerced to text/plain) into
+      // `content-disposition: inline` so a file/PDF chip can open it as a
+      // preview in a browser tab. Unsafe/unknown mimes ignore the param and
+      // keep the attachment default — see resolveInlineUpload.
+      const inline = resolveInlineUpload(new URL(request.url).searchParams.get("inline"), upload.mimeType);
       const commonHeaders: Record<string, string> = {
-        "content-type": upload.mimeType,
+        "content-type": inline ? inline.contentType : upload.mimeType,
         "cache-control": "private, max-age=31536000, immutable",
-        "content-disposition": "attachment",
+        "content-disposition": inline ? "inline" : "attachment",
         "x-content-type-options": "nosniff",
         "accept-ranges": "bytes"
       };

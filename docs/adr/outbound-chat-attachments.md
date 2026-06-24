@@ -73,13 +73,35 @@ Specific choices:
 - **Per-client renderers.** Web `MarkdownContent` (`web/src/components/chat/MarkdownContent.tsx`)
   overrides the `img`/`a` components to rewrite an upload ref to the BFF URL
   (with a custom `urlTransform` so react-markdown's sanitizer doesn't strip the
-  scheme first). Mobile `BlockAssistantText` (`mobile/src/components/chat/BlockAssistantText.tsx`)
-  overrides the markdown `image` rule to render `AuthedImage` (bearer on native,
-  blob fetch on web — RN Web's `<img>` can't send a header) and the `link` rule
-  to open the upload. Both DROP non-upload refs.
+  scheme first). An image ref becomes an inline `<img>`; a non-image ref becomes
+  a paperclip download chip. Mobile `BlockAssistantText`
+  (`mobile/src/components/chat/BlockAssistantText.tsx`) overrides the markdown
+  `image` rule to render `AuthedImage` (bearer on native, blob fetch on web — RN
+  Web's `<img>` can't send a header) and the `link` rule to render the non-image
+  chip inline. Both DROP non-upload refs.
+
+- **A non-image chip OPENS A PREVIEW, not a forced download.** `GET
+  /api/uploads/:id` defaults to `content-disposition: attachment`, but `?inline=1`
+  opts a safe-allowlisted upload into `content-disposition: inline`
+  (`resolveInlineUpload` in `src/http.ts`): PDFs + raster images keep their real
+  type, while `.md` / `.csv` / `.json` / `.txt` are coerced to `text/plain` so a
+  text upload previews as raw text rather than executing as a document.
+  Unsafe/unknown mimes (html, svg, xml, octet-stream) ignore the flag and still
+  download. The web chip opens the inline URL in a new tab (the browser's own
+  PDF/text viewer). Mobile can't open an authed URL in the system browser (no
+  bearer → 401), so its chip downloads the bytes WITH the bearer
+  (`openUploadAttachment` → `FileSystem.downloadAsync` → OS share/Quick Look
+  sheet — the same flow as the workspace-file preview's download toolbar).
 
 - **Reuse the upload store + `GET /api/uploads/:id`.** No new media endpoint.
-  Bytes are stored via `storeUpload` and served from the existing route. The CLI
+  Bytes are stored via `storeUpload` and served from the existing route. The blob
+  reader (`resolveBlobPath` in `src/state/uploads.ts`) tolerates writer extension
+  drift: `storeUpload` and the `promote-file` skill script choose a file
+  extension from independent mime→ext maps that can disagree (e.g. `text/markdown`
+  → `.md` from promote-file but `markdown` from `extensionFor`), so the reader
+  tries the computed extension first and then falls back to any `<id>.<ext>` blob
+  in the dir (excluding the `.json` manifest and `.vis-*.jpg` vision caches) —
+  otherwise a promoted markdown file 404s though it's plainly on disk. The CLI
   (which can't show pixels) parses refs from the reply text and saves the bytes
   to a temp file.
 
@@ -128,6 +150,13 @@ Specific choices:
   DROPS a foreign `https://` image src (SSRF guard).
 - `uploadIdsFromText` / `uploadIdFromRef` extract ids from reply text / a single
   ref and reject non-upload values.
+- A real chat turn that sends a PDF + a markdown file produces a reply whose text
+  contains `[name](gini-upload://<id>)` for each; the web/mobile chat renders each
+  as a named chip, and `GET /api/uploads/:id?inline=1` serves the PDF as
+  `application/pdf` inline and the markdown as `text/plain` inline (both
+  previewable), while an SVG/HTML upload keeps `content-disposition: attachment`.
+- A promoted `text/markdown` upload (blob on disk as `<id>.md`) is served, not
+  404'd — the reader resolves the blob despite the `extensionFor` mismatch.
 - The Telegram mirror sends the image as a photo and strips the tag from the
   text; a `[SILENT]` turn sends nothing.
 - 100% line/function coverage on every touched source file.

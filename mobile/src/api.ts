@@ -296,6 +296,23 @@ export function authHeader(): Record<string, string> {
   return { Authorization: `Bearer ${creds.token}` };
 }
 
+// Absolute gateway URL + bearer/device-token headers for a stored upload's
+// raw bytes. The system browser can't attach the bearer, so a non-image
+// attachment chip downloads via this (FileSystem.downloadAsync) and hands the
+// file to the OS preview/Share sheet. Mirrors fileRawSource for uploads.
+export function uploadRawSource(id: string): { uri: string; headers: Record<string, string> } {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  return {
+    uri: `${parsed.origin}/api/uploads/${encodeURIComponent(id)}`,
+    headers: {
+      authorization: `Bearer ${creds.token}`,
+      ...resolveDeviceTokenHeader()
+    }
+  };
+}
+
 // A workspace file read via GET /api/files. `content` is the utf8 text (null
 // for binary files); `truncated` is set when the file exceeds the gateway's
 // read cap. Mirrors web/src/lib/api.ts's WorkspaceFile.
