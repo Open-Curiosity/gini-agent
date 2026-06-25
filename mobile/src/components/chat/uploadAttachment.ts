@@ -46,7 +46,12 @@ export async function openUploadAttachment(
   try {
     const { uri, headers } = deps.source(uploadId);
     const safeName = safeAttachmentName(filename);
-    const dest = `${deps.cacheDir ?? ""}${safeName}`;
+    // Namespace the cache path by upload id, not just the display name: two
+    // distinct uploads can share a name ("report.pdf", "screenshot.png"), and a
+    // bare-name dest would let a second concurrent open overwrite the first —
+    // surfacing the wrong bytes (or a half-written file) in the share sheet. The
+    // id is a UUID (filesystem-safe); sanitize it anyway for defense in depth.
+    const dest = `${deps.cacheDir ?? ""}${safeAttachmentName(uploadId)}-${safeName}`;
     const result = await deps.download(uri, dest, { headers });
     // RN core Share can't attach a file on Android; there a full save needs
     // expo-sharing (native module → new build). iOS shares the local file via

@@ -81,28 +81,30 @@ describe("openUploadAttachment", () => {
     const { deps, calls } = makeDeps({ platformOS: "ios" });
     await openUploadAttachment("up_1", "report.pdf", deps);
     expect(calls.source).toHaveBeenCalledWith("up_1");
+    // The cache dest is namespaced by upload id so two same-named uploads can't
+    // collide / overwrite each other's bytes.
     expect(calls.download).toHaveBeenCalledWith(
       "https://gw.example/api/uploads/up_1",
-      "/cache/report.pdf",
+      "/cache/up_1-report.pdf",
       { headers: { authorization: "Bearer t", "X-Device-Token": "dev" } }
     );
     // iOS shares via { url } so the share sheet exposes Quick Look + Save to Files.
-    expect(calls.share).toHaveBeenCalledWith({ url: "file:///cache/report.pdf" });
+    expect(calls.share).toHaveBeenCalledWith({ url: "file:///cache/up_1-report.pdf" });
     expect(calls.alert).not.toHaveBeenCalled();
   });
 
   test("on Android shares via message+title (RN Share can't attach a file there)", async () => {
     const { deps, calls } = makeDeps({ platformOS: "android" });
     await openUploadAttachment("up_2", "data.csv", deps);
-    expect(calls.share).toHaveBeenCalledWith({ message: "file:///cache/data.csv", title: "data.csv" });
+    expect(calls.share).toHaveBeenCalledWith({ message: "file:///cache/up_2-data.csv", title: "data.csv" });
   });
 
-  test("a null cache dir degrades to a bare filename dest", async () => {
+  test("a null cache dir degrades to an id-namespaced bare filename dest", async () => {
     const { deps, calls } = makeDeps({ cacheDir: null });
     await openUploadAttachment("up_3", "x.md", deps);
     expect(calls.download).toHaveBeenCalledWith(
       "https://gw.example/api/uploads/up_3",
-      "x.md",
+      "up_3-x.md",
       { headers: { authorization: "Bearer t", "X-Device-Token": "dev" } }
     );
   });
@@ -133,10 +135,10 @@ describe("openUploadAttachment", () => {
     expect(apiSource).toHaveBeenCalledWith("up_default");
     expect(fsDownload).toHaveBeenCalledWith(
       "https://gw/api/uploads/up_default",
-      "/cache/guide.md",
+      "/cache/up_default-guide.md",
       { headers: { authorization: "Bearer real" } }
     );
-    expect(rnShare).toHaveBeenCalledWith({ url: "file:///cache/guide.md" });
+    expect(rnShare).toHaveBeenCalledWith({ url: "file:///cache/up_default-guide.md" });
     expect(rnAlert).not.toHaveBeenCalled();
   });
 
@@ -199,8 +201,17 @@ describe("openUploadInBrowser", () => {
     // Default fallback === openUploadAttachment → downloads with the bearer.
     expect(fsDownload).toHaveBeenCalledWith(
       "https://gw/api/uploads/up_defaulterr",
-      "/cache/guide.md",
+      "/cache/up_defaulterr-guide.md",
       { headers: { authorization: "Bearer real" } }
     );
+  });
+
+  test("two same-named uploads get DISTINCT cache dests (no collision)", async () => {
+    const { deps, calls } = makeDeps({ platformOS: "ios" });
+    await openUploadAttachment("up_aaa", "report.pdf", deps);
+    await openUploadAttachment("up_bbb", "report.pdf", deps);
+    const dests = calls.download.mock.calls.map((c) => c[1]);
+    expect(dests).toEqual(["/cache/up_aaa-report.pdf", "/cache/up_bbb-report.pdf"]);
+    expect(new Set(dests).size).toBe(2);
   });
 });
