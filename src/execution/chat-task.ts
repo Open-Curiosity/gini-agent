@@ -140,9 +140,15 @@ import {
 // Default safety cap on chat-task loop iterations. Each iteration is one
 // model call (followed by zero or more tool dispatches). Most tasks finish
 // in well under 10 iterations; the cap exists to bound runaway loops, not
-// to be a meaningful budget for normal work. Power users can override this
-// per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
-const MAX_LOOP_ITERATIONS = 90;
+// to be a meaningful budget for normal work. It is deliberately generous:
+// runaway/degenerate loops are caught far earlier by the loop-breakers below
+// (identical-repeat 3, same-action 6, navigation-without-progress 8), so this
+// backstop only ever bounds tasks that are making genuine progress every
+// iteration (e.g. a bulk download of dozens of items, each needing several
+// tool calls). Setting it too low cuts off that legitimate long work. Power
+// users can override per-instance via `config.agent.maxIterations` in
+// `~/.gini/instances/<inst>/config.json`.
+const MAX_LOOP_ITERATIONS = 200;
 // Reactive recovery for provider context-overflow errors. When the provider
 // rejects a call because the prompt no longer fits its window (the chars/4
 // estimate — even calibrated — can miss), the loop compacts the transcript
