@@ -93,6 +93,16 @@ export function uploadUrl(id: string): string {
   return `/api/runtime/uploads/${encodeURIComponent(id)}`;
 }
 
+// BFF URL for PREVIEWING an upload inline (a file/PDF chip opens this in a new
+// tab). The gateway's `?inline=1` mode serves a safe allowlist (PDFs + raster
+// images with their real type; .md/.csv/.json/.txt coerced to text/plain) with
+// content-disposition: inline, so the browser renders it rather than
+// downloading. Unsafe/unknown mimes ignore the flag and still download. The
+// BFF injects the bearer, so this is usable as a bare anchor/iframe src.
+export function uploadInlineUrl(id: string): string {
+  return `/api/runtime/uploads/${encodeURIComponent(id)}?inline=1`;
+}
+
 // A workspace file read via GET /api/files. `content` is the utf8 text (null
 // for binary files); `truncated` is set when the file exceeds the gateway's
 // read cap.

@@ -121,6 +121,7 @@ import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAV
 import { isLoopbackHost, isRelayHost, isRuntimeTunnelHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
+import { signUploadParams, verifyUploadSignature } from "./lib/upload-signing";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, removePendingChatMessageById, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
@@ -157,6 +158,17 @@ function maxUploadBytes(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_UPLOAD_BYTES;
 }
 
+// TTL (seconds) for a minted upload preview signature. Short by default so a
+// signed url that leaks into browser history / a log is dead within minutes;
+// clamped to [30s, 600s] so a caller can't request an effectively-permanent
+// url. Mirrors createPairing's ttl clamping.
+const DEFAULT_UPLOAD_SIGN_TTL_SECONDS = 300;
+function uploadSignTtlSeconds(raw: string | null): number {
+  const requested = Number(raw);
+  if (!Number.isFinite(requested) || requested <= 0) return DEFAULT_UPLOAD_SIGN_TTL_SECONDS;
+  return Math.min(600, Math.max(30, Math.floor(requested)));
+}
+
 // Extensions the browser can safely render inline (PDFs + raster images) when
 // GET /api/files is called with `inline=1`. Everything else — html/htm, svg,
 // xml, js, and any unlisted type — is deliberately excluded so it falls
@@ -173,6 +185,47 @@ const INLINE_MIME: Record<string, string> = {
   bmp: "image/bmp",
   ico: "image/x-icon"
 };
+
+// Upload mimes safe to serve as a TOP-LEVEL inline document under `?inline=1`
+// (the file/PDF chip opens the upload in a browser tab as a preview). PDFs +
+// raster images render directly with their real type. Anything outside this
+// set keeps the attachment-download default — an SVG/HTML/XML upload could run
+// script in a top-level navigation, so it is never served inline.
+const INLINE_UPLOAD_DIRECT = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/x-icon"
+]);
+// Text-like upload mimes that are safe to PREVIEW once neutralized to
+// text/plain: the browser shows the raw text instead of interpreting a .md /
+// .csv / .json upload as HTML or executing it. Served inline with a coerced
+// content-type so a `text/html`-adjacent payload can't become a script vector.
+const INLINE_UPLOAD_TEXT = new Set([
+  "text/markdown",
+  "text/csv",
+  "text/plain",
+  "application/json"
+]);
+
+// Decide how to serve an upload GET given the `?inline=` query value and the
+// stored mime. Returns the content-type to serve with `content-disposition:
+// inline`, or null to keep the safe attachment-download default (no inline
+// param, or an unsafe/unknown mime). Exported for direct unit coverage of the
+// allowlist branches.
+export function resolveInlineUpload(
+  inlineParam: string | null,
+  mimeType: string
+): { contentType: string } | null {
+  if (!inlineParam) return null;
+  if (INLINE_UPLOAD_DIRECT.has(mimeType)) return { contentType: mimeType };
+  if (INLINE_UPLOAD_TEXT.has(mimeType)) return { contentType: "text/plain; charset=utf-8" };
+  return null;
+}
 
 // Per-action audit row for connector.request completion. createConnector
 // and checkConnector emit their own connector.create / connector.health
@@ -446,6 +499,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const stored = storeUpload(config.instance, bytes, mimeType, filename);
       return json(stored, 201);
     }],
+    // Mint a short-lived SIGNED preview url for an upload. Bearer-gated (it
+    // rides the same authorized() gate as every route), so only an already-
+    // authenticated client — e.g. the mobile app holding its device token —
+    // can presign. The response carries a relative `path` (with `?inline=1`
+    // already applied) plus the absolute `exp`; the client prepends its known
+    // gateway origin. That signed url then authorizes a header-less GET from an
+    // in-app browser until `exp`. Returns 404 for an unknown id so a signature
+    // is never minted for bytes that don't exist.
+    ["POST", /^\/api\/uploads\/([^/]+)\/sign$/, (request, params) => {
+      const id = params[0]!;
+      if (!uploadStat(config.instance, id)) return json({ error: "Upload not found" }, 404);
+      const ttlSeconds = uploadSignTtlSeconds(new URL(request.url).searchParams.get("ttl"));
+      const expUnixSeconds = Math.floor(Date.now() / 1000) + ttlSeconds;
+      const { exp, sig } = signUploadParams(config.token, id, expUnixSeconds);
+      const path = `/api/uploads/${encodeURIComponent(id)}?inline=1&exp=${exp}&sig=${sig}`;
+      return json({ path, exp });
+    }],
     ["HEAD", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
       const meta = uploadStat(config.instance, params[0]);
       if (!meta) return new Response(null, { status: 404 });
@@ -468,15 +538,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // iOS AVPlayer refuses to start a remote AVURLAsset that streams audio
       // unless the server answers a `Range` request with 206 + Content-Range,
       // which is why an audio bubble's play button was inert (issue: voice
-      // playback). Arbitrary MIME is accepted, so force a download + no-sniff:
-      // a text/html or SVG upload must never execute as a top-level document on
-      // the app origin. The bytes still render inline in <img>/<audio>
-      // (subresource loads ignore Content-Disposition). Bare `attachment` (no
-      // filename= param) avoids header injection from the stored name.
+      // playback). Arbitrary MIME is accepted, so the DEFAULT is download +
+      // no-sniff: a text/html or SVG upload must never execute as a top-level
+      // document on the app origin. The bytes still render inline in
+      // <img>/<audio> (subresource loads ignore Content-Disposition). Bare
+      // `attachment` (no filename= param) avoids header injection from the
+      // stored name.
+      //
+      // `?inline=1` opts a SAFE-allowlisted upload (PDF + raster image served
+      // with its real type; .md/.csv/.json/.txt coerced to text/plain) into
+      // `content-disposition: inline` so a file/PDF chip can open it as a
+      // preview in a browser tab. Unsafe/unknown mimes ignore the param and
+      // keep the attachment default — see resolveInlineUpload.
+      const inline = resolveInlineUpload(new URL(request.url).searchParams.get("inline"), upload.mimeType);
       const commonHeaders: Record<string, string> = {
-        "content-type": upload.mimeType,
+        "content-type": inline ? inline.contentType : upload.mimeType,
         "cache-control": "private, max-age=31536000, immutable",
-        "content-disposition": "attachment",
+        "content-disposition": inline ? "inline" : "attachment",
         "x-content-type-options": "nosniff",
         "accept-ranges": "bytes"
       };
@@ -3664,11 +3742,35 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   return json({ error: "Not found" }, 404);
 }
 
+// A GET (or HEAD) for a single upload may be authorized by a capability
+// SIGNATURE (`?exp=&sig=`) instead of a bearer, so a mobile in-app browser —
+// which can't attach the bearer header or carry the gateway cookie — can open
+// a preview url. The signature is HMAC'd with the owner config token, scoped to
+// the exact upload id in the path, and expires. It authorizes ONLY this route;
+// `authorized` falls through to it only after the bearer check fails. See
+// src/lib/upload-signing.ts and ADR outbound-chat-attachments.md.
+const UPLOAD_GET_PATH = /^\/api\/uploads\/([^/]+)$/;
+function signedUploadAccess(request: Request, config: RuntimeConfig): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  const url = new URL(request.url);
+  const match = url.pathname.match(UPLOAD_GET_PATH);
+  if (!match) return false;
+  return verifyUploadSignature(
+    config.token,
+    match[1]!,
+    url.searchParams.get("exp"),
+    url.searchParams.get("sig"),
+    Date.now()
+  );
+}
+
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
-  return authorizedBearer(config, bearer ?? undefined);
+  if (await authorizedBearer(config, bearer ?? undefined)) return true;
+  // No valid bearer — accept a scoped, unexpired upload capability signature.
+  return signedUploadAccess(request, config);
 }
 
 // Pull the bearer off a request the same way `authorized` does so

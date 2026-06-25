@@ -46,6 +46,8 @@ const {
   authHeader,
   fetchWorkspaceFile,
   fileRawSource,
+  uploadRawSource,
+  signUploadUrl,
   resolveStreamEndpoint
 } = await import("@/src/api");
 const { saveCredentials, clearCredentials } = await import("@/src/auth");
@@ -407,6 +409,49 @@ describe("api() helpers", () => {
         return e;
       }
     })();
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(401);
+  });
+
+  test("uploadRawSource builds the encoded upload URL with auth + device-token headers", () => {
+    deviceToken = "apns-7";
+    const src = uploadRawSource("up id/01");
+    expect(src.uri).toBe("http://127.0.0.1:7421/api/uploads/up%20id%2F01");
+    expect(src.headers.authorization).toBe("Bearer tok");
+    expect(src.headers["X-Device-Token"]).toBe("apns-7");
+  });
+
+  test("uploadRawSource throws ApiError(401) with no credentials", async () => {
+    await clearCredentials();
+    const err = (() => {
+      try {
+        return uploadRawSource("up_x");
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(401);
+  });
+
+  test("signUploadUrl POSTs to the sign endpoint and returns the absolute signed url", async () => {
+    let calledUrl = "";
+    let calledMethod = "";
+    setFetch(async (url, init) => {
+      calledUrl = url;
+      calledMethod = (init?.method ?? "GET").toUpperCase();
+      return jsonResponse({ path: "/api/uploads/up_1?inline=1&exp=123&sig=abc", exp: 123 });
+    });
+    const signed = await signUploadUrl("up_1");
+    expect(calledMethod).toBe("POST");
+    expect(calledUrl).toBe("http://127.0.0.1:7421/api/uploads/up_1/sign");
+    // The relative path from the gateway is prefixed with the resolved origin.
+    expect(signed).toBe("http://127.0.0.1:7421/api/uploads/up_1?inline=1&exp=123&sig=abc");
+  });
+
+  test("signUploadUrl throws ApiError(401) with no credentials", async () => {
+    await clearCredentials();
+    const err = await signUploadUrl("up_x").catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as InstanceType<typeof ApiError>).status).toBe(401);
   });

@@ -7,10 +7,15 @@ import {
   type ReactElement,
   type ReactNode
 } from "react";
-import { Animated, Easing, StyleSheet, Text, View } from "react-native";
+import { Animated, Easing, Pressable, StyleSheet, Text, View } from "react-native";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+import { authHeader, uploadUrl } from "@/src/api";
+import { uploadIdFromRef } from "@/src/upload-ref";
+import { AuthedImage } from "./AuthedImage";
+import { useImagePreview } from "@/src/components/ImagePreview";
+import { openUploadInBrowser } from "./uploadAttachment";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
@@ -23,7 +28,7 @@ type MarkdownNode = {
   key: string;
   type?: string;
   content: string;
-  attributes?: { href?: string };
+  attributes?: { href?: string; src?: string; alt?: string };
   children?: MarkdownNode[];
 };
 type MarkdownStylesMap = Record<string, object>;
@@ -137,16 +142,32 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
+// Collect the visible text of a markdown node's subtree. Used to recover the
+// chip label (the filename in `[report.pdf](gini-upload://id)`) from a link
+// node so the downloaded attachment gets a sensible filename for the OS
+// preview/share sheet.
+function nodeText(node: MarkdownNode): string {
+  if (node.content) return node.content;
+  return (node.children ?? []).map(nodeText).join("");
+}
+
 // Walk an AST node's subtree for an inline, *interactive* `link`. markdown-it
 // (with `linkify`) collapses `link_open`/`link_close` into a node of type
-// `link`, covering both `[label](url)` and bare autolinked URLs. Only http(s)
-// links get tap/long-press handlers, so only those should flip the block off
-// the selectable path — a non-web link is inert and should keep normal text
-// selection. A block-level `blocklink` (e.g. a linked image) keeps the
+// `link`, covering both `[label](url)` and bare autolinked URLs. A link is
+// interactive — and so must flip the block off the iOS TextInput selection path,
+// whose wrapper would otherwise swallow the link's taps — when it's either an
+// http(s) link OR a `gini-upload://` attachment chip (the link rule gives both
+// an onPress). A plain non-web, non-upload link is inert and should keep normal
+// text selection. A block-level `blocklink` (e.g. a linked image) keeps the
 // library's own touchable wrapper and is excluded here.
 function hasLinkDescendant(node: MarkdownNode): boolean {
   const href = node.attributes?.href;
-  if (node.type === "link" && href !== undefined && isWebUrl(href)) return true;
+  if (
+    node.type === "link" &&
+    href !== undefined &&
+    (isWebUrl(href) || uploadIdFromRef(href) !== null)
+  )
+    return true;
   return node.children?.some(hasLinkDescendant) ?? false;
 }
 
@@ -191,6 +212,41 @@ function nonSelectable(children: ReactNode): ReactNode {
     );
   });
 }
+
+// An inline agent image rendered from a `gini-upload://<id>` markdown ref.
+// Tapping opens the full-screen preview. Split into its own component so it can
+// use the useImagePreview hook (the markdown rules are a module-level constant,
+// not a component, so the hook can't live there directly).
+function MarkdownUploadImage({ uploadId }: { uploadId: string }) {
+  const { open } = useImagePreview();
+  const uri = uploadUrl(uploadId);
+  const headers = authHeader();
+  return (
+    <Pressable
+      style={uploadImageStyles.wrapper}
+      onPress={() => open({ uri, headers })}
+      accessibilityRole="button"
+      accessibilityLabel="Open image"
+    >
+      <AuthedImage uploadId={uploadId} style={uploadImageStyles.image} resizeMode="cover" />
+    </Pressable>
+  );
+}
+
+const uploadImageStyles = StyleSheet.create({
+  wrapper: {
+    marginVertical: 6,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: theme.border,
+    alignSelf: "flex-start"
+  },
+  image: {
+    width: 240,
+    height: 170
+  }
+});
 
 // Inline rules (text/textgroup/link/strong/em/s/inline) need their own
 // `selectable` because react-native-markdown-display emits <Text>
@@ -237,6 +293,28 @@ export const markdownRules: Record<string, RenderRule> = {
   ),
   link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
+    // A `gini-upload://<id>` link is a non-image attachment. Tapping it mints a
+    // short-lived SIGNED url server-side and opens it in the in-app browser
+    // (SFSafariViewController / Custom Tabs) — the signed url carries its own
+    // auth in the query string, so the header-less browser can load it. If
+    // minting fails it falls back to downloading the bytes with the bearer and
+    // handing them to the OS share/Quick Look sheet. Stays an inline <Text> so
+    // it can sit mid-prose; the filename label is recovered from the node text.
+    const uploadId = uploadIdFromRef(href);
+    if (uploadId) {
+      const filename = nodeText(node).trim() || "attachment";
+      return (
+        <Text
+          key={node.key}
+          style={styles.link}
+          onPress={() => {
+            void openUploadInBrowser(uploadId, filename);
+          }}
+        >
+          {nonSelectable(children)}
+        </Text>
+      );
+    }
     // Only http(s) links are interactive. Tap opens the in-app browser;
     // long-press raises the link context menu at the touch point. The link
     // is intentionally not `selectable` so a long-press shows the menu
@@ -257,6 +335,18 @@ export const markdownRules: Record<string, RenderRule> = {
       </Text>
     );
   },
+  // An agent-produced image is authored as a `gini-upload://<id>` markdown
+  // image ref. Override the default image rule (which renders a header-less
+  // FitImage that 401s against the gateway) to render AuthedImage instead —
+  // it carries the bearer on native and fetches a blob on web. A non-upload
+  // src is DROPPED (returns null) rather than fetched: that allowlist closes
+  // the SSRF / tracking-pixel surface. The image rule has a special signature
+  // (extra allowedImageHandlers / defaultImageHandler args), so it's cast.
+  image: ((node: MarkdownNode) => {
+    const id = uploadIdFromRef(node.attributes?.src);
+    if (!id) return null;
+    return <MarkdownUploadImage key={node.key} uploadId={id} />;
+  }) as RenderRule,
   // Code blocks render as `SelectableBlockText` so iOS gets the loupe
   // and drag handles on multi-line snippets. The library's defaults
   // emit a single `<Text>` here, which on iOS would otherwise collapse

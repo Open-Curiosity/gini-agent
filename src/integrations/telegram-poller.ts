@@ -10,7 +10,8 @@
 import { mkdirSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig, TaskStatus } from "../types";
-import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { appendLog, isTerminalTaskStatus, mutateState, now, readState, uploadPathFor, uploadStat } from "../state";
+import { UPLOAD_REF_SCHEME, uploadIdsFromText } from "../lib/upload-ref";
 import {
   authorizeTelegramChat,
   deliverVerificationCode,
@@ -438,9 +439,15 @@ async function maintainTypingAndMirrorReply(
     if (!session || !session.source || session.source.kind !== "telegram") return;
 
     let replyText: string | undefined;
+    let suppressed = false;
     try {
       const message = await syncChatTaskResult(config, session.id, taskId);
-      if (message && message.role === "assistant") replyText = message.content;
+      // A null result means the reply was suppressed — a [SILENT] sentinel
+      // (see src/jobs/silent.ts) or otherwise nothing to deliver. That silence
+      // is intentional and must extend to the image: a [SILENT] turn that also
+      // took a screenshot must NOT leak the photo to Telegram.
+      if (message === null) suppressed = true;
+      else if (message.role === "assistant") replyText = message.content;
     } catch (error) {
       appendLog(config.instance, "messaging.telegram.sync_error", {
         bridgeId,
@@ -450,20 +457,77 @@ async function maintainTypingAndMirrorReply(
       return;
     }
 
-    // Empty replies or [SILENT]-suppressed messages produce nothing to
-    // dispatch — leave the inbound record in place but stay quiet.
-    if (!replyText || replyText.trim().length === 0) return;
+    // Respect suppression for the image too — a [SILENT] turn stays fully
+    // silent on the bridge (its reply text, which would carry any attachment
+    // ref, was suppressed).
+    if (suppressed) return;
+
+    // The agent embeds any attachment it produced as a `gini-upload://<id>`
+    // markdown ref INSIDE its reply text (so it can land inline, mid-prose, in
+    // the web/app chat). Telegram can't render those refs, so: pull the upload
+    // ids out of the reply and send each IMAGE upload as its own photo. Non-image
+    // uploads (PDF, CSV, …) aren't sent yet — Telegram sendDocument is deferred
+    // (see ADR outbound-chat-attachments.md, alongside the stubbed Discord photo
+    // path). Resolve each id to its on-disk path + mime.
+    const refIds = replyText ? uploadIdsFromText(replyText) : [];
+    const imageRefs: { id: string; photo: Record<string, unknown> }[] = [];
+    for (const id of refIds) {
+      const meta = uploadStat(config.instance, id);
+      const path = uploadPathFor(config.instance, id);
+      if (!meta || !path || !meta.mimeType.startsWith("image/")) continue;
+      imageRefs.push({ id, photo: { path, contentType: meta.mimeType } });
+    }
 
     try {
-      // Thread the originating taskId so the outbound row and its
-      // messaging.sent audit attribute back to the owning agent rather
-      // than landing unattributed at the bridge level.
-      await sendMessagingOutput(config, bridgeId, {
-        text: replyText,
-        target: session.source.target,
-        taskId,
-        ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
-      });
+      // Send the photos FIRST, recording which ids actually delivered. Each
+      // photo is its own send — never a photo+caption (Telegram caps a caption
+      // at 1024 MarkdownV2-escaped chars and a failed photo upload would take
+      // the caption text down with it). replyToMessageId threads onto the first
+      // send only so a photo+text split doesn't double-quote the user.
+      // sendMessagingOutput SWALLOWS a failed send (records status:"failed",
+      // doesn't throw), so we key the tag-strip below on the RETURNED status —
+      // a photo that failed to deliver keeps its filename label in the text
+      // rather than vanishing from both the photo stream and the prose.
+      const deliveredImageIds = new Set<string>();
+      let firstSend = true;
+      for (const { id, photo } of imageRefs) {
+        const record = await sendMessagingOutput(config, bridgeId, {
+          photo,
+          target: session.source.target,
+          taskId,
+          ...(firstSend && replyToMessageId !== undefined ? { replyToMessageId } : {})
+        });
+        firstSend = false;
+        if ((record as { status?: string } | undefined)?.status === "sent") {
+          deliveredImageIds.add(id);
+        }
+      }
+
+      // Now rewrite the upload-ref markdown tags out of the text Telegram shows.
+      // For a ref whose photo actually DELIVERED, drop the tag entirely (the
+      // photo carries it). For any other ref — a non-image file we don't send,
+      // an image that failed to resolve, or a photo whose send FAILED — keep the
+      // visible LABEL (the filename) so the attachment never silently vanishes;
+      // only the unusable `gini-upload://` link target is removed. Collapse
+      // leftover blank lines.
+      const tagRe = new RegExp(`(!?)\\[([^\\]]*)\\]\\(${UPLOAD_REF_SCHEME}([A-Za-z0-9_-]+)\\)`, "g");
+      const cleanedText = (replyText ?? "")
+        .replace(tagRe, (_full, _bang: string, label: string, id: string) =>
+          deliveredImageIds.has(id) ? "" : label
+        )
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      // Send the cleaned text as its own message when non-empty. Thread
+      // replyToMessageId here only if no photo claimed it first.
+      if (cleanedText.length > 0) {
+        await sendMessagingOutput(config, bridgeId, {
+          text: cleanedText,
+          target: session.source.target,
+          taskId,
+          ...(firstSend && replyToMessageId !== undefined ? { replyToMessageId } : {})
+        });
+      }
     } catch (error) {
       appendLog(config.instance, "messaging.telegram.reply_error", {
         bridgeId,

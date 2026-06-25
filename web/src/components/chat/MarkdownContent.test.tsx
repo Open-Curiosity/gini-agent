@@ -95,4 +95,58 @@ describe("MarkdownContent", () => {
     rerender(<MarkdownContent text="hi" />);
     expect(container.querySelector(".streaming-cursor")).toBeNull();
   });
+
+  test("an inline gini-upload image ref renders an <img> served from the BFF upload URL", () => {
+    const { container } = render(
+      <MarkdownContent text="Here's the shot: ![screenshot](gini-upload://up_abc123)" />
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img?.getAttribute("src")).toBe("/api/runtime/uploads/up_abc123");
+  });
+
+  test("with dropForeignImages, a foreign image URL is DROPPED (SSRF / tracking-pixel guard for model-authored text)", () => {
+    const { container } = render(
+      <MarkdownContent text="![x](https://evil.example/pixel.gif)" dropForeignImages />
+    );
+    expect(container.querySelector("img")).toBeNull();
+  });
+
+  test("by default (trusted doc/file/skill markdown), an ordinary image renders", () => {
+    const { container } = render(
+      <MarkdownContent text="![diagram](https://example.com/diagram.png)" />
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img?.getAttribute("src")).toBe("https://example.com/diagram.png");
+  });
+
+  test("even by default, a gini-upload image ref is rewritten to the BFF URL (not the raw scheme)", () => {
+    const { container } = render(
+      <MarkdownContent text="![shot](gini-upload://up_xyz)" />
+    );
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("/api/runtime/uploads/up_xyz");
+  });
+
+  test("dropForeignImages still rewrites a gini-upload image ref (the allowlist only drops FOREIGN srcs)", () => {
+    const { container } = render(
+      <MarkdownContent text="![shot](gini-upload://up_kept)" dropForeignImages />
+    );
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("/api/runtime/uploads/up_kept");
+  });
+
+  test("a gini-upload link ref renders a chip that opens the inline preview URL", () => {
+    render(<MarkdownContent text="[report.pdf](gini-upload://up_pdf99)" />);
+    const link = screen.getByText("report.pdf").closest("a");
+    // The chip opens the upload as an inline preview (?inline=1) in a new tab,
+    // not a forced download.
+    expect(link?.getAttribute("href")).toBe("/api/runtime/uploads/up_pdf99?inline=1");
+    expect(link?.getAttribute("target")).toBe("_blank");
+  });
+
+  test("a normal external link still renders untouched", () => {
+    render(<MarkdownContent text="see [the docs](https://example.com/docs)" />);
+    const link = screen.getByText("the docs").closest("a");
+    expect(link?.getAttribute("href")).toBe("https://example.com/docs");
+  });
 });

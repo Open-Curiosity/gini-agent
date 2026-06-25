@@ -840,6 +840,470 @@ describe("telegram poller supervisor", () => {
     }
   });
 
+  test("reply mirror forwards an inline image ref as a Telegram photo and strips the tag from the text", async () => {
+    const config = testConfig("tg-outbound-photo");
+    const { storeUpload } = await import("../state");
+    const sendPhotoCalls: Array<{ chatId: string | number; source: unknown; caption?: string }> = [];
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      async sendPhoto(chatId, source, options) {
+        sendPhotoCalls.push({ chatId, source, caption: options?.caption });
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["55"],
+      botToken: "TOK"
+    });
+
+    // Store a real upload so uploadPathFor resolves a path the mirror sends.
+    const upload = storeUpload(config.instance, new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", "shot.png");
+
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_photo_tg",
+        instance: config.instance,
+        title: "screenshot",
+        input: "screenshot lego.com",
+        status: "completed",
+        // The agent embeds the image as a gini-upload:// markdown ref in its
+        // reply text — the mirror pulls the id out and sends the photo.
+        summary: `Here's the screenshot. ![screenshot](gini-upload://${upload.id})`,
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_photo_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_photo_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_photo_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 55, target: "55" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_photo_tg",
+      55,
+      client,
+      controller.signal
+    );
+
+    // The image ref is sent as a caption-less photo, and the text (with the
+    // markdown tag stripped) goes as its own message. Two separate sends so
+    // the reply can never be lost to a caption-length limit or photo failure.
+    expect(sendPhotoCalls.length).toBe(1);
+    expect(sendMessageCalls.length).toBe(1);
+    const call = sendPhotoCalls[0]!;
+    expect(call.caption).toBeUndefined();
+    // The raw gini-upload:// tag must NOT appear in the user-facing text.
+    expect(sendMessageCalls[0]).toContain("Here's the screenshot");
+    expect(sendMessageCalls[0]).not.toContain("gini-upload://");
+    const source = call.source as { kind?: string; path?: string };
+    expect(source.kind).toBe("path");
+    expect(source.path?.endsWith(`${upload.id}.png`)).toBe(true);
+  });
+
+  test("reply mirror keeps a NON-image attachment's filename in the text (not silently dropped)", async () => {
+    const config = testConfig("tg-outbound-doc");
+    const { storeUpload } = await import("../state");
+    const sendPhotoCalls: unknown[] = [];
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      async sendPhoto(chatId) {
+        sendPhotoCalls.push({ chatId });
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `f/${fileId}` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["55"],
+      botToken: "TOK"
+    });
+
+    // A non-image upload (PDF). Telegram sendDocument isn't wired yet, so the
+    // file isn't sent — but its filename label must survive in the text so the
+    // attachment doesn't vanish without a trace.
+    const upload = storeUpload(
+      config.instance,
+      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      "application/pdf",
+      "release-notes.pdf"
+    );
+
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_doc_tg",
+        instance: config.instance,
+        title: "send pdf",
+        input: "send me the pdf",
+        status: "completed",
+        summary: `Here are the files: [release-notes.pdf](gini-upload://${upload.id})`,
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_doc_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_doc_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_doc_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 55, target: "55" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_doc_tg",
+      55,
+      client,
+      controller.signal
+    );
+
+    // No photo (it's not an image), but the text is sent with the FILENAME
+    // visible and only the unusable gini-upload:// link target removed. The
+    // outbound text is MarkdownV2-escaped (`-` and `.` get backslash-escaped),
+    // so match the filename with the escaping the send layer applies.
+    expect(sendPhotoCalls.length).toBe(0);
+    expect(sendMessageCalls.length).toBe(1);
+    expect(sendMessageCalls[0]).toContain("release\\-notes\\.pdf");
+    expect(sendMessageCalls[0]).not.toContain("gini-upload://");
+  });
+
+  test("a FAILED image photo send keeps the image's alt label in the mirrored text", async () => {
+    const config = testConfig("tg-outbound-photo-fail");
+    const { storeUpload } = await import("../state");
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      // The photo send FAILS. sendMessagingOutput swallows this into a
+      // status:"failed" record (it does not throw), so the mirror must NOT
+      // treat the image as delivered.
+      async sendPhoto() {
+        throw new Error("telegram 413: photo too large");
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `f/${fileId}` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["55"],
+      botToken: "TOK"
+    });
+
+    const upload = storeUpload(config.instance, new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", "shot.png");
+
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_photofail_tg",
+        instance: config.instance,
+        title: "screenshot",
+        input: "screenshot it",
+        status: "completed",
+        summary: `Here's the shot: ![the-screenshot](gini-upload://${upload.id})`,
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_photofail_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_photofail_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_photofail_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 55, target: "55" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_photofail_tg",
+      55,
+      client,
+      controller.signal
+    );
+
+    // The photo didn't deliver, so its tag is NOT stripped — the alt label
+    // survives in the text (MarkdownV2-escaped) so the attachment isn't lost.
+    expect(sendMessageCalls.length).toBe(1);
+    expect(sendMessageCalls[0]).toContain("the\\-screenshot");
+    expect(sendMessageCalls[0]).not.toContain("gini-upload://");
+  });
+
+  test("a [SILENT]-suppressed turn does NOT leak its outbound image to Telegram", async () => {
+    const config = testConfig("tg-silent-photo");
+    const { storeUpload } = await import("../state");
+    const sendPhotoCalls: unknown[] = [];
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      async sendPhoto(chatId) {
+        sendPhotoCalls.push({ chatId });
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["56"],
+      botToken: "TOK"
+    });
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_silent_tg",
+        instance: config.instance,
+        title: "watch",
+        input: "watch",
+        status: "completed",
+        // The [SILENT] sentinel — syncChatTaskResult returns null and the
+        // reply is suppressed. The image must be suppressed with it.
+        summary: "[SILENT]",
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_silent_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_silent_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_silent_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 56, target: "56" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_silent_tg",
+      56,
+      client,
+      controller.signal
+    );
+
+    // Fully silent: a [SILENT] reply is suppressed (syncChatTaskResult returns
+    // null), and since any image ref would live INSIDE that suppressed reply
+    // text, nothing — neither text nor photo — goes out.
+    expect(sendPhotoCalls.length).toBe(0);
+    expect(sendMessageCalls.length).toBe(0);
+  });
+
+  test("a reply longer than Telegram's caption limit sends the photo caption-less + the text as a separate message", async () => {
+    const config = testConfig("tg-long-caption");
+    const { storeUpload } = await import("../state");
+    const sendPhotoCalls: Array<{ caption?: string }> = [];
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      async sendPhoto(chatId, _source, options) {
+        sendPhotoCalls.push({ caption: options?.caption });
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["57"],
+      botToken: "TOK"
+    });
+    const upload = storeUpload(config.instance, new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", "shot.png");
+    // A reply well past Telegram's 1024-char caption cap, with the image ref
+    // embedded inline.
+    const longReply = "x".repeat(1500) + ` ![shot](gini-upload://${upload.id})`;
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_long_tg",
+        instance: config.instance,
+        title: "screenshot",
+        input: "screenshot",
+        status: "completed",
+        summary: longReply,
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_long_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_long_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_long_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 57, target: "57" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_long_tg",
+      57,
+      client,
+      controller.signal
+    );
+
+    // The photo went out caption-less, and the full text (tag stripped) went as
+    // its own message — nothing was lost to the 1024-char caption ceiling, and
+    // the >1024-char body proves we never tried to ride it as a caption.
+    expect(sendPhotoCalls.length).toBe(1);
+    expect(sendPhotoCalls[0]!.caption).toBeUndefined();
+    expect(sendMessageCalls.length).toBe(1);
+    expect(sendMessageCalls[0]!.length).toBeGreaterThan(1024);
+    expect(sendMessageCalls[0]!).not.toContain("gini-upload://");
+  });
+
   test("disabled bridges have their loop stopped on next reconcile", async () => {
     const config = testConfig("poller-disable");
     setMessagingDeps({ telegramClientFactory: () => deferredClient().client });

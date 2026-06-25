@@ -4,11 +4,14 @@ import { createElement } from "react";
 // the components under test are imported. The same mocks are used by
 // linkContextMenu.test so the two files can run in one process.
 import {
+  alert,
+  downloadAsync,
   effectCleanups,
   loopStart,
   loopStop,
   openBrowserAsync,
   Platform,
+  share,
   Text,
   TextInput,
   View
@@ -16,6 +19,9 @@ import {
 
 const { markdownRules, BlockAssistantText } = await import(
   "@/src/components/chat/BlockAssistantText"
+);
+const { openUploadAttachment } = await import(
+  "@/src/components/chat/uploadAttachment"
 );
 const { SelectableBlockText } = await import(
   "@/src/components/chat/SelectableBlockText"
@@ -111,6 +117,23 @@ describe("bug: markdown links inside iOS block text are not clickable", () => {
     const inner = renderBlock("paragraph", nested, ["x"]);
     expect(inner.type).toBe(Text);
   });
+
+  test("iOS paragraph whose only link is a gini-upload chip renders as Text, not TextInput", () => {
+    // A `gini-upload://` chip has a live onPress (mint signed url + open the
+    // in-app browser), so it's interactive and must flip the block off the
+    // TextInput selection path — otherwise the wrapper swallows the chip's tap
+    // and the file chip is inert on iOS. Mirrors the http(s) case above.
+    const para: Node = {
+      key: "p",
+      type: "paragraph",
+      children: [linkNode("gini-upload://up_pdf01", "report.pdf")]
+    };
+    const inner = renderBlock("paragraph", para, [
+      rule("link")(linkNode("gini-upload://up_pdf01", "report.pdf"), "report.pdf", [], styles)
+    ]);
+    expect(inner.type).toBe(Text);
+    expect(inner.props.selectable).toBeFalsy();
+  });
 });
 
 describe("link tap and long-press wiring", () => {
@@ -160,6 +183,102 @@ describe("link tap and long-press wiring", () => {
       expect(el.props.onPress).toBeUndefined();
       expect(el.props.onLongPress).toBeUndefined();
     }
+  });
+});
+
+describe("non-image attachment chip (gini-upload:// link)", () => {
+  function uploadLink(label: string): Node {
+    return {
+      key: "ul",
+      type: "link",
+      content: "",
+      attributes: { href: "gini-upload://up_pdf01" },
+      children: [{ key: "t", type: "text", content: label, children: [] }]
+    };
+  }
+
+  test("tapping the chip mints a signed url and opens it in the in-app browser", async () => {
+    Platform.OS = "ios";
+    openBrowserAsync.mockClear();
+    const el = rule("link")(uploadLink("report.pdf"), "report.pdf", [], styles);
+    expect(typeof el.props.onPress).toBe("function");
+    // The chip stays a plain Text node so it can sit mid-prose.
+    expect(el.type).toBe(Text);
+    el.props.onPress();
+    // onPress fire-and-forgets the async mint+open; await a couple ticks so the
+    // sign promise resolves and openLink fires before asserting.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    // signUploadUrl (mocked in chatMockSetup) returns a signed url; openLink
+    // opens it via the in-app browser (openBrowserAsync), NOT a download.
+    expect(openBrowserAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_pdf01?inline=1&exp=9999999999&sig=deadbeef"
+    );
+  });
+
+  test("openUploadAttachment (the fallback) downloads with the bearer then shares (iOS)", async () => {
+    Platform.OS = "ios";
+    downloadAsync.mockClear();
+    share.mockClear();
+    await openUploadAttachment("up_pdf01", "report.pdf");
+    // The cache dest is namespaced by upload id so two same-named uploads
+    // can't collide / overwrite each other's bytes.
+    expect(downloadAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_pdf01",
+      "/cache/up_pdf01-report.pdf",
+      { headers: { authorization: "Bearer t" } }
+    );
+    expect(share).toHaveBeenCalledWith({ url: "/cache/up_pdf01-report.pdf" });
+  });
+
+  test("a label-less upload chip still opens (filename falls back to 'attachment')", async () => {
+    Platform.OS = "ios";
+    openBrowserAsync.mockClear();
+    const node: Node = {
+      key: "ul2",
+      type: "link",
+      content: "",
+      attributes: { href: "gini-upload://up_x" },
+      children: []
+    };
+    const el = rule("link")(node, [], [], styles);
+    el.props.onPress();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(openBrowserAsync).toHaveBeenCalledWith(
+      "http://gw.local/api/uploads/up_x?inline=1&exp=9999999999&sig=deadbeef"
+    );
+  });
+
+  test("openUploadAttachment surfaces a download failure via Alert", async () => {
+    alert.mockClear();
+    downloadAsync.mockImplementationOnce(() => Promise.reject(new Error("offline")));
+    await openUploadAttachment("up_err", "report.pdf");
+    expect(alert).toHaveBeenCalledWith("Couldn't open attachment", "offline");
+  });
+});
+
+describe("inline image rule (gini-upload:// image ref)", () => {
+  test("a gini-upload image ref renders the AuthedImage preview component", () => {
+    const node: Node = { key: "img", type: "image", content: "", attributes: { src: "gini-upload://up_img1" } as never, children: [] };
+    const el = rule("image")(node, [], [], styles);
+    expect(el).not.toBeNull();
+    // The element is the MarkdownUploadImage function component; invoking it
+    // exercises the hook + AuthedImage wiring and its tap handler.
+    const Comp = el.type as (p: { uploadId: string }) => any;
+    const rendered = Comp({ uploadId: "up_img1" });
+    expect(typeof rendered.props.onPress).toBe("function");
+    // Tapping opens the full-screen preview (mocked useImagePreview.open).
+    rendered.props.onPress();
+  });
+
+  test("a non-upload image src is DROPPED (returns null) — SSRF/tracking-pixel guard", () => {
+    const node: Node = { key: "img2", type: "image", content: "", attributes: { src: "https://evil.example/p.gif" } as never, children: [] };
+    expect(rule("image")(node, [], [], styles)).toBeNull();
+    const noSrc: Node = { key: "img3", type: "image", content: "", attributes: {} as never, children: [] };
+    expect(rule("image")(noSrc, [], [], styles)).toBeNull();
   });
 });
 

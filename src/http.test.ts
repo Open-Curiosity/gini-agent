@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import "./hooks/builtins"; // the email-watch routes provision a backing job, which validates isKnownHook("skill-script")
-import { createHandler } from "./http";
+import { createHandler, resolveInlineUpload } from "./http";
 import { logDir, uploadsDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
@@ -6456,6 +6456,183 @@ describe("GET /api/files", () => {
     // it may stream via byte ranges (iOS AVPlayer requires this to play remote
     // audio at all).
     expect(fetched.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  // `?inline=1` opts a safe-allowlisted upload into content-disposition: inline
+  // so a file/PDF chip can open it as a preview in a browser tab instead of
+  // forcing a download. These pin the per-mime allowlist decisions (the SSRF /
+  // top-level-script surface lives in the unsafe branches).
+  test("GET /api/uploads?inline=1 serves a PDF inline with its real type", async () => {
+    const config = testConfig("uploads-inline-pdf");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "report.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pdf");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  test("GET /api/uploads?inline=1 serves a PNG inline with its real type", async () => {
+    const config = testConfig("uploads-inline-png");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", "shot.png");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("GET /api/uploads?inline=1 coerces a markdown upload to text/plain inline", async () => {
+    const config = testConfig("uploads-inline-md");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("# Title\n"), "text/markdown", "notes.md");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    // Coerced to text/plain so the browser shows raw text rather than
+    // interpreting/executing the payload as a document.
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("GET /api/uploads?inline=1 never serves an SVG inline — keeps attachment", async () => {
+    const config = testConfig("uploads-inline-svg");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("<svg/>"), "image/svg+xml", "x.svg");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+  });
+
+  test("GET /api/uploads?inline=1 never serves HTML inline — keeps attachment", async () => {
+    const config = testConfig("uploads-inline-html");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new TextEncoder().encode("<h1>x</h1>"), "text/html", "x.html");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+  });
+
+  test("resolveInlineUpload returns null without the inline param and gates by mime", () => {
+    // No inline param → always download, regardless of a safe mime.
+    expect(resolveInlineUpload(null, "application/pdf")).toBeNull();
+    expect(resolveInlineUpload("", "application/pdf")).toBeNull();
+    // Safe direct image/pdf → its own type.
+    expect(resolveInlineUpload("1", "application/pdf")).toEqual({ contentType: "application/pdf" });
+    expect(resolveInlineUpload("1", "image/jpeg")).toEqual({ contentType: "image/jpeg" });
+    // Text-like → coerced to text/plain.
+    expect(resolveInlineUpload("1", "text/csv")).toEqual({ contentType: "text/plain; charset=utf-8" });
+    expect(resolveInlineUpload("1", "application/json")).toEqual({ contentType: "text/plain; charset=utf-8" });
+    // Unsafe / unknown → null (download).
+    expect(resolveInlineUpload("1", "image/svg+xml")).toBeNull();
+    expect(resolveInlineUpload("1", "text/html")).toBeNull();
+    expect(resolveInlineUpload("1", "application/octet-stream")).toBeNull();
+  });
+
+  // A mobile in-app browser can't send the bearer header or the gateway cookie,
+  // so the app mints a short-lived SIGNED url (POST /api/uploads/:id/sign) and
+  // opens that. These pin: the mint is bearer-gated, the signed url authorizes a
+  // header-less GET, and the signature is scoped + expiring.
+  test("POST /api/uploads/:id/sign mints a signed path that authorizes a header-less GET", async () => {
+    const config = testConfig("uploads-sign-ok");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "report.pdf");
+
+    const minted = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }, config.token);
+    expect(minted.status).toBe(200);
+    const body = await minted.json();
+    expect(body.path).toContain(`/api/uploads/${ref.id}?inline=1`);
+    expect(body.path).toMatch(/[?&]exp=\d+/);
+    expect(body.path).toMatch(/[?&]sig=[0-9a-f]{64}/);
+    expect(typeof body.exp).toBe("number");
+
+    // The signed path authorizes a GET with NO Authorization header.
+    const got = await rawCall(handler, config, body.path, {});
+    expect(got.status).toBe(200);
+    expect(got.headers.get("content-type")).toBe("application/pdf");
+    expect(got.headers.get("content-disposition")).toBe("inline");
+  });
+
+  test("the mint endpoint itself still requires a bearer", async () => {
+    const config = testConfig("uploads-sign-gated");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }); // no token
+    expect(res.status).toBe(401);
+  });
+
+  test("signing an unknown upload id returns 404 (no signature for absent bytes)", async () => {
+    const config = testConfig("uploads-sign-404");
+    const handler = createHandler(config);
+    const res = await rawCall(handler, config, `/api/uploads/does-not-exist/sign`, { method: "POST" }, config.token);
+    expect(res.status).toBe(404);
+  });
+
+  test("an unsigned, unauthenticated upload GET is rejected 401", async () => {
+    const config = testConfig("uploads-sign-unsigned");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1`, {}); // no token, no sig
+    expect(res.status).toBe(401);
+  });
+
+  test("a tampered upload id on a signed url fails (signature is scoped to one id)", async () => {
+    const config = testConfig("uploads-sign-scope");
+    const handler = createHandler(config);
+    const a = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "a.pdf");
+    const b = storeUpload(config.instance, new Uint8Array([4, 5, 6]), "application/pdf", "b.pdf");
+    const minted = await rawCall(handler, config, `/api/uploads/${a.id}/sign`, { method: "POST" }, config.token);
+    const { path } = await minted.json();
+    // Swap a's id for b's id but keep a's signature → must fail.
+    const sig = new URL(`http://x${path}`).searchParams.get("sig");
+    const exp = new URL(`http://x${path}`).searchParams.get("exp");
+    const forged = `/api/uploads/${b.id}?inline=1&exp=${exp}&sig=${sig}`;
+    const res = await rawCall(handler, config, forged, {});
+    expect(res.status).toBe(401);
+  });
+
+  test("an expired signature is rejected 401", async () => {
+    const config = testConfig("uploads-sign-expired");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "application/pdf", "x.pdf");
+    // Mint with the minimum TTL clamp (30s), then forge an already-past exp by
+    // re-signing with a past timestamp using the same module the gateway uses.
+    const pastExp = Math.floor(Date.now() / 1000) - 10;
+    const { signUploadParams } = await import("./lib/upload-signing");
+    const { sig } = signUploadParams(config.token, ref.id, pastExp);
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}?inline=1&exp=${pastExp}&sig=${sig}`, {});
+    expect(res.status).toBe(401);
+  });
+
+  test("a caller-supplied ?ttl= is honored and clamped to the [30,600]s ceiling", async () => {
+    const config = testConfig("uploads-sign-ttl");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "x.pdf");
+
+    // An in-range ttl rides through unchanged; an over-max one clamps to 600.
+    // The exp the mint returns is now + clampedTtl, so assert exp lands within a
+    // small window of that target (a couple seconds for clock drift across the call).
+    const now = Math.floor(Date.now() / 1000);
+    const inRange = await rawCall(handler, config, `/api/uploads/${ref.id}/sign?ttl=120`, { method: "POST" }, config.token);
+    expect(inRange.status).toBe(200);
+    expect((await inRange.json()).exp - now).toBeLessThanOrEqual(122);
+
+    const clamped = await rawCall(handler, config, `/api/uploads/${ref.id}/sign?ttl=99999`, { method: "POST" }, config.token);
+    expect(clamped.status).toBe(200);
+    const clampedExp = (await clamped.json()).exp - Math.floor(Date.now() / 1000);
+    expect(clampedExp).toBeGreaterThan(595);
+    expect(clampedExp).toBeLessThanOrEqual(600);
+  });
+
+  test("a signed HEAD is also authorized (in-app browser preflight)", async () => {
+    const config = testConfig("uploads-sign-head");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "x.pdf");
+    const minted = await rawCall(handler, config, `/api/uploads/${ref.id}/sign`, { method: "POST" }, config.token);
+    const { path } = await minted.json();
+    const res = await rawCall(handler, config, path, { method: "HEAD" });
+    expect(res.status).toBe(200);
   });
 
   // iOS AVPlayer won't start a remote audio AVURLAsset unless the server honors

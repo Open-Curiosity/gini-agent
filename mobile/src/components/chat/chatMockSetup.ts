@@ -40,6 +40,8 @@ export const openBrowserAsync = mock((_url: string) => Promise.resolve());
 export const linkingOpenURL = mock((_url: string) => Promise.resolve());
 export const setStringAsync = mock((_s: string) => Promise.resolve(true));
 export const share = mock((_opts: unknown) => Promise.resolve({} as never));
+export const alert = mock((_title: string, _message?: string) => {});
+export const downloadAsync = mock((_uri: string, dest: string) => Promise.resolve({ uri: dest }));
 export const loopStart = mock(() => {});
 export const loopStop = mock(() => {});
 
@@ -59,6 +61,7 @@ mock.module("react-native", () => ({
   Pressable,
   Image,
   Share: { share },
+  Alert: { alert },
   Linking: { openURL: linkingOpenURL },
   StyleSheet: {
     create: (s: unknown) => s,
@@ -101,6 +104,38 @@ mock.module("react-native-markdown-display", () => ({
 mock.module("expo-web-browser", () => ({ openBrowserAsync }));
 mock.module("expo-clipboard", () => ({ setStringAsync }));
 mock.module("@expo/vector-icons", () => ({ Feather: Stub }));
+// uploadAttachment.ts (imported transitively via BlockAssistantText's link
+// rule) pulls expo-file-system/legacy at import; stub the one fn it uses so
+// the native graph isn't dragged in.
+mock.module("expo-file-system/legacy", () => ({ cacheDirectory: "/cache/", downloadAsync }));
+
+// AuthedImage and ImagePreview pull in native modules (reanimated / gesture-
+// handler) at import time; BlockAssistantText/BlockUserText now import them for
+// inline upload images. Stub both so the component tests don't drag the native
+// graph in. (The markdown lib is mocked to render null above, so the image
+// rule that uses these never actually executes here.)
+mock.module("@/src/components/chat/AuthedImage", () => ({ AuthedImage: Stub }));
+mock.module("@/src/components/ImagePreview", () => ({
+  useImagePreview: () => ({ open: () => {} })
+}));
+mock.module("@/src/upload-ref", () => ({
+  UPLOAD_REF_SCHEME: "gini-upload://",
+  uploadIdFromRef: (ref?: string | null) =>
+    ref && ref.startsWith("gini-upload://") ? ref.slice("gini-upload://".length) : null
+}));
+// @/src/api pulls in expo-file-system at import; the chat components only need
+// uploadUrl/authHeader for inline upload images and uploadRawSource for the
+// non-image attachment download.
+mock.module("@/src/api", () => ({
+  uploadUrl: (id: string) => `http://gw.local/api/uploads/${id}`,
+  authHeader: () => ({ Authorization: "Bearer t" }),
+  uploadRawSource: (id: string) => ({
+    uri: `http://gw.local/api/uploads/${id}`,
+    headers: { authorization: "Bearer t" }
+  }),
+  signUploadUrl: (id: string) =>
+    Promise.resolve(`http://gw.local/api/uploads/${id}?inline=1&exp=9999999999&sig=deadbeef`)
+}));
 
 mock.module("@/src/theme", () => ({
   theme: {

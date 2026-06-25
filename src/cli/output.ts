@@ -1,5 +1,67 @@
+import { uploadIdsFromText } from "../lib/upload-ref";
+
 export function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+// A chat block as the CLI cares about it for attachment rendering. Loosely
+// typed because the CLI consumes the wire JSON, not the runtime ChatBlock type.
+// Outbound attachments ride INLINE in the reply text as `gini-upload://<id>`
+// markdown refs (the model pastes them where the attachment belongs) — the
+// block schema carries no structured `images` field. The text the ref lives in
+// differs by kind: an assistant_text block keeps it in `text`, a tool_result
+// block in `preview`.
+interface RenderableBlock {
+  kind?: string;
+  text?: string;
+  preview?: string;
+}
+
+// Block kinds that can carry OUTBOUND (agent-produced) attachment refs, mapped
+// to the field whose text holds the reply prose. user_text is inbound — the
+// user's own uploads, which they already have locally — so it's excluded; this
+// function is outbound-only by name and behavior.
+const OUTBOUND_TEXT_FIELD: Record<string, "text" | "preview"> = {
+  assistant_text: "text",
+  tool_result: "preview"
+};
+
+// Render outbound attachments for the CLI. A terminal can't display a picture
+// (or a PDF), so the honest behavior is: parse the `gini-upload://<id>` refs the
+// model pasted into its reply text, fetch each upload's bytes via
+// GET /api/uploads/:id, write them to a temp file, and print the saved path so
+// the user can open it. Returns the number of attachments saved. The fetcher —
+// which also reports the upload's mime so the saved file gets a sensible
+// extension (the markdown ref carries no mime) — is injected so this stays
+// unit-testable without a live gateway. Each id is saved once even if referenced
+// by multiple blocks.
+export async function renderOutboundAttachments(
+  blocks: unknown,
+  deps: {
+    fetchUpload: (id: string) => Promise<{ bytes: Uint8Array; mimeType: string }>;
+    savePath: (id: string, mimeType: string) => string;
+    writeFile: (path: string, bytes: Uint8Array) => void;
+  }
+): Promise<number> {
+  if (!Array.isArray(blocks)) return 0;
+  const seen = new Set<string>();
+  let saved = 0;
+  for (const block of blocks as RenderableBlock[]) {
+    const field = block?.kind ? OUTBOUND_TEXT_FIELD[block.kind] : undefined;
+    if (!field) continue;
+    const text = block[field];
+    if (typeof text !== "string") continue;
+    for (const id of uploadIdsFromText(text)) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const { bytes, mimeType } = await deps.fetchUpload(id);
+      const path = deps.savePath(id, mimeType);
+      deps.writeFile(path, bytes);
+      console.log(paint("dim", "📎 attachment saved:") + ` ${path}`);
+      saved += 1;
+    }
+  }
+  return saved;
 }
 
 const ANSI = {
