@@ -5173,7 +5173,13 @@ describe("anthropic provider", () => {
         { role: "assistant", content: "", tool_calls: [{ id: "tu_ok", type: "function", function: { name: "list_toolsets", arguments: "{}" } }] },
         { role: "tool", tool_call_id: "tu_ok", content: "{\"ok\":true}" }
       ];
-      await generateToolCallingResponse(config(provider), messages, []);
+      // Structured tool blocks (and thus the ids asserted below) only survive
+      // translation when a toolConfig rides along, so load tools for this turn.
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "load_tools", description: "d", parameters: { type: "object", properties: {} } } },
+        { type: "function", function: { name: "list_toolsets", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), messages, tools);
       const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
       const dumped = JSON.stringify(body.messages);
       expect(dumped).not.toContain("tu_dangle");
@@ -5259,7 +5265,11 @@ describe("anthropic provider", () => {
         // Same id, but NO result this turn — must be dropped, not rescued by turn 1's result.
         { role: "assistant", content: "", tool_calls: [{ id: "dup_id", type: "function", function: { name: "search", arguments: "{}" } }] }
       ];
-      await generateToolCallingResponse(config(provider), messages, []);
+      // Structured tool blocks only survive translation alongside a toolConfig.
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "search", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), messages, tools);
       const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
         messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
       };
@@ -5307,7 +5317,13 @@ describe("anthropic provider", () => {
         { role: "assistant", content: "thinking out loud" }, // interleaved plain text
         { role: "tool", tool_call_id: "tu_x", content: "{\"ok\":true}" }
       ];
-      await generateToolCallingResponse(config(provider), messages, []);
+      // Structured tool blocks only survive translation when a toolConfig rides
+      // along (Converse rejects tool blocks otherwise), so this hoisting case is
+      // only reachable with tools loaded — pass one.
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "search", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), messages, tools);
       const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
         messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
       };
@@ -5325,6 +5341,50 @@ describe("anthropic provider", () => {
         (m) => m.role === "assistant" && m.content.some((b) => b.text === "thinking out loud")
       );
       expect(survived).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  // The iteration-cap / no-progress summary turn re-sends the whole transcript
+  // (which contains tool calls + results) but advertises NO tools, to force a
+  // text-only final answer. Converse 400s if tool blocks ride without a
+  // toolConfig ("The toolConfig field must be defined when using toolUse and
+  // toolResult content blocks"), and toolConfig can't be empty — so the history's
+  // tool blocks must flatten to text. Before the fix this 400 turned a recoverable
+  // cap into a hard task failure (the user lost the best-effort summary entirely).
+  test("bedrock: tool-less summary over tool history flattens tool blocks to text (no toolConfig 400)", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "summary" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "download the docs" },
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_1", type: "function", function: { name: "browser_navigate", arguments: "{\"url\":\"x\"}" } }] },
+        { role: "tool", tool_call_id: "tu_1", content: "{\"page\":1}" },
+        { role: "user", content: "You have reached the maximum number of tool-calling iterations. Write a final answer." }
+      ];
+      // Summary turn: NO tools advertised, exactly like chat-task's exhaustion path.
+      const result = await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        toolConfig?: unknown;
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // No toolConfig is sent on a tool-less turn...
+      expect(body.toolConfig).toBeUndefined();
+      // ...so NO structured tool blocks may remain, or Converse 400s.
+      const hasToolBlock = body.messages.some((m) => m.content.some((b) => b.toolUse || b.toolResult));
+      expect(hasToolBlock).toBe(false);
+      // The tool history survives as readable text so the model can still summarize.
+      const flat = JSON.stringify(body.messages);
+      expect(flat).toContain("Called tool browser_navigate");
+      expect(flat).toContain("Tool result:");
+      expect(result.text).toBe("summary");
     } finally {
       fetchStub.restore();
       restoreSk();

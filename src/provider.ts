@@ -2347,7 +2347,20 @@ function converseUserContent(content: string | MessageContentPart[] | null): Arr
 // into toolUse blocks, and collapse consecutive tool results into one user
 // message of toolResult blocks (Converse requires tool results to lead a user
 // turn that immediately follows the assistant toolUse turn).
-function translateMessagesToConverse(messages: ToolCallingMessage[]): ConverseTranslation {
+//
+// `stripToolBlocks` flattens tool_calls and tool results to plain text instead of
+// structured toolUse/toolResult blocks. Converse hard-rejects tool blocks unless
+// the request also carries a toolConfig ("The toolConfig field must be defined
+// when using toolUse and toolResult content blocks"), and toolConfig itself
+// rejects an empty tools array — so a tool-less call (e.g. the iteration-cap
+// summary turn, which intentionally advertises no tools) over a history that
+// contains tool blocks has no valid structured representation. Rendering the
+// history as text keeps the model grounded in what it did without re-opening the
+// tool channel it was told is closed.
+function translateMessagesToConverse(
+  messages: ToolCallingMessage[],
+  stripToolBlocks = false
+): ConverseTranslation {
   const system: Array<{ text: string }> = [];
   const out: Array<Record<string, unknown>> = [];
   let i = 0;
@@ -2363,13 +2376,17 @@ function translateMessagesToConverse(messages: ToolCallingMessage[]): ConverseTr
       while (i < messages.length && messages[i].role === "tool") {
         const toolMessage = messages[i];
         const text = typeof toolMessage.content === "string" ? toolMessage.content : JSON.stringify(toolMessage.content ?? "");
-        blocks.push({
-          toolResult: {
-            toolUseId: toolMessage.tool_call_id ?? "",
-            // Converse rejects an empty tool_result content; pad an empty result.
-            content: [{ text: text.length > 0 ? text : " " }]
-          }
-        });
+        if (stripToolBlocks) {
+          blocks.push({ text: text.length > 0 ? `Tool result: ${text}` : "Tool result: (empty)" });
+        } else {
+          blocks.push({
+            toolResult: {
+              toolUseId: toolMessage.tool_call_id ?? "",
+              // Converse rejects an empty tool_result content; pad an empty result.
+              content: [{ text: text.length > 0 ? text : " " }]
+            }
+          });
+        }
         i++;
       }
       out.push({ role: "user", content: blocks });
@@ -2389,9 +2406,14 @@ function translateMessagesToConverse(messages: ToolCallingMessage[]): ConverseTr
     }
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     for (const call of toolCalls) {
-      blocks.push({
-        toolUse: { toolUseId: call.id, name: call.function.name, input: parseJsonObject(call.function.arguments || "{}") }
-      });
+      if (stripToolBlocks) {
+        const args = call.function.arguments || "{}";
+        blocks.push({ text: `Called tool ${call.function.name}(${args})` });
+      } else {
+        blocks.push({
+          toolUse: { toolUseId: call.id, name: call.function.name, input: parseJsonObject(call.function.arguments || "{}") }
+        });
+      }
     }
     if (blocks.length === 0) blocks.push({ text: "" });
     out.push({ role: "assistant", content: blocks });
@@ -2479,7 +2501,10 @@ async function callBedrockConverse(
     Boolean(onDelta) && !(toolConfig && !bedrockSupportsStreamingWithTools(provider.model));
   const url = bedrockConverseUrl(region, provider.model, wantStream);
   const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
-  const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
+  // No toolConfig (tool-less turn, or a model that rejects tool use) ⟹ the
+  // request must not carry tool blocks either, or Converse 400s. Flatten any
+  // history tool blocks to text in that case.
+  const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages, !toolConfig);
   const extraMax =
     isRecord(provider.extraBody) && typeof provider.extraBody.max_tokens === "number" ? provider.extraBody.max_tokens : undefined;
   const maxTokens = maxTokensOverride ?? extraMax ?? DEFAULT_ANTHROPIC_MAX_TOKENS;
