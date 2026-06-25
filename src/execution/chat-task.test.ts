@@ -984,7 +984,7 @@ describe("chat-task loop", () => {
   // Loop-breaker (identical-repeat). A model that emits the IDENTICAL tool
   // call and gets the IDENTICAL result several iterations in a row is stuck;
   // the loop must stop at MAX_IDENTICAL_TOOL_REPEATS (3) — well before the
-  // 90-iteration cap — and route to the same graceful tool-less summary exit.
+  // iteration cap — and route to the same graceful tool-less summary exit.
   // We drive a cold browser_connect (no page open → deterministic ok:false
   // guard refusal every turn) to reproduce the real stuck-loop scenario.
   test("stops at the identical-repeat loop-breaker and completes via a tool-less summary", async () => {
@@ -1030,7 +1030,7 @@ describe("chat-task loop", () => {
     expect(finished.error).toBeUndefined();
 
     // Exactly four model calls: three repeated tool turns + one tool-less
-    // summary — proving we stopped at the loop-breaker, not the 90-cap.
+    // summary — proving we stopped at the loop-breaker, not the iteration cap.
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(4);
     // The final summary turn is the tool-less exit: its last message is the
@@ -1055,7 +1055,7 @@ describe("chat-task loop", () => {
   // (same name + arguments) but gets a DIFFERENT result every iteration —
   // the real browser_navigate case, where each live-page snapshot jitters —
   // slips past the exact-match guard, so the coarser action-only guard must
-  // catch it at MAX_SAME_ACTION_REPEATS (6) instead of running to the 90-cap.
+  // catch it at MAX_SAME_ACTION_REPEATS (6) instead of running to the iteration cap.
   // We drive get_current_time, whose result (a timestamp) differs each call.
   test("stops at the action-only loop-breaker when results jitter but the action repeats", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
@@ -1098,7 +1098,7 @@ describe("chat-task loop", () => {
     expect(finished.error).toBeUndefined();
 
     // Exactly seven model calls: six repeated tool turns + one tool-less
-    // summary — proving the action-only guard stopped us at 6, not the 90-cap.
+    // summary — proving the action-only guard stopped us at 6, not the iteration cap.
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(7);
 
@@ -1225,7 +1225,7 @@ describe("chat-task loop", () => {
       (t) => t.type === "warning" && /navigations to recently-visited URLs.*loop-breaker/.test(t.message)
     );
     expect(navBreaker).toBeDefined();
-    // Stopped well before the 90-cap: 10 navigation turns + 1 summary turn.
+    // Stopped well before the iteration cap: 10 navigation turns + 1 summary turn.
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(11);
 
@@ -1234,8 +1234,8 @@ describe("chat-task loop", () => {
 
   // Invalid `agent.maxIterations` values must fall back to the built-in
   // default and emit a warning trace. We only verify the warning trace
-  // here — proving the fallback value is actually 90 would require running
-  // a 90-iteration loop, which is wasteful; the resolver is small enough
+  // here — proving the fallback value matches the default would require running
+  // a full-length loop, which is wasteful; the resolver is small enough
   // that the warning's presence is sufficient evidence.
   test("invalid agent.maxIterations falls back to the default and emits a warning trace", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
@@ -1264,7 +1264,7 @@ describe("chat-task loop", () => {
       (t) => t.type === "warning" && /agent\.maxIterations/i.test(String(t.data?.reason ?? ""))
     );
     expect(warning).toBeDefined();
-    expect((warning?.data as Record<string, unknown> | undefined)?.defaultCap).toBe(90);
+    expect((warning?.data as Record<string, unknown> | undefined)?.defaultCap).toBe(200);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
