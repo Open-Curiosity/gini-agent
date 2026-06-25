@@ -108,23 +108,36 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  // Arm a timeout that aborts the request if the gateway never responds.
-  // RN polyfills AbortController (abort-controller@3) but NOT the static
-  // AbortSignal.timeout()/any() helpers, so wire it manually: our timer
-  // fires the controller. The internal timeout is what guarantees the
-  // request settles (issue #396) — it does not depend on the caller. A
-  // caller that DOES pass a `signal` (e.g. to forward React Query's
-  // cancellation) chains in so an upstream cancel also aborts; current
-  // query hooks don't forward one, so this is an opt-in capability, not a
-  // requirement.
+  // Bound the request with a deadline that ALWAYS settles, independent of
+  // whether the runtime's fetch honors an abort. RN polyfills AbortController
+  // (abort-controller@3) but NOT the static AbortSignal.timeout()/any()
+  // helpers, so the timer is wired manually.
   //
-  // The timer must stay armed across BOTH the fetch AND the body read.
-  // Expo's winter fetch resolves the Response as soon as headers arrive
-  // and streams the body lazily, so a gateway that flushes headers then
-  // stalls the body would slip past a timer cleared right after fetch()
-  // and hang forever on response.text() — the exact infinite-spinner
-  // (issue #396) the timeout exists to prevent. So clear the timer only
-  // in the finally that wraps the whole request, after the body is read.
+  // Why a race and not just controller.abort(): the abort path only settles
+  // the request if `fetch` actually rejects in response. Under Bun and on web
+  // it does, but on device the global is Expo's winter fetch, where an abort
+  // is forwarded to a native request.cancel() (expo/.../fetch/fetch.ts) — and
+  // on a wedged socket (a zombie relay tunnel that keeps the HTTP connection
+  // open while no bytes flow back) cancel() does not unblock the in-flight
+  // native read. The timer would fire, the controller would abort, yet
+  // `await fetch(...)` / `await response.text()` would never settle, leaving
+  // the query pending and the list screen's spinner up until a force-quit.
+  // Racing the request against `deadlinePromise` makes api() settle when the
+  // timer rejects the deadline, regardless of whether the fetch promise ever
+  // does. controller.abort() is still fired so a cancellation-honoring
+  // runtime frees the request promptly and a device runtime gets the signal
+  // to release native resources.
+  //
+  // The deadline also covers BOTH the fetch AND the body read: winter fetch
+  // resolves the Response as soon as headers arrive and streams the body
+  // lazily, so a gateway that flushes headers then stalls the body would
+  // otherwise hang forever on response.text(). The single deadline spans the
+  // whole request, so a stall at either stage settles via the race.
+  //
+  // A caller that passes a `signal` (e.g. to forward React Query's
+  // cancellation) chains in so an upstream cancel also aborts; current query
+  // hooks don't forward one, so this is an opt-in capability, not a
+  // requirement.
   const controller = new AbortController();
   // Default by method: a missing/"GET" method is an idempotent read and
   // gets the short ceiling; anything else is a write and gets the longer
@@ -132,18 +145,37 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   const method = (rest.method ?? "GET").toUpperCase();
   const defaultTimeout = method === "GET" ? GET_TIMEOUT_MS : WRITE_TIMEOUT_MS;
   const timeout = timeoutMs ?? defaultTimeout;
-  // Track WHY the controller aborted with an explicit flag rather than
-  // sniffing the thrown error's name. The aborted-request error shape is
-  // runtime-specific — RN's whatwg-fetch throws a DOMException named
-  // "AbortError", but Expo's winter fetch (the global on device) throws
-  // its own FetchError that is NOT named "AbortError" — so a name check
-  // would misclassify the timeout on device and let the raw error escape
-  // instead of the tagged ApiError(0). The flag is set only by our timer,
-  // so a caller-initiated cancel never trips it.
+  // Track WHY the request settled via the deadline with an explicit flag
+  // rather than sniffing the thrown error's name. The aborted-request error
+  // shape is runtime-specific — RN's whatwg-fetch throws a DOMException named
+  // "AbortError", but Expo's winter fetch (the global on device) throws its
+  // own FetchError that is NOT named "AbortError" — so a name check would
+  // misclassify the timeout on device and let the raw error escape instead of
+  // the tagged ApiError(0). The flag is set only by our timer, so a
+  // caller-initiated cancel never trips it.
   let didTimeout = false;
+  // The deadline is a reject-only promise the request races against. It is
+  // rejected by EITHER the timer (a timeout) OR a caller abort — both must
+  // settle the race, because the race is the only thing that guarantees
+  // termination when the runtime's fetch ignores the abort signal. The timer
+  // rejects with the timeout ApiError; onCallerAbort rejects with a plain
+  // cancellation error (below).
+  //
+  // Built with `new Promise`, NOT `Promise.withResolvers()`: the device JS
+  // engine is Hermes (react-native ships its own Promise polyfill, not a
+  // native one), which does not implement the ES2024 `Promise.withResolvers`.
+  // Calling it would throw `Promise.withResolvers is not a function` on every
+  // request on device — Bun (the test runtime) supports it, so a test-only
+  // build would mask the failure. Capturing the rejector from the executor is
+  // the portable equivalent.
+  let rejectDeadline!: (reason: Error) => void;
+  const deadlinePromise = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
   const timer = setTimeout(() => {
     didTimeout = true;
     controller.abort();
+    rejectDeadline(new ApiError(0, `Request to ${path} timed out`));
   }, timeout);
   // A caller-driven abort disarms the timer before aborting, so the timer
   // can't fire afterward and flip didTimeout — that would misclassify a
@@ -151,9 +183,19 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   // the catch a microtask later, leaving a window for the macrotask timer
   // to run first). Both the already-aborted and the later-abort paths go
   // through here so neither can race the flag.
+  //
+  // Rejecting the deadline here too is what makes the caller-abort path
+  // settle even when the runtime's fetch ignores the signal: controller.abort()
+  // alone only rejects the in-flight request on a cancellation-honoring
+  // runtime, so on the winter-fetch wedge the race would otherwise hang
+  // exactly as the timeout path would without its own deadline rejection. The
+  // rejection is a plain Error (not an ApiError) and didTimeout stays false,
+  // so the catch rethrows it unchanged — a caller cancel surfaces as a
+  // cancellation, never relabeled as a timeout.
   const onCallerAbort = () => {
     clearTimeout(timer);
     controller.abort();
+    rejectDeadline(new Error("The operation was aborted."));
   };
   if (callerSignal) {
     if (callerSignal.aborted) onCallerAbort();
@@ -162,12 +204,28 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
 
   const url = `${parsed.origin}/api${path}`;
   try {
-    const response = await fetch(url, { ...rest, headers, signal: controller.signal });
-    // Read the body under the same armed timeout — a stalled body aborts
-    // here too. 204 No Content (or any empty body) → null cast as T so
-    // callers that don't care about the body don't choke on JSON.parse.
-    const text = await response.text();
-    const value = text ? safeParse(text) : null;
+    // Race the whole request (fetch + body read) against the deadline so a
+    // runtime whose fetch ignores the abort can't keep this pending forever.
+    // The fetch work is wrapped in its own async thunk; whichever settles
+    // first wins. `deadlinePromise` is reject-only (the timeout ApiError, or
+    // the caller-abort Error), so the success branch can only come from the
+    // request.
+    const requestWork = (async () => {
+      const response = await fetch(url, { ...rest, headers, signal: controller.signal });
+      // Read the body inside the raced work — a stalled body loses to the
+      // deadline too. 204 No Content (or any empty body) → null cast as T so
+      // callers that don't care about the body don't choke on JSON.parse.
+      const bodyText = await response.text();
+      return { response, bodyText };
+    })();
+    // When the deadline wins the race, requestWork keeps running detached. If
+    // the wedged request later settles with a rejection (the socket finally
+    // errors, the abort lands), nothing would be awaiting it — an unhandled
+    // promise rejection. Attach a no-op catch so the abandoned work can't
+    // surface one; the deadline already produced the error we act on.
+    requestWork.catch(() => {});
+    const { response, bodyText } = await Promise.race([requestWork, deadlinePromise]);
+    const value = bodyText ? safeParse(bodyText) : null;
     if (!response.ok) {
       // Two error-body shapes flow through the gateway: generic 4xx/5xx
       // { error: "..." }, and the fill_secret / connector runtime-action
