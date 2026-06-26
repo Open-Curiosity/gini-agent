@@ -41,6 +41,6 @@
     "protobufjs"
   ],
   "patchedDependencies": {
-    "playwright-core@1.61.0": "patches/playwright-core@1.61.0.patch"
+    "playwright-core@1.61.1": "patches/playwright-core@1.61.1.patch"
   }
 }
