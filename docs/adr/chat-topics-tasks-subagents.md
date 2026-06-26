@@ -1,6 +1,6 @@
 # ADR: Chat → Topics → Tasks → Subagents
 
-- **Status:** Proposed (decisions locked 2026-06-25; implementation in progress)
+- **Status:** Accepted (2026-06-26; shipped across 10 commits on the implementing branch)
 - **Date:** 2026-06-25
 - **Supersedes / reverses:** [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md) (threads-as-tags and one-canonical-chat are reversed)
 - **Updates:** [Bounded Chat Context Window](./chat-context-window.md) (per-session soft thread-priority packing becomes per-topic hard isolation)
@@ -246,9 +246,45 @@ two-session turn no current path models (queue, run-scoping, forward-back must b
 legacy threads either freeze or require a real data migration; the Task tier adds a record
 layer that must preserve the `subagentDepth` chain.
 
+## Implementation notes / deferrals
+
+- **Chat is the existing `kind:"agent"` session**, kept (not renamed to `"chat"`) — see Session kind.
+- **Job Topics keep `kind:"channel"` (`origin:"job"`)** rather than being renamed `kind:"topic"`.
+  Functionally they are the job's Topic (own session, own context) and now forward into Chat via
+  `JobRecord.forwardToChat`; the cosmetic value-rename `"channel"→"topic"` is deferred to avoid
+  churning every `kind` check across gateway/web/mobile. They surface in the rails' Recurring-jobs
+  section, not the Topics list.
+- **The Task tier is the existing parent-`Task` + `spawnSubagent` edge**, not a new record layer
+  (which would fork `subagentDepth`, the cancel-cascade, `toolCallState` resume, and the renderers).
+  The only net-new capability — "additional input needed" — is a structured `needs_input` **return
+  value** (a subagent's `ask_user` wall bubbles to its parent, which re-asks via the existing
+  `ask_user`→forward path), plus optional `goal`/`context` framing fields and forwarding a Topic
+  turn's pending gate cards into Chat. No new persisted `TaskStatus`/`SubagentStatus` members.
+- **Mobile native-only behavior** (a real push-notification tap, RN touch/gesture on the new Topic
+  rows + forwarded chip) is covered by unit tests + typecheck but not yet exercised on a simulator.
+
 ## Acceptance checks
 
-(to be finalized as phases land — will include: per-topic context isolation test; router
-3-way decision test; topic↔chat forward round-trip test; job→topic→forward test; migration
-backfill test; web + mobile topic-view render; live-gateway dogfood of the world-cup-trip
-flow and the cross-topic "book the game tickets" resume.)
+- `bun run test` / `bun run typecheck` green across runtime + web + mobile (modulo a pre-existing
+  ~1/6 flaky-timing pool — SSE stream / discord poller / chat auto-rename — and pre-existing
+  RN-module-resolution failures in two mobile test files, both confirmed unrelated to this change).
+- **Phase 1** — `createTopic`, `getOrCreateAgentChat` not promoting a Topic, the v10 `chat_blocks`
+  thread-tag null migration, and the marker-gated `chatMessages`/`pendingMessages` strip
+  (records / agent-chat-resolver / store / memory-db tests).
+- **Phase 2** — the topic dispatch + forward round-trip (`chat-topic-forward.test.ts`: new topic +
+  forward, replay scoping keeps the answer in the Topic, per-topic queue, chat-direct unchanged) and
+  the structured router 3-way decision + recent-conversation/topic-summary prompt + validator
+  hardening (`chat-route.test.ts`).
+- **Phase 3** — a `forwardToChat` job materializes in its Topic AND forwards a tagged block into the
+  owning agent's Chat; channel-only forwards nothing; the chat-bound deferral is gone; the migration
+  mints a Topic + `forwardToChat` for a legacy chat-bound job (`jobs.test.ts`, `store.test.ts`).
+- **Phase 4** — a subagent `ask_user` with no answerable surface returns `status:"needs_input"`
+  (no timeout) and the parent reads it as a parseable tool result; `goal`/`context` render as
+  labeled system-prompt sections; a Topic turn's `setup_requested` gate forwards an actionable copy
+  (same id) into the parent Chat (`subagents.test.ts`, `chat-task-emit.test.ts`).
+- **Live-gateway dogfood (codex `gpt-5.5`, driven through the web app):** routing a new substantive
+  message into a fresh Topic with the answer forwarded back; a follow-up continuing the *existing*
+  Topic; the cross-topic "sort out the game tickets" jumping back to the trip Topic over a
+  more-recent distractor; a quick advice ask staying chat-direct; the chat rendering as one linear
+  timeline with `from #topic · View topic →` chips and the Topics sidebar/topic-view — all verified
+  in the browser after the thread machinery was removed.
