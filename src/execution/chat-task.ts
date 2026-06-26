@@ -166,8 +166,20 @@ const MAX_CONTEXT_OVERFLOW_ATTEMPTS = 3;
 // overflow budget (and vice versa). Number of EXTRA retries after the first
 // attempt; 2 means up to 3 total tries.
 const MAX_TRANSIENT_RETRIES = 2;
+// Backoff base/cap for the transient-retry curve (base * 2^(n-1), capped).
 const TRANSIENT_RETRY_BASE_MS = 500;
 const TRANSIENT_RETRY_MAX_MS = 4_000;
+// Resolve the backoff base at use time (not module load) so a test can override
+// it via GINI_TRANSIENT_RETRY_BASE_MS to run the retry path at 0ms instead of
+// real wall-clock sleeps — mirrors the GINI_RESUME_WAIT_* env seams below.
+// Production (env unset) uses TRANSIENT_RETRY_BASE_MS. A 0 override is honored
+// explicitly (|| would treat 0 as falsy and fall back to 500).
+function transientRetryBaseMs(): number {
+  const raw = process.env.GINI_TRANSIENT_RETRY_BASE_MS;
+  if (raw === undefined) return TRANSIENT_RETRY_BASE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : TRANSIENT_RETRY_BASE_MS;
+}
 const PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION = 0.05;
 const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
@@ -2693,7 +2705,7 @@ async function runLoop(
           routeResolved = !isFirstModelCall;
           const backoff = Math.min(
             TRANSIENT_RETRY_MAX_MS,
-            TRANSIENT_RETRY_BASE_MS * 2 ** (transientAttempts - 1)
+            transientRetryBaseMs() * 2 ** (transientAttempts - 1)
           );
           appendTrace(config.instance, taskId, {
             type: "warning",
@@ -2709,6 +2721,13 @@ async function runLoop(
           // wait unwinds, with flushChain already drained above.
           await abortableBackoffSleep(backoff, turnSignal).catch(() => {});
           if (turnSignal?.aborted) return bailOnTurnAbort();
+          // Cancel the for-loop's `attempt++` for this transient retry: `attempt`
+          // is the context-overflow COMPACTION budget, and a transient stall must
+          // not spend it (the two budgets are independent — transientAttempts vs
+          // attempt). Without this, two transient retries would advance attempt to
+          // MAX_CONTEXT_OVERFLOW_ATTEMPTS and the first genuine overflow would exit
+          // with a partial result before any compaction ran.
+          attempt--;
           // `result` stays undefined, so the for-loop re-runs the model call.
           continue;
         }

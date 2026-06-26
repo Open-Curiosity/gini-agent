@@ -205,13 +205,19 @@ describe("chat-task loop", () => {
   let root: string;
   let prevState: string | undefined;
   let prevLog: string | undefined;
+  let prevTransientBackoff: string | undefined;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "gini-chat-task-"));
     prevState = process.env.GINI_STATE_ROOT;
     prevLog = process.env.GINI_LOG_ROOT;
+    prevTransientBackoff = process.env.GINI_TRANSIENT_RETRY_BASE_MS;
     process.env.GINI_STATE_ROOT = root;
     process.env.GINI_LOG_ROOT = `${root}-logs`;
+    // Run the transient-retry backoff at 0ms so these tests never burn real
+    // wall-clock sleep (the production curve is verified separately by the
+    // trace-message assertions); keeps the suite fast and deterministic.
+    process.env.GINI_TRANSIENT_RETRY_BASE_MS = "0";
     clearEchoToolCallingResponses();
     clearEchoAuxTextResponses();
   });
@@ -221,6 +227,8 @@ describe("chat-task loop", () => {
     else process.env.GINI_STATE_ROOT = prevState;
     if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
     else process.env.GINI_LOG_ROOT = prevLog;
+    if (prevTransientBackoff === undefined) delete process.env.GINI_TRANSIENT_RETRY_BASE_MS;
+    else process.env.GINI_TRANSIENT_RETRY_BASE_MS = prevTransientBackoff;
     // Clear any fixed-catalog override a compaction test installed so the
     // rest of the suite sees the live buildToolCatalog.
     __setBaseToolCatalogForTests(null);
@@ -5302,8 +5310,10 @@ describe("chat-task loop", () => {
       (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
     );
     expect(retries.length).toBe(1);
-    // The first (and only) retry uses the base backoff: 500 * 2^0 = 500ms.
-    expect(retries[0]!.message).toContain("after 500ms");
+    // Backoff base is overridden to 0ms for tests (GINI_TRANSIENT_RETRY_BASE_MS),
+    // so the curve renders 0 * 2^0 = 0ms here; the production 500ms base is a
+    // plain constant exercised by the live path.
+    expect(retries[0]!.message).toContain("after 0ms");
     expect(retries[0]!.message).toContain("attempt 1 of 2");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -5357,9 +5367,11 @@ describe("chat-task loop", () => {
       (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
     );
     // Two retry warnings (one per extra attempt); the third failure exhausts
-    // the budget and falls through to the hard-throw.
+    // the budget and falls through to the hard-throw. Backoff base is 0ms for
+    // tests, so both retries render "after 0ms" (the production base * 2^n curve
+    // is a plain constant; only the attempt counter and cap matter here).
     expect(retries.length).toBe(2);
-    expect(retries[1]!.message).toContain("after 1000ms");
+    expect(retries[1]!.message).toContain("after 0ms");
     expect(retries[1]!.message).toContain("attempt 2 of 2");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -5398,30 +5410,43 @@ describe("chat-task loop", () => {
     const provider = normalizeProvider(config.provider);
     const { cancelTask } = await import("../agent");
 
-    // One transient failure arms a 500ms backoff; the success stub after it
-    // must NEVER run because we cancel during that backoff window.
-    setEchoToolCallingFailure("The operation timed out.");
-    setEchoToolCallingResponse({ provider, text: "SHOULD-NOT-APPEAR", toolCalls: [], finishReason: "stop" });
+    // This is the ONE transient test that needs a real backoff window to cancel
+    // inside. Override the (otherwise-0ms) base to a long, fixed value so the
+    // cancel deterministically lands DURING the wait regardless of CI load — the
+    // test never actually waits it out (the cancel aborts the sleep at once).
+    // The retry warning is written synchronously right before the sleep starts,
+    // so once we observe it there is a full 60s window to cancel: no race.
+    const prevBase = process.env.GINI_TRANSIENT_RETRY_BASE_MS;
+    process.env.GINI_TRANSIENT_RETRY_BASE_MS = "60000";
+    try {
+      // One transient failure arms the backoff; the success stub after it must
+      // NEVER run because we cancel during that backoff window.
+      setEchoToolCallingFailure("The operation timed out.");
+      setEchoToolCallingResponse({ provider, text: "SHOULD-NOT-APPEAR", toolCalls: [], finishReason: "stop" });
 
-    const task = await submitTask(config, "say hi", { mode: "chat" });
-    // The transient-retry warning is appended right before the backoff sleep —
-    // poll for it, then cancel inside the 500ms backoff window.
-    const { readTrace } = await import("../state");
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      const retried = readTrace(config.instance, task.id).some(
-        (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
-      );
-      if (retried) break;
-      await Bun.sleep(5);
+      const task = await submitTask(config, "say hi", { mode: "chat" });
+      // The transient-retry warning is appended right before the backoff sleep —
+      // poll for it, then cancel inside the (60s) backoff window.
+      const { readTrace } = await import("../state");
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const retried = readTrace(config.instance, task.id).some(
+          (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
+        );
+        if (retried) break;
+        await Bun.sleep(5);
+      }
+      await cancelTask(config, task.id);
+      const cancelled = await waitForTerminal(config, task.id, 10000);
+
+      expect(cancelled.status).toBe("cancelled");
+      // The retry's success stub must not have run: only the failed first call.
+      expect(getEchoToolCallingCalls().length).toBe(1);
+      expect(cancelled.summary ?? "").not.toContain("SHOULD-NOT-APPEAR");
+    } finally {
+      if (prevBase === undefined) delete process.env.GINI_TRANSIENT_RETRY_BASE_MS;
+      else process.env.GINI_TRANSIENT_RETRY_BASE_MS = prevBase;
     }
-    await cancelTask(config, task.id);
-    const cancelled = await waitForTerminal(config, task.id, 10000);
-
-    expect(cancelled.status).toBe("cancelled");
-    // The retry's success stub must not have run: only the failed first call.
-    expect(getEchoToolCallingCalls().length).toBe(1);
-    expect(cancelled.summary ?? "").not.toContain("SHOULD-NOT-APPEAR");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -5450,6 +5475,50 @@ describe("chat-task loop", () => {
     // The overflow warning fired; the transient-retry warning did NOT.
     expect(traces.some((t) => t.type === "warning" && /rejected the prompt as too long/.test(t.message))).toBe(true);
     expect(traces.some((t) => t.type === "warning" && /Transient model-call fault/.test(t.message))).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Regression: transient retries must NOT consume the context-overflow
+  // compaction budget. The two counters are independent (transientAttempts vs
+  // attempt), so two transient faults followed by an overflow must still leave
+  // the overflow path its full compaction budget — the overflow must COMPACT
+  // and recover, not exit early with a no-compaction partial result. (Before the
+  // attempt-- fix, the transient `continue` advanced `attempt` to 3, so the
+  // first overflow hit `attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS` and bailed.)
+  test("transient retries do not steal the context-overflow compaction budget", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transient-then-overflow");
+    const provider = normalizeProvider(config.provider);
+
+    const OVERFLOW_MESSAGE =
+      "This model's maximum context length is 32000 tokens. However, your messages resulted in 99999 tokens.";
+    // Two transient faults exhaust the transient budget, then a context overflow
+    // arrives, then a clean success once compaction shrinks the transcript.
+    setEchoToolCallingFailure("The operation timed out.");
+    setEchoToolCallingFailure("The operation timed out.");
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingResponse({ provider, text: "Recovered after transient faults + a compaction.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    // The task recovered via compaction — it did NOT exit early with the
+    // no-compaction partial-result message.
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recovered after transient faults + a compaction.");
+    expect(finished.summary).not.toContain("no longer fits the model's context window");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    // Both transient retries fired AND the overflow compaction still ran.
+    const transientRetries = traces.filter(
+      (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
+    );
+    expect(transientRetries.length).toBe(2);
+    expect(traces.some((t) => t.type === "warning" && /rejected the prompt as too long/.test(t.message))).toBe(true);
+    // 4 provider calls total: 2 transient fails + 1 overflow + 1 successful retry.
+    expect(getEchoToolCallingCalls().length).toBe(4);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
