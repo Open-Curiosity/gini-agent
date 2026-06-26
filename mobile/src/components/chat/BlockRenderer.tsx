@@ -48,9 +48,32 @@ export function BlockRenderer({
     case "phase":
       return <BlockPhase block={block} />;
     case "authorization_requested":
-      return <BlockAuthorizationRequested block={block} />;
+      // A gate forwarded from a Topic carries its source Topic; render the same
+      // deep-link chip below the (fully actionable) card so the user can open the
+      // Topic conversation.
+      return block.forwardedFromTopicId ? (
+        <View style={{ gap: 8 }}>
+          <BlockAuthorizationRequested block={block} />
+          <TopicForwardChip
+            topicId={block.forwardedFromTopicId}
+            topicTitle={block.forwardedFromTopicTitle}
+          />
+        </View>
+      ) : (
+        <BlockAuthorizationRequested block={block} />
+      );
     case "setup_requested":
-      return <BlockSetupRequested block={block} />;
+      return block.forwardedFromTopicId ? (
+        <View style={{ gap: 8 }}>
+          <BlockSetupRequested block={block} />
+          <TopicForwardChip
+            topicId={block.forwardedFromTopicId}
+            topicTitle={block.forwardedFromTopicTitle}
+          />
+        </View>
+      ) : (
+        <BlockSetupRequested block={block} />
+      );
     case "system_note":
       return <BlockSystemNote block={block} />;
     default: {
