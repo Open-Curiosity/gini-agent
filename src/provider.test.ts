@@ -4913,6 +4913,120 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("bedrock: a streaming Claude tool turn requests fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "tu_1", name: "write_file" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { toolUse: { input: "{\"path\":\"a\"}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "write_file", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools, () => {});
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // Without this flag Bedrock buffers the whole tool_use input JSON before
+      // emitting any of it, stranding the stream past the socket idle timeout.
+      expect(body.additionalModelRequestFields).toEqual({
+        anthropic_beta: ["fine-grained-tool-streaming-2025-05-14"]
+      });
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a tool-less streaming turn does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "hi" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // No toolConfig is sent, so the tool-streaming flag would be meaningless.
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-streaming (structured) Claude tool turn does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ toolUse: { toolUseId: "tu_1", name: "lookup", input: { q: "x" } } }] } },
+        stopReason: "tool_use",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      // No onDelta ⟹ non-streaming /converse; the flag is streaming-only.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools);
+      expect(fetchStub.calls[0]!.url).toContain("/converse");
+      expect(fetchStub.calls[0]!.url).not.toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-Claude model does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "tu_1", name: "lookup" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { toolUse: { input: "{}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } }
+      ])
+    );
+    try {
+      // Nova supports tools + streaming, but the fine-grained flag is a Claude
+      // capability — sending it to a non-Claude family risks a 400, so it's gated off.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools, () => {});
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
   test("bedrock: a converse-stream exception frame throws", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");

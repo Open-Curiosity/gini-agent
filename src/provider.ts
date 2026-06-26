@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsFineGrainedToolStreaming, bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -41,6 +41,11 @@ const DEFAULT_BEDROCK_BASE_URL = bedrockRuntimeBaseUrl(DEFAULT_BEDROCK_REGION);
 // live versioning docs (newest entry; the SSE-named-events format). Honored by
 // both the first-party API and Claude in Amazon Bedrock.
 const ANTHROPIC_VERSION = "2023-06-01";
+// Anthropic beta flag that enables fine-grained tool streaming (tool_use input
+// JSON streamed incrementally instead of buffered whole). GA on Bedrock via the
+// anthropic_beta request field; no HTTP beta header required. See AWS Bedrock
+// "Anthropic Claude tool use" docs.
+const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 // The Messages API REQUIRES max_tokens. The streaming send-path resolves the
 // model's real output ceiling via resolveMaxOutputTokens so a large tool-call
 // argument isn't truncated mid-JSON; this flat floor is the NON-streaming
@@ -2533,6 +2538,19 @@ async function callBedrockConverse(
   };
   if (system.length > 0) body.system = system;
   if (toolConfig) body.toolConfig = toolConfig;
+  // Fine-grained tool streaming. Without it, Bedrock buffers a tool_use block's
+  // entire input JSON server-side and emits nothing on the wire until the whole
+  // argument is generated; a large argument (e.g. a long file body written
+  // inline) leaves the stream idle past the socket timeout, surfacing as
+  // "The operation timed out." and failing the turn. The beta flag streams the
+  // tool input incrementally (field-by-field) so the connection stays fed.
+  // Only meaningful on a streaming tool turn. On Converse the flag is the
+  // anthropic_beta entry inside additionalModelRequestFields — the tool-level
+  // `eager_input_streaming` property used by the first-party Messages API is
+  // silently ignored here. See AWS Bedrock "Anthropic Claude tool use" docs.
+  if (wantStream && toolConfig && bedrockSupportsFineGrainedToolStreaming(provider.model)) {
+    body.additionalModelRequestFields = { anthropic_beta: [FINE_GRAINED_TOOL_STREAMING_BETA] };
+  }
 
   const bodyJson = JSON.stringify(body);
   const response = await fetch(url, {

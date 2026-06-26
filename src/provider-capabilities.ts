@@ -347,6 +347,18 @@ export function bedrockSupportsStreamingWithTools(model: string): boolean {
   return !/llama4/i.test(model);
 }
 
+// Whether a Bedrock model accepts the fine-grained-tool-streaming beta flag,
+// which streams a tool_use block's input JSON incrementally instead of
+// buffering it whole. Per the AWS Bedrock "Anthropic Claude tool use" docs the
+// capability is an Anthropic Claude family feature (Claude Sonnet/Haiku/Opus 4
+// and 4.5); non-Claude Bedrock families (Nova, Llama, DeepSeek, Mistral) don't
+// support the flag, so sending it could 400 a validation error. Allowlist the
+// Claude family only. The slug may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-…") or be bare; both match.
+export function bedrockSupportsFineGrainedToolStreaming(model: string): boolean {
+  return /anthropic\.claude|^claude/.test(normalizeModel(model));
+}
+
 export interface ModelPricing {
   /** USD per 1M input (prompt) tokens. */
   inputPerMillion: number;

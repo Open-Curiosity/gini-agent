@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bedrockSupportsFineGrainedToolStreaming,
   bedrockSupportsStreamingWithTools,
   bedrockSupportsToolUse,
   estimateUsd,
@@ -204,6 +205,33 @@ describe("bedrockSupportsStreamingWithTools", () => {
       ""
     ]) {
       expect(bedrockSupportsStreamingWithTools(m)).toBe(true);
+    }
+  });
+});
+
+describe("bedrockSupportsFineGrainedToolStreaming", () => {
+  test("Claude families (bedrock-prefixed or bare) accept the flag; others don't", () => {
+    // Fine-grained tool streaming is a Claude capability on Bedrock.
+    for (const m of [
+      "us.anthropic.claude-sonnet-4-6",
+      "us.anthropic.claude-opus-4-8",
+      "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "anthropic.claude-sonnet-4-20250514-v1:0",
+      "claude-opus-4-8"
+    ]) {
+      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(true);
+    }
+    // Non-Claude families don't support the beta flag (sending it risks a 400),
+    // and an empty/unknown id stays off.
+    for (const m of [
+      "us.amazon.nova-pro-v1:0",
+      "us.meta.llama4-scout-17b-instruct-v1:0",
+      "us.deepseek.r1-v1:0",
+      "us.mistral.mistral-large-2407-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(false);
     }
   });
 });
