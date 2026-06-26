@@ -883,12 +883,8 @@ export interface Task {
   // when the surface is unknown. See ADR client-surface-context.md.
   clientSurface?: ChatClientSurface;
   // Thread membership for the task's emitted chat blocks. Set when a task is
-  // spawned to reply inside a thread (Phase 0c thread-reply endpoint), in
-  // which case the whole response threads with no routing directive needed.
-  // The runtime may also set `threadId`/`parentBlockId` mid-turn when the
-  // agent's `<route>thread</route>` directive fires, persisting them so an
-  // approval-resume re-threads from the same parent. Absent for ordinary
-  // main-chat tasks.
+  // spawned to reply inside a thread (the thread-reply endpoint), in which
+  // case the whole response threads. Absent for ordinary main-chat tasks.
   threadId?: string;
   parentBlockId?: string;
   // Times this task has been re-dispatched after a gateway restart; capped to

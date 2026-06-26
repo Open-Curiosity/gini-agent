@@ -3932,7 +3932,7 @@ describe("chat-task loop", () => {
   });
 
   // Issue #397: an inline-handled tool (load_tools here; the deferred-not-loaded
-  // nudge and start_thread share the branch) must PERSIST its tool result to
+  // nudge shares the branch) must PERSIST its tool result to
   // the durable transcript, paired with the assistant tool_use row. Otherwise a
   // later turn (or any rebuild) replays the assistant tool_use with no result,
   // and a tool-pairing-strict provider (Bedrock Converse, Anthropic Messages)
