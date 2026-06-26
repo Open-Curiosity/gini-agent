@@ -5735,6 +5735,30 @@ describe("streaming max_tokens clamp", () => {
     }
   });
 
+  test("anthropic: a small user-pinned max_tokens is preserved on a streaming turn (clamp never raises it)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      // A deliberately small pinned value (256) on a small-prompt streaming turn:
+      // it fits the window with room to spare, so the clamp must pass it through
+      // untouched — it must NOT be raised to STREAM_MAX_TOKENS_FLOOR (1024). The
+      // floor only bounds the window-fit reduction, never the caller's request.
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { max_tokens: 256 } });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).max_tokens).toBe(256);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
   test("anthropic: a non-streaming turn keeps the conservative floor (clamp does not apply)", async () => {
     const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     const fetchStub = installFetch(() =>

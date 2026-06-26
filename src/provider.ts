@@ -1850,8 +1850,12 @@ async function readResponsesToolCallingStream(
 // window, leaving the prior-context replay untouched (we shrink the *output*
 // budget, never the messages). The estimate mirrors chat-task's send-time
 // budgeting: estimateToolCallingMessagesTokens(messages) + serialized tool tokens.
-// Never raises max_tokens (min only) and never floors below STREAM_MAX_TOKENS_FLOOR
-// — a prompt that close to full is the context-overflow retry path's job, not ours.
+// Only ever clamps DOWN — it never raises `resolved`, so a deliberately small
+// caller value (a user-pinned extraBody.max_tokens) passes through untouched.
+// The STREAM_MAX_TOKENS_FLOOR bounds the WINDOW-FIT ceiling, not the caller's
+// request: on a near-full prompt where `fits` is small/negative we send at least
+// the floor rather than zero/negative (that overshoot is the context-overflow
+// retry path's job), but the floor can never lift a value the caller chose.
 const STREAM_MAX_TOKENS_CONTEXT_MARGIN = 256;
 const STREAM_MAX_TOKENS_FLOOR = 1024;
 function clampStreamingMaxTokens(
@@ -1864,7 +1868,7 @@ function clampStreamingMaxTokens(
   const estimatedInputTokens =
     estimateToolCallingMessagesTokens(messages) + estimateTextTokens(JSON.stringify(tools));
   const fits = contextWindow - estimatedInputTokens - STREAM_MAX_TOKENS_CONTEXT_MARGIN;
-  return Math.max(STREAM_MAX_TOKENS_FLOOR, Math.min(resolved, fits));
+  return Math.min(resolved, Math.max(STREAM_MAX_TOKENS_FLOOR, fits));
 }
 
 async function callAnthropicMessages(
