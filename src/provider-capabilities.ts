@@ -94,9 +94,12 @@ function openrouterContextWindowTokens(model: string): number {
 // ("us.anthropic.claude-opus-4-8") or arrive bare ("claude-opus-4-8") — both
 // match the family patterns. The minor-version classes ([6-9]|\d\d) keep
 // future point releases (Opus 4.9+) on 1M while leaving 4.5/4.1/4.0 at 200K.
+// The `(?![0-9])` lookahead anchors the minor token so a model id's DATE STAMP
+// can't be misread as a minor version (e.g. "claude-sonnet-4-20250514" must not
+// match `4-\d\d` via the "20" of the date and jump to 1M; it falls to 200K).
 function claudeContextWindowTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 1_000_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 1_000_000;
   if (/claude-fable-\d/.test(slug)) return 1_000_000;
   if (/claude/.test(slug)) return 200_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
@@ -162,22 +165,34 @@ export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
 // Max output tokens (synchronous Messages/Converse) by Claude family. The model
 // REJECTS a max_tokens above its real ceiling with a 400 (Bedrock
 // ValidationException "exceeds the model limit of N"; first-party Anthropic the
-// equivalent) — it does NOT clamp — so this must never overshoot. Values are
-// each model's documented/probed ceiling: 4.6+ Opus/Sonnet and Fable at 128K;
-// Haiku 4.5 and the 4.5 Opus/Sonnet tier at 64K; Opus 4.1 at 32K. The minor
-// classes ([6-9]|\d\d) keep future point releases on the 128K tier while the
-// explicit 4.5/4.1 patterns pin the older tiers. `slug` may carry a Bedrock
-// inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
-// ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized)
-// stays on the conservative floor.
+// equivalent) — it does NOT clamp — so this must never overshoot. Documented/
+// probed ceilings (verified via the Anthropic Models API and provider docs):
+// Opus/Sonnet 4.6+ and Fable at 128K; Haiku 4.5, Opus 4.5, and Sonnet 4.5 at
+// 64K; Sonnet 4.0 at 64K; Opus 4.1 and Opus 4.0 at 32K. `slug` may carry a
+// Bedrock inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
+// ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized) stays
+// on the conservative floor.
+//
+// The minor-version classes are anchored with a trailing `(?![0-9])` so a model
+// id's DATE STAMP can't be misread as a minor version: without it,
+// `claude-sonnet-4-20250514` (Sonnet 4.0, dated) matches `[…]4-(?:[6-9]|\d\d)`
+// because `\d\d` eats "20" → a wrong 128K ceiling → a 400 on a real Sonnet-4.0
+// streaming turn. The lookahead forces the minor token to be the WHOLE segment
+// (followed by `-`/end, not more digits), and the explicit 4.5/4.1/4.0 patterns
+// pin the older tiers; order matters (specific tiers before the 6-9 class).
 function claudeMaxOutputTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 128_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 128_000;
   if (/claude-fable-\d/.test(slug)) return 128_000;
   if (/claude-haiku-4-5/.test(slug)) return 64_000;
   if (/claude-opus-4-5/.test(slug)) return 64_000;
   if (/claude-sonnet-4-5/.test(slug)) return 64_000;
   if (/claude-opus-4-1/.test(slug)) return 32_000;
+  // Bare major-version 4.0 ids (e.g. "claude-sonnet-4-20250514" — a date stamp
+  // follows the major, no minor version). Match the major followed directly by
+  // a non-minor segment so 4.5/4.6 (handled above) don't fall in here.
+  if (/claude-sonnet-4-20\d/.test(slug)) return 64_000;
+  if (/claude-opus-4-20\d/.test(slug)) return 32_000;
   return FALLBACK_MAX_OUTPUT_TOKENS;
 }
 

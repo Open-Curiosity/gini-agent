@@ -299,6 +299,10 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-haiku-4-5"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-5"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-haiku-4-5"))).toBe(200_000);
+    // A date-stamped major-only 4.0 id must NOT have its date digits ("20")
+    // misread as a 4.x minor version and jump to the 1M window — it stays 200K.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-20250514"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(1_000_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(300_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(300_000);
@@ -343,6 +347,19 @@ describe("resolveMaxOutputTokens", () => {
   test("Opus 4.1 resolves to 32K", () => {
     expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-1"))).toBe(32_000);
     expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-1-20250805-v1:0"))).toBe(32_000);
+  });
+
+  test("date-stamped 4.0 ids resolve to their real ceiling, not a date-digit overmatch", () => {
+    // Regression: a major-only 4.0 id carries a date stamp right after the major
+    // ("claude-sonnet-4-20250514"). A `4-(?:[6-9]|\d\d)` minor class without a
+    // trailing-digit anchor reads the date's "20" as a minor version and wrongly
+    // returns 128K, so a streaming turn would send max_tokens=128000 against the
+    // model's real 64K (Sonnet 4.0) / 32K (Opus 4.0) ceiling and 400. Pin the
+    // documented ceilings (verified via the Anthropic Models API + provider docs).
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-20250514"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-20250514"))).toBe(32_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"))).toBe(32_000);
   });
 
   test("non-Claude Bedrock families carry their own probed ceilings", () => {
