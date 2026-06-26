@@ -210,7 +210,7 @@ describe("bedrockSupportsStreamingWithTools", () => {
 });
 
 describe("claudeSupportsFineGrainedToolStreaming", () => {
-  test("Claude 4+ family (bedrock-prefixed or bare first-party) accept the flag; others don't", () => {
+  test("Claude 4 family (bedrock-prefixed or bare first-party) accept the flag; 3.x, 5+, and non-Claude don't", () => {
     // Fine-grained tool streaming is documented for the Claude 4 family only,
     // on both the bedrock (prefixed) and first-party (bare) id shapes.
     for (const m of [
