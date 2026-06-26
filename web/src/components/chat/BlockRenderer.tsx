@@ -6,6 +6,7 @@ import { BlockPhase } from "./BlockPhase";
 import { BlockSystemNote } from "./BlockSystemNote";
 import { BlockToolCall } from "./BlockToolCall";
 import { BlockUserText } from "./BlockUserText";
+import { TopicForwardChip } from "./TopicForwardChip";
 
 // Dispatcher for the typed ChatBlock union. The switch is exhaustive on
 // `block.kind` — adding a new block kind requires a new case here, and
@@ -27,7 +28,21 @@ export function BlockRenderer({
     case "user_text":
       return <BlockUserText block={block} />;
     case "assistant_text":
-      return <BlockAssistantText block={block} agent={agent} />;
+      // A forwarded Topic answer carries its source Topic; render a deep-link
+      // chip under the answer text, aligned to the message in the avatar gutter.
+      return block.forwardedFromTopicId ? (
+        <div className="space-y-2">
+          <BlockAssistantText block={block} agent={agent} />
+          <div className="pl-[46px]">
+            <TopicForwardChip
+              topicId={block.forwardedFromTopicId}
+              topicTitle={block.forwardedFromTopicTitle}
+            />
+          </div>
+        </div>
+      ) : (
+        <BlockAssistantText block={block} agent={agent} />
+      );
     case "tool_call":
       return <BlockToolCall block={block} result={toolResult} />;
     case "tool_result":

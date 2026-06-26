@@ -55,6 +55,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const [agentsCollapsed, toggleAgents] = useSectionCollapsed("agents");
   const [archivedCollapsed, toggleArchived] = useSectionCollapsed("agents-archived");
   const [jobsCollapsed, toggleJobs] = useSectionCollapsed("jobs");
+  const [topicsCollapsed, toggleTopics] = useSectionCollapsed("topics");
 
   const status = useStatus();
   const activeAgentId = status.data?.activeAgent?.id;
@@ -101,6 +102,21 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
           (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
       );
   }, [allJobs.data, allSessions.data]);
+
+  // Topics for the active agent: `kind:"topic"` sessions that aren't archived,
+  // newest-activity first so the most recently touched subject sits on top.
+  // Scoped to the active agent (each Topic belongs to that agent's Chat) so the
+  // section tracks the selected agent, like the Messages/agent rows.
+  const topics = useMemo<ChatSession[]>(() => {
+    return (allSessions.data ?? [])
+      .filter(
+        (s) =>
+          s.kind === "topic" &&
+          !s.archivedAt &&
+          (activeAgentId == null || s.agentId === activeAgentId)
+      )
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  }, [allSessions.data, activeAgentId]);
 
   const { isUnread } = useChatReadState(allSessions.data);
 
@@ -370,6 +386,63 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                           )}
                         >
                           {job.name}
+                        </span>
+                        {unread ? (
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+
+          {/* Topics */}
+          {topics.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between px-2">
+                <button
+                  type="button"
+                  onClick={toggleTopics}
+                  aria-expanded={!topicsCollapsed}
+                  className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+                >
+                  <ChevronDown
+                    className={cn("size-3 transition-transform", topicsCollapsed && "-rotate-90")}
+                  />
+                  <span className="text-[11px] font-semibold tracking-[0.5px]">Topics</span>
+                </button>
+              </div>
+              <ul className={cn("flex flex-col gap-0.5", topicsCollapsed && "hidden")}>
+                {topics.map((topic) => {
+                  const active = onChat && selectedSession === topic.id;
+                  const unread = !active && isUnread(topic);
+                  return (
+                    <li key={topic.id}>
+                      <button
+                        type="button"
+                        onClick={() => selectChannel(topic.id)}
+                        className={cn(
+                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                        )}
+                      >
+                        <span
+                          aria-hidden
+                          className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
+                        >
+                          #
+                        </span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-[13px]",
+                            active || unread
+                              ? "font-semibold text-sidebar-accent-foreground"
+                              : "font-medium text-sidebar-foreground"
+                          )}
+                        >
+                          {topic.title}
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />

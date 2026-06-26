@@ -75,14 +75,26 @@ export default function ChatPage() {
   const isChannel = Boolean(
     pinnedSessionId && (session?.kind === "channel" || session?.origin === "job")
   );
+  // A pinned `kind:"topic"` session is the Topic surface: its own subject-scoped
+  // conversation. Like a channel it carries the topic's own title and the owning
+  // agent as the assistant, but it's headed as `#<title>` and hides the Jobs tab.
+  const isTopic = Boolean(pinnedSessionId && session?.kind === "topic");
 
-  const headerName = isChannel ? session?.title?.trim() || "Channel" : activeAgentName;
-  const headerSeed = isChannel ? sessionId ?? "channel" : activeAgentId ?? "agent";
+  const headerName = isTopic
+    ? `#${session?.title?.trim() || "topic"}`
+    : isChannel
+      ? session?.title?.trim() || "Channel"
+      : activeAgentName;
+  const headerSeed = isTopic
+    ? sessionId ?? "topic"
+    : isChannel
+      ? sessionId ?? "channel"
+      : activeAgentId ?? "agent";
   // The agent whose messages render in the transcript. On the agent surface
-  // this is the active agent; on a channel the assistant is the session's
-  // owning agent (named "Gini" by default since the channel title isn't the
+  // this is the active agent; on a channel or topic the assistant is the
+  // session's owning agent (named "Gini" by default since the title isn't the
   // agent's name). Keys the colored-initial message-row avatar.
-  const messageAgent = isChannel
+  const messageAgent = isChannel || isTopic
     ? session?.agentId
       ? { id: session.agentId, name: "Gini" }
       : undefined
@@ -95,8 +107,8 @@ export default function ChatPage() {
     <div className="flex min-h-0 flex-1 overflow-hidden bg-background">
       {!sessionId ? (
         <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <AgentChatHeader name={headerName} seed={headerSeed} showAvatar={!isChannel} />
-          <ChatTabBar active="messages" onChange={() => {}} hideJobsTab={isChannel} hideSettingsTab={Boolean(pinnedSessionId)} />
+          <AgentChatHeader name={headerName} seed={headerSeed} showAvatar={!isChannel && !isTopic} />
+          <ChatTabBar active="messages" onChange={() => {}} hideJobsTab={isChannel || isTopic} hideSettingsTab={Boolean(pinnedSessionId)} />
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             {resolving ? "Loading…" : "No chat yet — say hello below."}
           </div>
@@ -112,6 +124,7 @@ export default function ChatPage() {
           headerName={headerName}
           headerSeed={headerSeed}
           isChannel={isChannel}
+          isTopic={isTopic}
           isPinned={Boolean(pinnedSessionId)}
           messageAgent={messageAgent}
           activeAgentId={activeAgentId}
@@ -127,6 +140,7 @@ function ChatSurface({
   headerName,
   headerSeed,
   isChannel,
+  isTopic,
   isPinned,
   messageAgent,
   activeAgentId
@@ -136,6 +150,7 @@ function ChatSurface({
   headerName: string;
   headerSeed: string;
   isChannel: boolean;
+  isTopic: boolean;
   isPinned: boolean;
   messageAgent?: { id: string; name: string };
   activeAgentId?: string;
@@ -455,8 +470,8 @@ function ChatSurface({
           name={headerName}
           seed={headerSeed}
           lastActiveAt={session.updatedAt}
-          subtitle={isChannel ? "recurring job channel" : undefined}
-          showAvatar={!isChannel}
+          subtitle={isChannel ? "recurring job channel" : isTopic ? "topic" : undefined}
+          showAvatar={!isChannel && !isTopic}
           titleAction={
             isChannel && job ? (
               <ChannelViewJob jobId={job.id} agentId={job.agentId} activeAgentId={activeAgentId} />
@@ -486,7 +501,7 @@ function ChatSurface({
           onChange={setTab}
           threadCount={unreadThreadCount}
           threadsActivity={threadsActivity}
-          hideJobsTab={isChannel}
+          hideJobsTab={isChannel || isTopic}
           hideSettingsTab={isPinned}
         />
 
