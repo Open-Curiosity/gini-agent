@@ -256,7 +256,8 @@ export async function getOrCreateAgentChat(
     }
 
     const promotable = owned
-      .filter((session) => session.origin !== "job" && session.source === undefined)
+      // never promote a Topic into the canonical chat
+      .filter((session) => session.origin !== "job" && session.source === undefined && session.kind !== "topic")
       .sort(byRecency)[0];
     if (promotable) {
       promotable.kind = "agent";

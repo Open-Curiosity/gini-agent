@@ -1304,3 +1304,53 @@ describe("normalizeState task.chatSessionId backfill", () => {
     expect(state.tasks.find((t) => t.id === "task_chat")!.chatSessionId).toBe("chat_explicit");
   });
 });
+
+// Schema v10 (ADR chat-topics-tasks-subagents.md) — legacy threads convert to
+// linear Chat history by nulling the thread tags on durable chat messages and
+// on queued (pending) messages.
+describe("normalizeState thread-tag strip (v10)", () => {
+  // Seeds a state with one thread-tagged chatMessage and one session whose
+  // pendingMessages queue carries a thread-tagged entry.
+  function seedThreadTagged(instance: string): RuntimeState {
+    const state = createEmptyState(instance);
+    (state.chatMessages as RuntimeState["chatMessages"]).push({
+      id: "m_thread", instance, sessionId: "chat_x", role: "user",
+      content: "threaded reply", createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: "thread_1", parentBlockId: "blk_root"
+    } as RuntimeState["chatMessages"][number]);
+    (state.chatSessions as RuntimeState["chatSessions"]).push({
+      id: "chat_x", instance, title: "Chat", createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z", messageIds: ["m_thread"], taskIds: [], runIds: [],
+      pendingMessages: [
+        { id: "p1", content: "queued reply", createdAt: "2026-01-01T00:00:01.000Z", threadId: "thread_1", parentBlockId: "blk_root" }
+      ]
+    } as RuntimeState["chatSessions"][number]);
+    return state;
+  }
+
+  test("strips threadId/parentBlockId from chatMessages and pendingMessages", () => {
+    const state = seedThreadTagged("thread-strip");
+    normalizeState("thread-strip", state);
+
+    const message = state.chatMessages.find((m) => m.id === "m_thread")!;
+    expect(message.threadId).toBeUndefined();
+    expect(message.parentBlockId).toBeUndefined();
+
+    const pending = state.chatSessions.find((s) => s.id === "chat_x")!.pendingMessages![0]!;
+    expect(pending.threadId).toBeUndefined();
+    expect(pending.parentBlockId).toBeUndefined();
+  });
+
+  test("is idempotent across two runs", () => {
+    const state = seedThreadTagged("thread-strip-idem");
+    const once = normalizeState("thread-strip-idem", state);
+    const twice = normalizeState("thread-strip-idem", once);
+
+    const message = twice.chatMessages.find((m) => m.id === "m_thread")!;
+    expect(message.threadId).toBeUndefined();
+    expect(message.parentBlockId).toBeUndefined();
+    const pending = twice.chatSessions.find((s) => s.id === "chat_x")!.pendingMessages![0]!;
+    expect(pending.threadId).toBeUndefined();
+    expect(pending.parentBlockId).toBeUndefined();
+  });
+});

@@ -64,9 +64,10 @@ export interface ChatSession {
   // list to render a one-line subtitle below the title.
   lastMessagePreview?: string | null;
   // Role in the chats IA. `"agent"` = an agent's single canonical chat;
-  // `"channel"` = a recurring-job-derived channel. Undefined for legacy /
+  // `"channel"` = a recurring-job-derived channel; `"topic"` = a
+  // subject-scoped session with its own context window. Undefined for legacy /
   // non-canonical sessions.
-  kind?: "agent" | "channel";
+  kind?: "agent" | "channel" | "topic";
   // `"job"` marks a session spawned by a scheduled job — channels carry
   // both this and `kind: "channel"`.
   origin?: "job";

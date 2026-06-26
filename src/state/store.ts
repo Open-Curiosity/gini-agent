@@ -964,6 +964,36 @@ function migrateTaskChatSessionId(state: RuntimeState): void {
   dyn.migrations = { ...(dyn.migrations ?? {}), taskChatSessionIdBackfilled: now() };
 }
 
+// Convert legacy threads into linear Chat history (ADR
+// chat-topics-tasks-subagents.md, Decision 3). A thread was a `threadId` /
+// `parentBlockId` tag on durable chat messages and queued pending messages
+// inside one session's ordinal stream; nulling those tags makes the rows read
+// as one linear main-chat history in ordinal order. The SQLite chat_blocks
+// rows are nulled by the parallel v10 memory-db migration.
+//
+// Marker-gated on `state.migrations.threadsToLinearHistory` so it runs at most
+// ONCE per instance — NOT on every load. The live thread-routing path still
+// writes these tags this phase (it is deleted in a later phase), so a
+// strip-on-every-read would null a freshly-queued thread reply before it could
+// be dispatched. Gating confines the conversion to the one-time legacy upgrade.
+function migrateThreadsToLinearHistory(state: RuntimeState): void {
+  const dyn = state as unknown as {
+    migrations?: { threadsToLinearHistory?: string };
+  };
+  if (dyn.migrations?.threadsToLinearHistory) return;
+  for (const message of state.chatMessages) {
+    delete message.threadId;
+    delete message.parentBlockId;
+  }
+  for (const session of state.chatSessions) {
+    for (const pending of session.pendingMessages ?? []) {
+      delete pending.threadId;
+      delete pending.parentBlockId;
+    }
+  }
+  dyn.migrations = { ...(dyn.migrations ?? {}), threadsToLinearHistory: now() };
+}
+
 // Stamp the active-at-migration-time agent onto records that pre-date the
 // per-agent isolation field. Idempotent and audit-emitting. Covers Task,
 // ChatSessionRecord, JobRecord, JobRunRecord,
@@ -1445,6 +1475,9 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       session.kind = "channel";
     }
   }
+  // Convert legacy threads into linear Chat history (ADR
+  // chat-topics-tasks-subagents.md). Marker-gated so it runs ONCE per instance.
+  migrateThreadsToLinearHistory(state);
   // Archive job channels orphaned by a pre-cleanup job deletion (issue #369).
   // Runs after the channel-kind backfill above so a legacy `origin:"job"`
   // session that just gained `kind:"channel"` is in scope, and after

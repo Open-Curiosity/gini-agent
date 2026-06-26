@@ -1003,12 +1003,23 @@ export interface ChatSessionRecord {
   // human opens them.
   origin?: "job";
   // The session's role in the new chats IA. `"agent"` = the single
-  // canonical chat for an agent; `"channel"` = a recurring-job-derived
-  // channel (always also carries `origin: "job"`). DISTINCT from
-  // `source?.kind` (the messaging-bridge kind). Legacy/non-canonical
-  // sessions may leave this undefined; the new UI treats undefined as
-  // hidden.
-  kind?: "agent" | "channel";
+  // canonical chat for an agent (this is Chat — the always-present main
+  // interface); `"channel"` = a recurring-job-derived channel (always also
+  // carries `origin: "job"`); `"topic"` = a subject-scoped session with its
+  // own isolated context window, spawned by Chat / a job / another topic
+  // (ADR chat-topics-tasks-subagents.md). `"channel"` folds into `"topic"`
+  // in a later phase. DISTINCT from `source?.kind` (the messaging-bridge
+  // kind). Legacy/non-canonical sessions may leave this undefined; the new
+  // UI treats undefined as hidden.
+  kind?: "agent" | "channel" | "topic";
+  // Short rolling summary of a `kind:"topic"` session, used later for
+  // routing/retrieval (Chat picks a topic to dispatch into by recalling over
+  // topic summaries). Absent until a topic accrues content.
+  topicSummary?: string;
+  // The Chat (`kind:"agent"`) session that spawned a `kind:"topic"` session,
+  // used later to forward a topic's final answer back into Chat. The topic's
+  // display name reuses the existing `title` field.
+  parentChatSessionId?: string;
   // Archived marker. Absent = active. An archived session keeps its full
   // history and stays directly addressable (GET /api/chat/<id>, deep links),
   // but is excluded from session/channel lists. Set when a job's delivery
