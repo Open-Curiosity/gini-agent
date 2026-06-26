@@ -5276,6 +5276,184 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // A transient fault (dropped connection / OS timeout) is retried with bounded
+  // backoff: the conversation is valid, so the next attempt may simply succeed.
+  test("transient model fault (operation timed out) retries with backoff then completes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transient-retry");
+    const provider = normalizeProvider(config.provider);
+
+    // First attempt: a transient OS timeout. Second attempt: success.
+    setEchoToolCallingFailure("The operation timed out.");
+    setEchoToolCallingResponse({ provider, text: "Recovered after a flaky connection.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recovered after a flaky connection.");
+    expect(finished.error).toBeUndefined();
+    // Exactly two provider calls: the failed attempt + the successful retry.
+    expect(getEchoToolCallingCalls().length).toBe(2);
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const retries = traces.filter(
+      (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
+    );
+    expect(retries.length).toBe(1);
+    // The first (and only) retry uses the base backoff: 500 * 2^0 = 500ms.
+    expect(retries[0]!.message).toContain("after 500ms");
+    expect(retries[0]!.message).toContain("attempt 1 of 2");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The streaming idle/stall timeout (provider.ts StreamIdleTimeoutError, whose
+  // message carries the "stream idle timeout" marker) is also transient and must
+  // be retried — this pins the reconciliation between the reader's thrown shape
+  // and the retry classifier.
+  test("streaming idle-timeout fault retries then completes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-idle-retry");
+    const provider = normalizeProvider(config.provider);
+
+    // The exact message provider.ts's StreamIdleTimeoutError produces.
+    setEchoToolCallingFailure("Model stream idle timeout: no data for 120000ms");
+    setEchoToolCallingResponse({ provider, text: "Back after the stall.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Back after the stall.");
+    expect(getEchoToolCallingCalls().length).toBe(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The transient budget is bounded: after MAX_TRANSIENT_RETRIES (2) extra
+  // attempts the task fails with the raw fault, just as it would today.
+  test("a persistent transient fault gives up after the retry cap and fails the task", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transient-cap");
+
+    // 1 initial attempt + 2 retries = 3 total, all failing transiently.
+    setEchoToolCallingFailure("connection reset by peer");
+    setEchoToolCallingFailure("connection reset by peer");
+    setEchoToolCallingFailure("connection reset by peer");
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("connection reset");
+    // Exactly three provider calls: initial + 2 retries, then it gives up.
+    expect(getEchoToolCallingCalls().length).toBe(3);
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const retries = traces.filter(
+      (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
+    );
+    // Two retry warnings (one per extra attempt); the third failure exhausts
+    // the budget and falls through to the hard-throw.
+    expect(retries.length).toBe(2);
+    expect(retries[1]!.message).toContain("after 1000ms");
+    expect(retries[1]!.message).toContain("attempt 2 of 2");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A transient failure that streamed partial text before erroring must have
+  // that partial trimmed from partialSummary before the retry (mirrors the
+  // overflow path's discard). Exercises the routeSurfacedLen > 0 reset branch.
+  test("a transient fault that streamed partial text trims it before the successful retry", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transient-partial-trim");
+    const provider = normalizeProvider(config.provider);
+
+    // The failed attempt streams a partial chunk, then errors transiently.
+    setEchoToolCallingFailure("The operation timed out.", { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+    setEchoToolCallingResponse({ provider, text: "Clean retry answer.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    // The discarded partial must NOT leak into the final summary.
+    expect(finished.summary).toBe("Clean retry answer.");
+    expect(finished.summary).not.toContain("DISCARDED-PARTIAL");
+    expect(getEchoToolCallingCalls().length).toBe(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A cancel that lands during the transient backoff wait must bail to the
+  // cancelled path, never sneak in the retry. Exercises abortableBackoffSleep's
+  // abort branch and the catch-and-bailOnTurnAbort handling.
+  test("a cancel during the transient backoff wait bails to cancelled, not a retry", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, `chat-task-transient-cancel-${basename(workspaceRoot)}`);
+    const provider = normalizeProvider(config.provider);
+    const { cancelTask } = await import("../agent");
+
+    // One transient failure arms a 500ms backoff; the success stub after it
+    // must NEVER run because we cancel during that backoff window.
+    setEchoToolCallingFailure("The operation timed out.");
+    setEchoToolCallingResponse({ provider, text: "SHOULD-NOT-APPEAR", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    // The transient-retry warning is appended right before the backoff sleep —
+    // poll for it, then cancel inside the 500ms backoff window.
+    const { readTrace } = await import("../state");
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const retried = readTrace(config.instance, task.id).some(
+        (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
+      );
+      if (retried) break;
+      await Bun.sleep(5);
+    }
+    await cancelTask(config, task.id);
+    const cancelled = await waitForTerminal(config, task.id, 10000);
+
+    expect(cancelled.status).toBe("cancelled");
+    // The retry's success stub must not have run: only the failed first call.
+    expect(getEchoToolCallingCalls().length).toBe(1);
+    expect(cancelled.summary ?? "").not.toContain("SHOULD-NOT-APPEAR");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A context overflow is NOT a transient fault — it must take the compact-and-
+  // retry path on its own budget, never the transient-retry path. (The transient
+  // markers and the overflow markers are disjoint by construction.)
+  test("a context overflow takes the overflow path, not the transient-retry path", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-not-transient");
+    const provider = normalizeProvider(config.provider);
+
+    const OVERFLOW_MESSAGE =
+      "This model's maximum context length is 32000 tokens. However, your messages resulted in 99999 tokens.";
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingResponse({ provider, text: "Recovered via overflow path.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recovered via overflow path.");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    // The overflow warning fired; the transient-retry warning did NOT.
+    expect(traces.some((t) => t.type === "warning" && /rejected the prompt as too long/.test(t.message))).toBe(true);
+    expect(traces.some((t) => t.type === "warning" && /Transient model-call fault/.test(t.message))).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // Fallback: a provider that reports no usage (the echo default) keeps the
   // plain chars/4 behavior — the identical transcript never trims.
   test("without provider usage the trim path stays on the chars/4 estimate and never engages", async () => {
