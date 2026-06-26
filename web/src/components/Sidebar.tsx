@@ -8,7 +8,6 @@ import {
   ArchiveRestore,
   ChevronDown,
   Menu,
-  MessagesSquare,
   Moon,
   MoreVertical,
   Plus,
@@ -26,8 +25,8 @@ import { useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import { useAllChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
-import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { useAllChatSessions, useInvalidate, useStatus } from "@/lib/queries";
+import { useChatReadState } from "@/lib/use-chat-read-state";
 import { isOpenableJobChannel } from "@/lib/job-channel";
 import {
   DropdownMenu,
@@ -132,16 +131,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
     return map;
   }, [allSessions.data, isUnread]);
 
-  const threadsInbox = useThreadsInbox();
-  const { isThreadUnread } = useThreadReadState(threadsInbox.data);
-  const unreadThreadCount = useMemo(
-    () => (threadsInbox.data ?? []).filter((t) => isThreadUnread(t)).length,
-    [threadsInbox.data, isThreadUnread]
-  );
-
   const selectedSession = params?.get("session") ?? null;
   const onChat = pathname === "/chat";
-  const onThreads = pathname === "/threads";
 
   const useAgentMutation = useMutation({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
@@ -457,19 +448,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
           <div className="h-px bg-sidebar-border" />
 
-          {/* Nav: Threads, Skills, Settings */}
+          {/* Nav: Skills, Logs, Settings */}
           <ul className="flex flex-col gap-0.5">
-            <li>
-              <Link href="/threads" onClick={onNavigate} className={navItem(onThreads)}>
-                <MessagesSquare className="size-3.5 text-sidebar-foreground/70" />
-                <span className="flex-1">Threads</span>
-                {unreadThreadCount > 0 ? (
-                  <span className="flex items-center justify-center rounded-full bg-sidebar-primary px-[7px] py-px text-[10px] font-bold text-sidebar-primary-foreground">
-                    {unreadThreadCount}
-                  </span>
-                ) : null}
-              </Link>
-            </li>
             <li>
               <Link href="/skills" onClick={onNavigate} className={navItem(pathname === "/skills")}>
                 <WandSparkles className="size-3.5 text-sidebar-foreground/70" />

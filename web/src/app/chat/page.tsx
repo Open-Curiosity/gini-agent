@@ -15,19 +15,14 @@ import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
 import { ChannelViewJob } from "@/components/chat/ChannelViewJob";
 import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
-import { ThreadChip } from "@/components/chat/ThreadChip";
-import { ReplyInThreadButton } from "@/components/chat/ReplyInThreadButton";
-import { ThreadPanel } from "@/components/chat/ThreadPanel";
-import { ThreadsTab, aggregateActivity } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
 import { SettingsTab } from "@/components/chat/SettingsTab";
 import { api, type UploadRef } from "@/lib/api";
-import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { useChatReadState } from "@/lib/use-chat-read-state";
 import { useStickToBottom } from "@/lib/use-stick-to-bottom";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   latestInFlightTaskId,
-  splitBlocks,
   TERMINAL_PHASE_LABELS,
   useAgentChat,
   useAllChatSessions,
@@ -38,11 +33,9 @@ import {
   useChatSessions,
   useInvalidate,
   useRemovePendingChatMessage,
-  useStatus,
-  useThreads
+  useStatus
 } from "@/lib/queries";
-import type { ChatBlock } from "@runtime/types";
-import type { ChatSession, ThreadSummary } from "@/lib/view-types";
+import type { ChatSession } from "@/lib/view-types";
 
 // The job name a render item was delivered by, or undefined for ordinary
 // conversation. A file_artifact card has no runId of its own, so the caller
@@ -114,9 +107,9 @@ export default function ChatPage() {
           </div>
         </section>
       ) : (
-        // Key on sessionId so all transient view state (active tab, open
-        // thread, composer draft) resets cleanly when the user switches agents
-        // or opens a channel — no reset effect needed.
+        // Key on sessionId so all transient view state (active tab, composer
+        // draft) resets cleanly when the user switches agents or opens a
+        // channel — no reset effect needed.
         <ChatSurface
           key={sessionId}
           sessionId={sessionId}
@@ -164,7 +157,6 @@ function ChatSurface({
   useEffect(() => {
     if (isPinned && tab === "settings") setTab("messages");
   }, [isPinned, tab]);
-  const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
   const [text, setText] = useState("");
   // In-chat search: client-side find over the loaded transcript. `query` is the
   // raw input; `activeMatch` indexes into the matched-block list below.
@@ -186,17 +178,6 @@ function ChatSurface({
     sessionId,
     session.pendingMessages
   );
-  const threadsQuery = useThreads(sessionId);
-  const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
-  const { markThreadRead, isThreadUnread } = useThreadReadState(threads);
-  // The Threads tab badge mirrors the sidebar nav badge: it counts UNREAD
-  // threads (and the pill hides at 0), not the total thread count.
-  const unreadThreadCount = threads.filter((t) => isThreadUnread(t)).length;
-  // Dot the Threads tab while any thread's run is in flight so activity is
-  // visible from the Messages tab without switching over. aggregateActivity
-  // shares the sort's ranking, so a run waiting on the user (the actionable
-  // state) outranks a running one here exactly as it does in list order.
-  const threadsActivity = aggregateActivity(threads);
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
@@ -215,30 +196,10 @@ function ChatSurface({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, liveActivityAt, markRead]);
 
-  // Mark the open thread read using the live summary, so a reply that lands
-  // while the panel is open clears too instead of re-flagging it as unread.
-  useEffect(() => {
-    if (!openThread) return;
-    const live = threads.find((t) => t.threadId === openThread.threadId) ?? openThread;
-    markThreadRead(live);
-  }, [openThread, threads, markThreadRead]);
-
-  // Main chat = blocks with no threadId; thread blocks render in the panel.
-  const mainBlocks = useMemo(() => splitBlocks(blocks).main, [blocks]);
-
-  // Map a thread's parent block id → its summary, so the chip renders
-  // directly under the message it branched from. When several threads share
-  // one parent, keep the one with the newest reply so the freshest
-  // conversation is the one surfaced by the single chip.
-  const threadByParent = useMemo(() => {
-    const map = new Map<string, ThreadSummary>();
-    for (const t of threads) {
-      if (!t.parentBlockId) continue;
-      const existing = map.get(t.parentBlockId);
-      if (!existing || t.lastReplyAt > existing.lastReplyAt) map.set(t.parentBlockId, t);
-    }
-    return map;
-  }, [threads]);
+  // The transcript renders the session's full block list in ordinal order —
+  // legacy thread-tagged blocks (the agent no longer creates threads) read
+  // inline alongside everything else.
+  const mainBlocks = blocks;
 
   // Run-now responses carry { taskId }; enqueued ones carry { queued, pendingId }.
   // The server decides which based on whether a turn is already in flight; the
@@ -251,7 +212,7 @@ function ChatSurface({
       }),
     onSuccess: () => {
       setText("");
-      invalidate(["chat", "tasks", "threads"]);
+      invalidate(["chat", "tasks"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -418,17 +379,6 @@ function ChatSurface({
       );
     }
     const block = item.block;
-    // A thread can branch off either the user's message (an agent-routed
-    // turn) or an assistant reply (the user's own "Reply in thread"), so look
-    // up a chip for both.
-    const thread =
-      block.kind === "assistant_text" || block.kind === "user_text"
-        ? threadByParent.get(block.id)
-        : undefined;
-    // An assistant reply with no thread yet gets the always-visible "Reply in
-    // thread" affordance so the user can branch a new thread off it
-    // (Slack-style).
-    const canStartThread = block.kind === "assistant_text" && !block.streaming && !thread;
     const isMatch = matches.includes(block.id);
     const isActiveMatch = block.id === activeMatchId;
     return (
@@ -448,17 +398,6 @@ function ChatSurface({
           toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
           agent={messageAgent}
         />
-        {thread ? (
-          // Assistant replies sit in a 46px avatar gutter; user messages are
-          // right-aligned, so align the chip to the message it branched from.
-          <div className={block.kind === "user_text" ? "flex justify-end" : "pl-[46px]"}>
-            <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
-          </div>
-        ) : canStartThread ? (
-          <div className="pl-[46px]">
-            <ReplyInThreadButton onClick={() => setOpenThread(newThreadFor(sessionId, block))} />
-          </div>
-        ) : null}
       </li>
     );
   };
@@ -499,8 +438,6 @@ function ChatSurface({
         <ChatTabBar
           active={tab}
           onChange={setTab}
-          threadCount={unreadThreadCount}
-          threadsActivity={threadsActivity}
           hideJobsTab={isChannel || isTopic}
           hideSettingsTab={isPinned}
         />
@@ -586,8 +523,6 @@ function ChatSurface({
               </div>
             </div>
           </>
-        ) : tab === "threads" ? (
-          <ThreadsTab threads={threads} agentName={headerName} onOpen={(t) => setOpenThread(t)} />
         ) : tab === "jobs" ? (
           <JobsTab />
         ) : tab === "settings" && !isPinned ? (
@@ -598,40 +533,8 @@ function ChatSurface({
           <SettingsTab agentId={activeAgentId} />
         ) : null}
       </section>
-
-      {openThread ? (
-        // Key on the thread id so the panel's transient state (composer draft,
-        // scroll) starts fresh per thread — no draft leaks across switches.
-        <ThreadPanel
-          key={openThread.threadId}
-          sessionId={sessionId}
-          thread={openThread}
-          agentName={headerName}
-          agent={messageAgent}
-          onClose={() => setOpenThread(null)}
-        />
-      ) : null}
     </>
   );
-}
-
-// Build the open-thread descriptor for a brand-new thread the user is
-// starting off an assistant message. There's no ThreadSummary yet (no blocks),
-// so synthesize one with a fresh threadId and replyCount 0; ThreadPanel renders
-// the parent echo + empty replies + composer, and the first reply (carrying
-// `parentBlockId`) brings the real thread into existence.
-function newThreadFor(
-  sessionId: string,
-  block: Extract<ChatBlock, { kind: "assistant_text" }>
-): ThreadSummary {
-  return {
-    threadId: crypto.randomUUID(),
-    sessionId,
-    parentBlockId: block.id,
-    rootPreview: block.text,
-    replyCount: 0,
-    lastReplyAt: block.createdAt
-  };
 }
 
 // Resolve a pinned session from the unscoped chat list the sidebar fetches —
