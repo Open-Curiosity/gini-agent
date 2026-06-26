@@ -350,13 +350,17 @@ export function bedrockSupportsStreamingWithTools(model: string): boolean {
 // Whether a Bedrock model accepts the fine-grained-tool-streaming beta flag,
 // which streams a tool_use block's input JSON incrementally instead of
 // buffering it whole. Per the AWS Bedrock "Anthropic Claude tool use" docs the
-// capability is an Anthropic Claude family feature (Claude Sonnet/Haiku/Opus 4
-// and 4.5); non-Claude Bedrock families (Nova, Llama, DeepSeek, Mistral) don't
-// support the flag, so sending it could 400 a validation error. Allowlist the
-// Claude family only. The slug may carry a Bedrock inference-profile prefix
-// ("us.anthropic.claude-…") or be bare; both match.
+// capability is documented for the Claude 4 FAMILY ONLY — "Claude Sonnet 4.5,
+// Claude Haiku 4.5, Claude Sonnet 4, and Claude Opus 4." Older Claude 3.x/3.5
+// ids and the non-Claude families (Nova, Llama, DeepSeek, Mistral) are NOT
+// listed, and Bedrock rejects an unsupported feature with a 400 rather than
+// ignoring it — so the allowlist must match the 4+ family precisely, not any
+// `claude` id. The minor class ([4-9]|\d\d) keeps future point releases on it
+// while excluding 3.x. The slug may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-sonnet-4-6") or be bare ("claude-sonnet-4-6"); both
+// match because the pattern keys off the `claude-<tier>-<major>` shape.
 export function bedrockSupportsFineGrainedToolStreaming(model: string): boolean {
-  return /anthropic\.claude|^claude/.test(normalizeModel(model));
+  return /claude-(?:sonnet|haiku|opus)-(?:[4-9]|\d\d)/.test(normalizeModel(model));
 }
 
 export interface ModelPricing {

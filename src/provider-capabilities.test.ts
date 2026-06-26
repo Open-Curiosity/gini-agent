@@ -210,19 +210,30 @@ describe("bedrockSupportsStreamingWithTools", () => {
 });
 
 describe("bedrockSupportsFineGrainedToolStreaming", () => {
-  test("Claude families (bedrock-prefixed or bare) accept the flag; others don't", () => {
-    // Fine-grained tool streaming is a Claude capability on Bedrock.
+  test("Claude 4+ family (bedrock-prefixed or bare) accept the flag; others don't", () => {
+    // AWS documents fine-grained tool streaming for the Claude 4 family only.
     for (const m of [
       "us.anthropic.claude-sonnet-4-6",
       "us.anthropic.claude-opus-4-8",
       "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
       "anthropic.claude-sonnet-4-20250514-v1:0",
-      "claude-opus-4-8"
+      "claude-opus-4-8",
+      "claude-sonnet-4-12"
     ]) {
       expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(true);
     }
-    // Non-Claude families don't support the beta flag (sending it risks a 400),
-    // and an empty/unknown id stays off.
+    // Claude 3.x/3.5 are NOT in AWS's supported list — sending the beta to them
+    // risks a 400, so the gate must exclude them even though they're Claude.
+    for (const m of [
+      "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
+      "us.anthropic.claude-3-opus-20240229-v1:0",
+      "us.anthropic.claude-3-haiku-20240307-v1:0",
+      "claude-3-5-sonnet-20241022"
+    ]) {
+      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(false);
+    }
+    // Non-Claude families don't support the beta flag, and an empty/unknown id
+    // stays off.
     for (const m of [
       "us.amazon.nova-pro-v1:0",
       "us.meta.llama4-scout-17b-instruct-v1:0",

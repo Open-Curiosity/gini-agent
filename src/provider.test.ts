@@ -4969,7 +4969,7 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("bedrock: a non-streaming (structured) Claude tool turn does NOT request fine-grained tool streaming", async () => {
+  test("bedrock: a non-streaming Claude tool turn does NOT request fine-grained tool streaming", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
     const fetchStub = installFetch(() =>
