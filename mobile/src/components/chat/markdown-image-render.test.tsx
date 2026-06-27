@@ -9,14 +9,18 @@ import {
 
 // This test drives the REAL react-native-markdown-display parser + AstRenderer
 // with the app's REAL `markdownRules`, so the AST nesting is genuine (an
-// image-only line parses to `paragraph -> image`, see repro-ast). The shared
-// chatMockSetup mocks the library's *component* (default export) to render
-// null, but the parser/AstRenderer internals are pure JS (only StyleSheet from
-// the already-mocked react-native), so we import and run them directly against
-// the rule tree the device would build. The library's own `MarkdownIt` re-export
-// is mocked too, so we parse with the real `markdown-it` package — exactly what
-// the library wraps. Walking the produced tree proves whether an agent image
-// lands inside the iOS TextInput selection wrapper (where a View can't render).
+// image-only line parses to `paragraph -> image`). chatMockSetup mocks the
+// library's package root (its component renders null) and the react-native it
+// pulls in, so importing AstRenderer/parser from the root would hit the mock —
+// and loading the real root cascades through renderRules -> styles ->
+// Platform.select / react-native-fit-image, none of which the lean RN mock
+// provides. We import `parser.js` + `AstRenderer.js` from `/src/lib/*` instead:
+// they're pure JS needing only the already-mocked StyleSheet, so they bypass
+// the component mock and run against the real rule tree the device would build.
+// The library's `MarkdownIt` re-export is mocked too, so we parse with the real
+// `markdown-it` package — exactly what the library wraps. Walking the produced
+// tree proves whether an agent image lands inside the iOS TextInput selection
+// wrapper (where a View can't render).
 const AstRenderer = (
   await import("react-native-markdown-display/src/lib/AstRenderer.js")
 ).default;
@@ -162,8 +166,10 @@ describe("an agent upload image renders outside the iOS text-selection wrapper",
     );
     const path = findPath(tree, isUploadImage)!;
     expect(path.some(isSelectableBlock)).toBe(false);
-    // The paragraph that holds both the prose and the image is a View.
-    expect(path[1].type).toBe(View);
+    // The image's nearest block ancestor (the paragraph holding both the prose
+    // and the image) renders as a View. Anchored from the leaf, like the
+    // standalone case above, so a change in wrapping depth can't misindex it.
+    expect(path[path.length - 2].type).toBe(View);
   });
 
   test("a paragraph of plain prose still uses the iOS TextInput selection wrapper", () => {
