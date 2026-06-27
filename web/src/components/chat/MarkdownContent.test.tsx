@@ -172,6 +172,31 @@ describe("MarkdownContent", () => {
     expect(anchors[0]?.querySelector("[role='link']")?.tagName).toBe("SPAN");
   });
 
+  test("clicking the chip inside a linked image opens ONLY the image URL and cancels the outer link's navigation", () => {
+    const opened: string[] = [];
+    const origOpen = window.open;
+    // @ts-expect-error test stub
+    window.open = (u: string) => { opened.push(u); return null; };
+    try {
+      const { container } = render(
+        <MarkdownContent text="[![a cat](https://evil.example/p.gif)](https://target.example)" dropForeignImages />
+      );
+      // Sanity: the chip is nested inside the outer anchor.
+      const anchor = container.querySelector("a")!;
+      const chip = screen.getByText("a cat").closest("[role='link']")!;
+      expect(anchor.contains(chip)).toBe(true);
+      const evt = new MouseEvent("click", { bubbles: true, cancelable: true });
+      chip.dispatchEvent(evt);
+      // Only the image URL opened (window.open), and the chip called
+      // preventDefault — so the anchor's default navigation to the target URL is
+      // cancelled. One click → one model-authored destination, not two.
+      expect(opened).toEqual(["https://evil.example/p.gif"]);
+      expect(evt.defaultPrevented).toBe(true);
+    } finally {
+      window.open = origOpen;
+    }
+  });
+
   test("with dropForeignImages, an alt-less foreign image chip falls back to the 'Image' label", () => {
     const { container } = render(
       <MarkdownContent text="![](https://evil.example/pixel.gif)" dropForeignImages />

@@ -113,10 +113,20 @@ function makeComponents(linkBaseUrl?: string, dropForeignImages = false) {
               role="link"
               tabIndex={0}
               title={src}
-              onClick={() => window.open(src, "_blank", "noopener,noreferrer")}
+              // preventDefault + stopPropagation so the chip OWNS the
+              // activation: when it's nested inside a linked image's outer <a>
+              // (`[![](img)](target)`), a bare window.open would still let the
+              // click bubble to that anchor and navigate there too — one click,
+              // two model-authored destinations. Stopping here keeps it to one.
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                window.open(src, "_blank", "noopener,noreferrer");
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
+                  e.stopPropagation();
                   window.open(src, "_blank", "noopener,noreferrer");
                 }
               }}
