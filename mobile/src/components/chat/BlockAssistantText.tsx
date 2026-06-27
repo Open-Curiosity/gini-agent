@@ -173,19 +173,22 @@ function hasLinkDescendant(node: MarkdownNode): boolean {
   return node.children?.some(hasLinkDescendant) ?? false;
 }
 
-// Walk an AST node's subtree for an `image` node that the image rule will
-// actually render — i.e. one whose `src` is a `gini-upload://` ref (a foreign
-// src is dropped to null, so it contributes no View to host). Such an image
-// renders as MarkdownUploadImage, a Pressable (a View subtree), which RN cannot
-// mount inside the iOS `<TextInput>` selection wrapper a text block resolves to.
-// A block carrying one must therefore render as a plain View instead, so the
-// image's View subtree has a valid host. The default markdown paragraph rule is
-// itself a View for exactly this reason; the app's text-wrapper override (for
-// clean URL wrapping + selection) is what would otherwise strand the image.
-function hasUploadImageDescendant(node: MarkdownNode): boolean {
-  if (node.type === "image" && uploadIdFromRef(node.attributes?.src) !== null)
-    return true;
-  return node.children?.some(hasUploadImageDescendant) ?? false;
+// Walk an AST node's subtree for an `image` node the image rule renders as a
+// View subtree — either a `gini-upload://` ref (→ MarkdownUploadImage) or a
+// foreign http(s) src (→ MarkdownForeignImage chip). Both are Pressables, which
+// RN cannot mount inside the iOS `<TextInput>` selection wrapper a text block
+// resolves to; a block carrying one must render as a plain View instead so the
+// image's View subtree has a valid host. The condition mirrors the image rule's
+// own non-null branches exactly (a data:/other src still drops to null there, so
+// it stays on the text path). The default markdown paragraph rule is itself a
+// View for the same reason; the app's text-wrapper override (for clean URL
+// wrapping + selection) is what would otherwise strand the image.
+function hasRenderableImageDescendant(node: MarkdownNode): boolean {
+  if (node.type === "image") {
+    const src = node.attributes?.src;
+    if (uploadIdFromRef(src) !== null || (src != null && isWebUrl(src))) return true;
+  }
+  return node.children?.some(hasRenderableImageDescendant) ?? false;
 }
 
 // Block-level renderers wrap inline children in a single selectable
@@ -203,18 +206,19 @@ function hasUploadImageDescendant(node: MarkdownNode): boolean {
 // selectable wrapper would let iOS hijack the long-press for text selection
 // instead of showing the link menu.
 //
-// A block that contains a renderable upload image takes a different escape: the
-// image renders as a View subtree (MarkdownUploadImage), which can't mount
-// inside the iOS TextInput a text wrapper resolves to, so the block renders as
-// a plain View (the library's own default paragraph rule is a View for the same
-// reason). It mirrors that default rule's row/wrap layout (imageBlock below) so
-// a mid-sentence image keeps inline, wrapping paragraph flow — prose, image,
-// prose flow left-to-right and wrap, rather than stacking vertically under RN's
-// default column direction — and carries over the text style's vertical margins.
+// A block that contains a renderable image (an upload preview or a foreign-image
+// chip) takes a different escape: the image renders as a View subtree, which
+// can't mount inside the iOS TextInput a text wrapper resolves to, so the block
+// renders as a plain View (the library's own default paragraph rule is a View
+// for the same reason). It mirrors that default rule's row/wrap layout
+// (imageBlock below) so a mid-sentence image keeps inline, wrapping paragraph
+// flow — prose, image, prose flow left-to-right and wrap, rather than stacking
+// vertically under RN's default column direction — and carries over the text
+// style's vertical margins.
 const renderAsText =
   (style: { marginTop?: number; marginBottom?: number }): RenderRule =>
   (node, children) => {
-    if (hasUploadImageDescendant(node)) {
+    if (hasRenderableImageDescendant(node)) {
       return (
         <View
           key={node.key}

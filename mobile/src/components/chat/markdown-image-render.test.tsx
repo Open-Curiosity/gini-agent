@@ -127,6 +127,15 @@ function isUploadImage(el: El): boolean {
   );
 }
 
+// MarkdownForeignImage is the inert chip the image rule renders for a foreign
+// http(s) src (loads only on tap; never auto-fetched).
+function isForeignImage(el: El): boolean {
+  return (
+    typeof el.type === "function" &&
+    (el.type as { name?: string }).name === "MarkdownForeignImage"
+  );
+}
+
 beforeEach(() => {
   Platform.OS = "ios";
 });
@@ -190,11 +199,24 @@ describe("an agent upload image renders outside the iOS text-selection wrapper",
     expect(host.type).toBe(TextInput);
   });
 
-  test("a foreign (non-upload) image src is still dropped — SSRF guard intact", () => {
-    // The screenshot's literal `https://cataas.com/cat` is NOT a gini-upload
-    // ref, so the image rule returns null: nothing renders, and the block stays
-    // on the normal text-selection path (no upload-image escape).
+  test("a foreign http(s) image renders the inert chip and escapes the TextInput wrapper", () => {
+    // The screenshot's literal `https://cataas.com/cat` is NOT a gini-upload ref,
+    // so it's not auto-fetched — but rather than vanish, it renders the inert
+    // MarkdownForeignImage chip (a View/Pressable). Like the upload image, that
+    // View subtree can't live inside the iOS TextInput, so its block ancestor
+    // must be a plain View, not SelectableBlockText.
     const tree = renderTree("![Cat pic](https://cataas.com/cat)");
+    const path = findPath(tree, isForeignImage);
+    expect(path).not.toBeNull();
+    expect(path!.some(isSelectableBlock)).toBe(false);
+    expect(path![path!.length - 2].type).toBe(View);
+  });
+
+  test("a non-http(s) image src is dropped — no chip, stays on the text path", () => {
+    // A data:/javascript: src renders nothing (not even a chip), so the block has
+    // no image View to host and keeps the normal text-selection wrapper.
+    const tree = renderTree("![x](data:image/png;base64,AAAA)");
+    expect(findPath(tree, isForeignImage)).toBeNull();
     expect(findPath(tree, isUploadImage)).toBeNull();
     expect(findPath(tree, isSelectableBlock)).not.toBeNull();
   });

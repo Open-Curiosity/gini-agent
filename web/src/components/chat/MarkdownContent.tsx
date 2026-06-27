@@ -104,17 +104,28 @@ function makeComponents(linkBaseUrl?: string, dropForeignImages = false) {
         if (dropForeignImages) {
           const host = webHost(src);
           if (!host) return null;
+          // A SPAN, not an <a>: markdown can nest an image inside a link
+          // (`[![alt](img)](target)`), and an <a> chip there would produce an
+          // invalid nested anchor. The span opens the URL on explicit click via
+          // window.open (noopener) — nothing fetches at render time.
           return (
-            <a
-              href={src}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="my-1 inline-flex max-w-full items-center gap-1.5 rounded-lg border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+            <span
+              role="link"
+              tabIndex={0}
+              title={src}
+              onClick={() => window.open(src, "_blank", "noopener,noreferrer")}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  window.open(src, "_blank", "noopener,noreferrer");
+                }
+              }}
+              className="my-1 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-lg border bg-background px-3 py-1.5 text-sm hover:bg-accent"
             >
               <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate font-medium text-foreground">{alt || "Image"}</span>
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">{alt || "Image"}</span>
               <span className="shrink-0 text-muted-foreground">{host}</span>
-            </a>
+            </span>
           );
         }
         return (
@@ -186,10 +197,12 @@ export const MarkdownContent = memo(function MarkdownContent({
   // When set, doc-relative links resolve absolute against this URL (the doc
   // viewer passes the doc's hosted URL); omit it for chat/skills rendering.
   linkBaseUrl?: string;
-  // When true, only `gini-upload://` image refs render and every other image
-  // `src` is dropped (the SSRF / tracking-pixel guard for UNTRUSTED
-  // model-authored chat/thinking text). Leave unset for trusted doc/file/skill
-  // markdown so ordinary images render. See ADR outbound-chat-attachments.md.
+  // When true, only `gini-upload://` image refs render inline; a foreign http(s)
+  // image is NOT auto-fetched (the SSRF / tracking-pixel guard for UNTRUSTED
+  // model-authored chat/thinking text) but renders an inert chip that loads only
+  // on explicit click, and a non-http(s) src is dropped entirely. Leave unset for
+  // trusted doc/file/skill markdown so ordinary images render. See ADR
+  // outbound-chat-attachments.md.
   dropForeignImages?: boolean;
 }) {
   return (

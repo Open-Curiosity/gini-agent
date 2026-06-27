@@ -112,12 +112,64 @@ describe("MarkdownContent", () => {
     // No <img>: nothing fetches the bytes at render time (the SSRF /
     // tracking-pixel guard for model-authored text holds).
     expect(container.querySelector("img")).toBeNull();
-    // A chip names the image + host and only navigates on an explicit click.
-    const chip = screen.getByText("a cat").closest("a");
-    expect(chip?.getAttribute("href")).toBe("https://evil.example/pixel.gif");
-    expect(chip?.getAttribute("target")).toBe("_blank");
-    expect(chip?.getAttribute("rel")).toBe("noopener noreferrer");
+    // A chip names the image + host. It's a role=link SPAN (not an <a>) so it
+    // can't form an invalid nested anchor inside a linked image; it carries the
+    // URL in its title and opens only on explicit click.
+    const chip = screen.getByText("a cat").closest("[role='link']");
+    expect(chip).not.toBeNull();
+    expect(chip?.tagName).toBe("SPAN");
+    expect(chip?.getAttribute("title")).toBe("https://evil.example/pixel.gif");
     expect(chip?.textContent).toContain("evil.example");
+    // No anchor was emitted for the image.
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  test("a foreign image clicks open in a new tab with noopener (only on explicit click)", () => {
+    const calls: Array<[string, string, string]> = [];
+    const orig = window.open;
+    // @ts-expect-error test stub
+    window.open = (u: string, t: string, f: string) => { calls.push([u, t, f]); return null; };
+    try {
+      render(<MarkdownContent text="![a cat](https://evil.example/pixel.gif)" dropForeignImages />);
+      const chip = screen.getByText("a cat").closest("[role='link']")!;
+      chip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      expect(calls).toEqual([["https://evil.example/pixel.gif", "_blank", "noopener,noreferrer"]]);
+    } finally {
+      window.open = orig;
+    }
+  });
+
+  test("a foreign image chip activates on Enter/Space but ignores other keys", () => {
+    const calls: string[] = [];
+    const orig = window.open;
+    // @ts-expect-error test stub
+    window.open = (u: string) => { calls.push(u); return null; };
+    try {
+      render(<MarkdownContent text="![a cat](https://evil.example/pixel.gif)" dropForeignImages />);
+      const chip = screen.getByText("a cat").closest("[role='link']")!;
+      chip.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+      expect(calls).toEqual([]); // a non-activating key does nothing
+      chip.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      chip.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
+      expect(calls).toEqual([
+        "https://evil.example/pixel.gif",
+        "https://evil.example/pixel.gif"
+      ]);
+    } finally {
+      window.open = orig;
+    }
+  });
+
+  test("a linked foreign image does NOT produce a nested anchor (chip is a span)", () => {
+    const { container } = render(
+      <MarkdownContent text="[![a cat](https://evil.example/p.gif)](https://target.example)" dropForeignImages />
+    );
+    // Exactly one anchor (the outer link); the image chip is a span inside it,
+    // never a second <a> — invalid nested anchors are avoided.
+    const anchors = container.querySelectorAll("a");
+    expect(anchors.length).toBe(1);
+    expect(anchors[0]?.getAttribute("href")).toBe("https://target.example");
+    expect(anchors[0]?.querySelector("[role='link']")?.tagName).toBe("SPAN");
   });
 
   test("with dropForeignImages, an alt-less foreign image chip falls back to the 'Image' label", () => {
@@ -125,8 +177,8 @@ describe("MarkdownContent", () => {
       <MarkdownContent text="![](https://evil.example/pixel.gif)" dropForeignImages />
     );
     expect(container.querySelector("img")).toBeNull();
-    const chip = screen.getByText("Image").closest("a");
-    expect(chip?.getAttribute("href")).toBe("https://evil.example/pixel.gif");
+    const chip = screen.getByText("Image").closest("[role='link']");
+    expect(chip?.getAttribute("title")).toBe("https://evil.example/pixel.gif");
   });
 
   test("with dropForeignImages, a non-http(s) image src is dropped entirely (no chip, no img)", () => {
@@ -136,7 +188,7 @@ describe("MarkdownContent", () => {
     // react-markdown's sanitizer already neutralizes data:/javascript: srcs;
     // webHost also returns null for them, so no chip is rendered either.
     expect(container.querySelector("img")).toBeNull();
-    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("[role='link']")).toBeNull();
   });
 
   test("webHost folds: http, https, non-http(s) protocol, unparseable", () => {
