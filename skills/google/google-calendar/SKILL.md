@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Calendar scopes."
 metadata:
   gini:
-    version: 1.2.0
+    version: 1.2.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -180,7 +180,7 @@ The block is plain text: optional `view:` / `date:` / `tz:` header lines up to t
 - `view:` — `day` or `week` (optional; defaults to `day` when every event is on the anchor date, else `week`).
 - `date:` — the anchor date `YYYY-MM-DD` (week view shows the Sunday-started week containing it).
 - `tz:` — a short timezone label shown in the header (e.g. `PT`).
-- time-spec — `YYYY-MM-DD HH:MM-HH:MM`, `YYYY-MM-DD all-day`, or just `HH:MM-HH:MM` / `all-day` (date then defaults to the anchor). Times are 24h.
+- time-spec — `YYYY-MM-DD HH:MM-HH:MM`, `YYYY-MM-DD all-day`, or just `HH:MM-HH:MM` / `all-day` (date then defaults to the anchor). Times are 24h. The bare (undated) forms need an anchor — a `date:` header or at least one fully-dated event line — or those undated lines are dropped and the card renders empty.
 - status — `proposed` for the change you're making, `cancel` for an event going away; omit it for the user's existing events.
 
 ````text
