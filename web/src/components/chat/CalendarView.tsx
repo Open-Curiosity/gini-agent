@@ -95,8 +95,12 @@ export function parseCalendar(raw: string): ParsedCalendar {
       const key = m?.[1]?.toLowerCase();
       if (m && key && (HEADER_KEYS as readonly string[]).includes(key)) {
         header[key as (typeof HEADER_KEYS)[number]] = m[2]!.trim();
+        continue;
       }
-      // Unknown header-shaped lines inside the header section are ignored.
+      // The first non-recognized-header line ends the header. Leave i pointing at
+      // it (don't consume) so it's parsed as an event line — agents often emit
+      // event lines straight after the header with no blank separator.
+      break;
     }
   } else {
     i = 0; // no header — every line is an event line

@@ -78,6 +78,13 @@ describe("parseCalendar", () => {
     expect(p.events).toHaveLength(0);
   });
 
+  test("event lines immediately after the header (no blank separator) are parsed, not dropped", () => {
+    const p = parseCalendar("date: 2026-07-02\n09:00-10:00 | A");
+    expect(p.anchor).toBe("2026-07-02");
+    expect(p.events).toHaveLength(1);
+    expect(p.events[0]?.title).toBe("A");
+  });
+
   test("status normalization: new→proposed, cancelled/removed→cancel, other→existing", () => {
     const p = parseCalendar(
       "date: 2026-07-02\n\n" +
