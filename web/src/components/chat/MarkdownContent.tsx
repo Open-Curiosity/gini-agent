@@ -10,6 +10,7 @@ import { uploadInlineUrl, uploadUrl } from "@/lib/api";
 import { defaultUrlTransform } from "react-markdown";
 import { uploadIdFromRef, UPLOAD_REF_SCHEME } from "@/lib/upload-ref";
 import { EmailDraftCard } from "./EmailDraftCard";
+import { CalendarView } from "./CalendarView";
 
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
@@ -184,12 +185,16 @@ function makeComponents(linkBaseUrl?: string, dropForeignImages = false) {
         </a>
       );
     },
-    // A ```email-draft fenced block renders as an inline draft card instead of a
-    // code block. `node` is destructured out so it isn't spread onto the DOM <pre>.
+    // A ```email-draft fenced block renders as an inline draft card, and a
+    // ```calendar fence renders as an inline calendar preview, instead of a code
+    // block. `node` is destructured out so it isn't spread onto the DOM <pre>.
     pre: ({ node, className, ...props }: React.HTMLAttributes<HTMLPreElement> & { node?: unknown }) => {
       const codeNode = (node as { children?: unknown[] } | undefined)?.children?.[0];
       if (codeNode && fenceLang(codeNode) === "email-draft") {
         return <EmailDraftCard raw={hastText(codeNode)} />;
+      }
+      if (codeNode && fenceLang(codeNode) === "calendar") {
+        return <CalendarView raw={hastText(codeNode)} />;
       }
       return <pre {...props} className={cn("hljs", className)} />;
     }
