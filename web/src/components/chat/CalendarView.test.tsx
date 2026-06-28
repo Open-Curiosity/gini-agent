@@ -66,6 +66,18 @@ describe("parseCalendar", () => {
     expect(p.events).toHaveLength(1);
   });
 
+  test("a non-ISO date: header falls back to the earliest dated event for the anchor", () => {
+    const p = parseCalendar("date: tomorrow\n\n2026-07-02 09:00-10:00 | A");
+    expect(p.anchor).toBe("2026-07-02");
+    expect(p.events).toHaveLength(1);
+  });
+
+  test("a non-ISO date: header with no dated event leaves the anchor null", () => {
+    const p = parseCalendar("date: 7/2\n\n09:00-10:00 | Floating");
+    expect(p.anchor).toBeNull();
+    expect(p.events).toHaveLength(0);
+  });
+
   test("status normalization: new→proposed, cancelled/removed→cancel, other→existing", () => {
     const p = parseCalendar(
       "date: 2026-07-02\n\n" +
@@ -192,6 +204,12 @@ describe("CalendarView", () => {
       <CalendarView raw={"view: week\ndate: 2026-07-02\n\n2026-07-02 all-day | Offsite\n2026-07-04 09:00-10:00 | Sync"} />
     );
     expect(screen.queryByText("Offsite")).not.toBeNull();
+  });
+
+  test("a bad date: header in a week-inferred layout renders without throwing", () => {
+    render(<CalendarView raw={"date: tomorrow\n\n2026-07-02 15:00-16:00 | A\n2026-07-03 09:00-10:00 | B"} />);
+    expect(screen.queryByText("A")).not.toBeNull();
+    expect(screen.queryByText("B")).not.toBeNull();
   });
 
   test("no dated events renders the placeholder card", () => {
