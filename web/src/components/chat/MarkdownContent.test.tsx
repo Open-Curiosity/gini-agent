@@ -72,6 +72,14 @@ describe("MarkdownContent", () => {
     expect(screen.queryByText("body line")).not.toBeNull();
   });
 
+  test("a calendar fence renders the inline calendar preview card", () => {
+    const text = "```calendar\ndate: 2026-07-02\n\n15:00-16:00 | Team sync | proposed\n```";
+    render(<MarkdownContent text={text} />);
+    expect(screen.queryByText("Calendar")).not.toBeNull();
+    expect(screen.queryByText("Team sync")).not.toBeNull();
+    expect(screen.queryByText("Proposed")).not.toBeNull();
+  });
+
   test("hastText folds: null, text, children, and childless non-text nodes", () => {
     expect(hastText(null)).toBe("");
     expect(hastText({ type: "text", value: "x" })).toBe("x");
