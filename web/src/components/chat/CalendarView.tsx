@@ -119,7 +119,8 @@ export function parseCalendar(raw: string): ParsedCalendar {
     .map((e) => /^(\d{4}-\d{2}-\d{2})\b/.exec(e.spec)?.[1])
     .filter((d): d is string => !!d)
     .sort();
-  const anchor = header.date ?? datedDates[0] ?? null;
+  const headerDate = header.date && /^\d{4}-\d{2}-\d{2}$/.test(header.date) ? header.date : undefined;
+  const anchor = headerDate ?? datedDates[0] ?? null;
 
   const events: CalEvent[] = [];
   for (const e of rawEvents) {
