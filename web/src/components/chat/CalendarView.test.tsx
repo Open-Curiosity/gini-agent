@@ -170,9 +170,19 @@ describe("CalendarView", () => {
   });
 
   test("a later non-overlapping event starts a fresh cluster (full width)", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\n09:00-10:00 | First\n11:00-12:00 | Second"} />);
+    const { container } = render(
+      <CalendarView raw={"date: 2026-07-02\n\n09:00-10:00 | First\n11:00-12:00 | Second"} />
+    );
     expect(screen.queryByText("First")).not.toBeNull();
     expect(screen.queryByText("Second")).not.toBeNull();
+    // Disjoint events each occupy the full column width at left 0 — a packing
+    // regression that collapses them into half-width columns fails here.
+    const blocks = Array.from(container.querySelectorAll("[style*='left']")) as HTMLElement[];
+    expect(blocks).toHaveLength(2);
+    for (const el of blocks) {
+      expect(el.style.left).toBe("0%");
+      expect(el.style.width).toBe("calc(100% - 2px)");
+    }
   });
 
   test("an early and a late event widen the hour window beyond [8,18]", () => {
