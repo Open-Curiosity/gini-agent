@@ -18,8 +18,8 @@ export interface RelayWorkspaceClient {
 }
 
 export const RELAY_WORKSPACE_CLIENT: RelayWorkspaceClient = {
-  clientId: "252321805238-mheo9opuo379iiq8qdf6l9qamo7maa0f.apps.googleusercontent.com",
-  clientSecret: "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"
+  clientId: "911117879651-1ha20s2fsks6c7aim71il0s48rpoabd4.apps.googleusercontent.com",
+  clientSecret: "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"
 };
 
 // Build the standard Google "authorized_user" credential JSON gws reads from a
