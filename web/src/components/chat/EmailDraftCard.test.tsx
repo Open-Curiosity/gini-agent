@@ -3,22 +3,26 @@
 // EmailDraftCard parses an RFC-ish plain-text draft (header lines up to the
 // first blank line, then the body) and renders it read-only with a copy
 // affordance. When the fence carries a DraftId, it also shows a Send button
-// that sends the SAVED Gmail draft directly server-side (no agent turn) and
-// renders a persistent "Sent" across refresh. These tests pin the parser folds
-// (recognized headers, the non-header line that ends headers, CRLF, no-header),
-// both copy outcomes, the DraftId/Account metadata extraction (never shown as
-// recipients), the Send-only-with-DraftId rule, the sent-marker mount query,
+// that sends the SAVED Gmail draft directly server-side (no agent turn). Whether
+// the draft is already sent comes from SentDraftsContext (primed eagerly by
+// ChatSurface), so the disabled "Sent" renders on first paint with no "Send"
+// flash on refresh. These tests pin the parser folds (recognized headers, the
+// non-header line that ends headers, CRLF, no-header), both copy outcomes, the
+// DraftId/Account metadata extraction (never shown as recipients), the
+// Send-only-with-DraftId rule, the context-driven Sent/Send/checking states,
 // and the click → POST → Sent/Sending/error branches.
 
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { SentDraftsProvider } from "./SentDraftsContext";
 
-// Controllable api() mock: each test sets `apiImpl` to drive the sent-marker
-// query and the send POST. Installed before importing the component so the card
-// picks up the stub.
+// Controllable api() mock: each test sets `apiImpl` to drive the send POST.
+// Installed before importing the component so the card picks up the stub. The
+// card no longer queries on mount — only the send click hits api now.
 type ApiCall = { path: string; init?: RequestInit };
 let apiCalls: ApiCall[] = [];
-let apiImpl: (path: string, init?: RequestInit) => Promise<unknown> = async () => ({ sent: [] });
+let apiImpl: (path: string, init?: RequestInit) => Promise<unknown> = async () => ({ ok: true });
 const api = mock((path: string, init?: RequestInit) => {
   apiCalls.push({ path, init });
   return apiImpl(path, init);
@@ -29,6 +33,20 @@ const { EmailDraftCard } = await import("./EmailDraftCard");
 
 const writeText = mock((_: string) => Promise.resolve());
 
+// Render the card inside a SentDraftsProvider so it can resolve its "Sent"
+// state from context. Defaults to a settled, empty set (the steady state for a
+// not-yet-sent draft once the eager query has loaded).
+function renderCard(
+  element: ReactElement,
+  ctx: { sentIds?: Set<string>; loaded?: boolean } = {}
+) {
+  return render(
+    <SentDraftsProvider value={{ sentIds: ctx.sentIds ?? new Set(), loaded: ctx.loaded ?? true }}>
+      {element}
+    </SentDraftsProvider>
+  );
+}
+
 beforeEach(() => {
   writeText.mockClear();
   writeText.mockImplementation(() => Promise.resolve());
@@ -37,7 +55,7 @@ beforeEach(() => {
     configurable: true
   });
   apiCalls = [];
-  apiImpl = async () => ({ sent: [] });
+  apiImpl = async () => ({ ok: true });
   api.mockClear();
 });
 
@@ -49,7 +67,7 @@ afterEach(() => {
 
 describe("EmailDraftCard", () => {
   test("renders recognized headers (Subject bold) and the body", () => {
-    render(<EmailDraftCard raw={"To: a@b.c\r\nCc: d@e.f\nSubject: Quarterly sync\n\nSee you Tuesday.\nBring notes."} />);
+    renderCard(<EmailDraftCard raw={"To: a@b.c\r\nCc: d@e.f\nSubject: Quarterly sync\n\nSee you Tuesday.\nBring notes."} />);
     expect(screen.queryByText("To:")).not.toBeNull();
     expect(screen.queryByText("Cc:")).not.toBeNull();
     const subject = screen.getByText("Quarterly sync");
@@ -58,13 +76,13 @@ describe("EmailDraftCard", () => {
   });
 
   test("a non-header first line means no header section — body only", () => {
-    render(<EmailDraftCard raw={"just a body line\nDate: not-a-recognized-header"} />);
+    renderCard(<EmailDraftCard raw={"just a body line\nDate: not-a-recognized-header"} />);
     expect(screen.queryByText("To:")).toBeNull();
     expect(screen.queryByText(/just a body line/)).not.toBeNull();
   });
 
   test("an unrecognized header-shaped line ends the headers and joins the body", () => {
-    render(<EmailDraftCard raw={"To: a@b.c\nDate: 2026-06-11\n\nactual body"} />);
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDate: 2026-06-11\n\nactual body"} />);
     expect(screen.queryByText("To:")).not.toBeNull();
     expect(screen.queryByText(/Date: 2026-06-11/)).not.toBeNull();
   });
@@ -73,7 +91,7 @@ describe("EmailDraftCard", () => {
   // its own navigator.clipboard stub, which would shadow the mock under test.
   test("copy writes the trimmed raw draft and flips to Copied, then back", async () => {
     jest.useFakeTimers();
-    render(<EmailDraftCard raw={"To: a@b.c\n\nbody"} />);
+    renderCard(<EmailDraftCard raw={"To: a@b.c\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy draft" }));
     // Flush onCopy's continuation (await writeText -> setCopied(true)).
     await act(async () => {});
@@ -89,7 +107,7 @@ describe("EmailDraftCard", () => {
 
   test("an unavailable clipboard is a silent no-op", async () => {
     writeText.mockImplementation(() => Promise.reject(new Error("denied")));
-    render(<EmailDraftCard raw={"body only"} />);
+    renderCard(<EmailDraftCard raw={"body only"} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy draft" }));
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(screen.queryByText("Copied")).toBeNull();
@@ -97,17 +115,17 @@ describe("EmailDraftCard", () => {
   });
 
   // Without a DraftId (doc viewer / file preview / skills page, or a draft the
-  // agent didn't tag) the card stays read-only — no Send affordance, no query.
+  // agent didn't tag) the card stays read-only — no Send affordance, no api call.
   test("renders no Send button without a DraftId", () => {
-    render(<EmailDraftCard raw={"To: a@b.c\nSubject: Hi\n\nbody"} />);
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nSubject: Hi\n\nbody"} />);
     expect(screen.queryByText("Send")).toBeNull();
     expect(api).not.toHaveBeenCalled();
   });
 
   // DraftId/Account are metadata: extracted (drive the Send), never shown as To/
-  // Cc/recipient rows.
-  test("extracts DraftId/Account as metadata and does not render them as rows", async () => {
-    render(
+  // Cc/recipient rows. With a settled context, no mount api call fires.
+  test("extracts DraftId/Account as metadata and does not render them as rows", () => {
+    renderCard(
       <EmailDraftCard
         raw={"To: a@b.c\nSubject: Hi\nDraftId: r123\nAccount: me@x.com\n\nbody"}
       />
@@ -119,43 +137,58 @@ describe("EmailDraftCard", () => {
     expect(screen.queryByText(/me@x\.com/)).toBeNull();
     // The recognized header still renders.
     expect(screen.queryByText("To:")).not.toBeNull();
-    // The mount sent-marker query fired with the draft id.
-    await waitFor(() => expect(api).toHaveBeenCalled());
-    expect(apiCalls[0]!.path).toBe("/email/drafts/sent?ids=r123");
+    // No mount fetch — the card reads sent-state from context, never queries.
+    expect(api).not.toHaveBeenCalled();
   });
 
-  // On mount the card asks whether the draft was already sent; if so it renders
-  // the disabled "Sent" state (this is what persists across a page refresh).
-  test("a draft already sent renders a disabled Sent on mount", async () => {
-    apiImpl = async (path) => (path.startsWith("/email/drafts/sent") ? { sent: ["r123"] } : { ok: true });
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(screen.queryByText("Sent")).not.toBeNull());
+  // A draft already in the (settled) context's sent set renders the disabled
+  // "Sent" on first paint, with no "Send" flash and no api call. This is the
+  // refresh path the fix targets.
+  test("a draft in the context sent set renders a disabled Sent with no Send flash", () => {
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />, {
+      sentIds: new Set(["r123"]),
+      loaded: true
+    });
+    expect(screen.queryByText("Sent")).not.toBeNull();
+    // The active "Send" text never appears for a sent draft.
+    expect(screen.queryByText("Send")).toBeNull();
     const button = screen.getByRole("button", { name: /Sent/ }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
+    expect(api).not.toHaveBeenCalled();
   });
 
-  // A draft NOT yet sent shows a clickable Send even when the mount query runs.
-  test("a not-yet-sent draft shows a clickable Send", async () => {
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+  // A draft NOT in the settled context's set shows a clickable "Send".
+  test("a not-sent draft with the context loaded shows a clickable Send", () => {
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />, {
+      sentIds: new Set(),
+      loaded: true
+    });
     const button = screen.getByRole("button", { name: /Send/ }) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
+  });
+
+  // Before the eager context settles, the card shows a disabled spinner —
+  // never the active "Send" text — so a sent draft can't flash "Send".
+  test("an unloaded context renders a disabled spinner, not Send", () => {
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />, {
+      sentIds: new Set(),
+      loaded: false
+    });
+    expect(screen.queryByText("Send")).toBeNull();
+    const button = screen.getByRole("button", { name: "Checking draft status" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
   });
 
   // Click → POST /email/drafts/send with the draftId + account; success flips to
   // a disabled "Sent".
   test("Send posts the draft directly and flips to Sent on success", async () => {
     let resolveSend: (v: { ok: boolean }) => void = () => {};
-    apiImpl = async (path, init) => {
-      if (path.startsWith("/email/drafts/sent")) return { sent: [] };
-      // /email/drafts/send — hold so the in-flight "Sending…" is observable.
-      return new Promise((resolve) => {
+    apiImpl = async (_path, init) =>
+      new Promise((resolve) => {
         resolveSend = resolve;
         void init;
       });
-    };
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\nAccount: me@x.com\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\nAccount: me@x.com\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
     // In-flight label + disabled.
     await waitFor(() => expect(screen.queryByText("Sending…")).not.toBeNull());
@@ -178,8 +211,7 @@ describe("EmailDraftCard", () => {
 
   // A draft with no Account omits it from the POST body.
   test("the send POST omits account when the fence has none", async () => {
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
     await waitFor(() => expect(apiCalls.some((c) => c.path === "/email/drafts/send")).toBe(true));
     const post = apiCalls.find((c) => c.path === "/email/drafts/send")!;
@@ -188,40 +220,41 @@ describe("EmailDraftCard", () => {
 
   // A server-side {ok:false} re-enables Send and surfaces the message.
   test("a failed send re-enables Send and shows the error message", async () => {
-    apiImpl = async (path) =>
-      path.startsWith("/email/drafts/sent") ? { sent: [] } : { ok: false, message: "Invalid draft" };
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+    apiImpl = async () => ({ ok: false, message: "Invalid draft" });
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
     await waitFor(() => expect(screen.queryByText("Invalid draft")).not.toBeNull());
     const button = screen.getByRole("button", { name: /Send/ }) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
   });
 
-  // A thrown api() error (network / gateway down) surfaces the error and
+  // A {ok:false} with no message falls back to the generic copy.
+  test("a failed send with no message shows the generic error copy", async () => {
+    apiImpl = async () => ({ ok: false });
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
+    fireEvent.click(screen.getByRole("button", { name: /Send/ }));
+    await waitFor(() => expect(screen.queryByText("Couldn't send the draft.")).not.toBeNull());
+  });
+
+  // A thrown api() Error (network / gateway down) surfaces its message and
   // re-enables Send.
   test("a thrown send error surfaces the message and re-enables Send", async () => {
-    apiImpl = async (path) => {
-      if (path.startsWith("/email/drafts/sent")) return { sent: [] };
+    apiImpl = async () => {
       throw new Error("gateway down");
     };
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
     await waitFor(() => expect(screen.queryByText("gateway down")).not.toBeNull());
     expect((screen.getByRole("button", { name: /Send/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  // A failed mount sent-marker query leaves the button clickable (best-effort).
-  test("a failed sent-marker query leaves Send clickable", async () => {
+  // A thrown non-Error rejection falls back to the generic error copy.
+  test("a thrown non-Error rejection shows the generic error copy", async () => {
     apiImpl = async () => {
-      throw new Error("query failed");
+      throw "boom";
     };
-    render(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
-    // Give the rejected promise a tick to settle.
-    await act(async () => {});
-    const button = screen.getByRole("button", { name: /Send/ }) as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
+    renderCard(<EmailDraftCard raw={"To: a@b.c\nDraftId: r123\n\nbody"} />);
+    fireEvent.click(screen.getByRole("button", { name: /Send/ }));
+    await waitFor(() => expect(screen.queryByText("Couldn't send the draft.")).not.toBeNull());
   });
 });

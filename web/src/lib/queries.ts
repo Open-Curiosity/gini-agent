@@ -129,6 +129,24 @@ export function useSetupRequests() {
   });
 }
 
+// The set of Gmail draft ids the gateway has recorded as sent (GET
+// /email/drafts/sent with no `ids` filter returns them all). ChatSurface fires
+// this eagerly so the small payload is normally settled before the heavier
+// blocks (and thus the draft cards) render — letting an already-sent card paint
+// "Sent" on first render with no "Send" flash. `loaded` is true once the query
+// settles (so the card can show a brief spinner only in the rare not-yet-loaded
+// case, never the "Send" text).
+export function useSentDrafts(): { sentIds: Set<string>; loaded: boolean } {
+  const query = useQuery<{ sent: string[] }>({
+    queryKey: ["sent-drafts"],
+    queryFn: () => api<{ sent: string[] }>("/email/drafts/sent")
+  });
+  return useMemo(
+    () => ({ sentIds: new Set(query.data?.sent ?? []), loaded: !query.isLoading }),
+    [query.data, query.isLoading]
+  );
+}
+
 // `useMemories` was removed alongside the state.memories
 // consolidation. The Memory page now surfaces Hindsight only — see
 // the per-unit/per-bank hooks below. See ADR
