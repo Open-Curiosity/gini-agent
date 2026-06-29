@@ -194,7 +194,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
         errorSeverity: payload.errorSeverity === "info" || payload.errorSeverity === "error" ? payload.errorSeverity : undefined,
         callId: String(payload.callId ?? ""),
-        runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
+        runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined,
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     case "tool_result":
       return {
@@ -202,10 +208,26 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         kind: "tool_result",
         callId: String(payload.callId ?? ""),
         preview: String(payload.preview ?? ""),
-        truncated: Boolean(payload.truncated)
+        truncated: Boolean(payload.truncated),
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     case "phase":
-      return { ...base, kind: "phase", label: String(payload.label ?? "") };
+      return {
+        ...base,
+        kind: "phase",
+        label: String(payload.label ?? ""),
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
+      };
     case "approval_requested": {
       // Legacy block kind from before the Authorization/SetupRequest split.
       // Partition by action so old rows render with the right new card
@@ -279,7 +301,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         ...base,
         kind: "system_note",
         text: String(payload.text ?? ""),
-        ...(authError ? { authError } : {})
+        ...(authError ? { authError } : {}),
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     }
     default: {
@@ -320,16 +348,24 @@ function payloadFor(block: ChatBlock): string {
         errorMessage: block.errorMessage,
         errorSeverity: block.errorSeverity,
         callId: block.callId,
-        runningHint: block.runningHint
+        runningHint: block.runningHint,
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
       });
     case "tool_result":
       return JSON.stringify({
         callId: block.callId,
         preview: block.preview,
-        truncated: block.truncated
+        truncated: block.truncated,
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
       });
     case "phase":
-      return JSON.stringify({ label: block.label });
+      return JSON.stringify({
+        label: block.label,
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
+      });
     case "authorization_requested":
       return JSON.stringify({
         authorizationId: block.authorizationId,
@@ -353,7 +389,9 @@ function payloadFor(block: ChatBlock): string {
     case "system_note":
       return JSON.stringify({
         text: block.text,
-        ...(block.authError ? { authError: block.authError } : {})
+        ...(block.authError ? { authError: block.authError } : {}),
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
       });
   }
 }
@@ -434,7 +472,9 @@ export function insertChatBlock(
             errorMessage: input.errorMessage,
             errorSeverity: input.errorSeverity,
             callId: input.callId,
-            runningHint: input.runningHint
+            runningHint: input.runningHint,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
         case "tool_result":
           return {
@@ -442,10 +482,18 @@ export function insertChatBlock(
             kind: "tool_result",
             callId: input.callId,
             preview: input.preview,
-            truncated: input.truncated
+            truncated: input.truncated,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
         case "phase":
-          return { ...base, kind: "phase", label: input.label };
+          return {
+            ...base,
+            kind: "phase",
+            label: input.label,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
+          };
         case "authorization_requested":
           return {
             ...base,
@@ -472,7 +520,9 @@ export function insertChatBlock(
             ...base,
             kind: "system_note",
             text: input.text,
-            ...(input.authError ? { authError: input.authError } : {})
+            ...(input.authError ? { authError: input.authError } : {}),
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
       }
     })();
