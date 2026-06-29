@@ -8,6 +8,7 @@ import { appendTrace } from "./state/trace";
 import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, claudeSupportsFineGrainedToolStreaming, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderContextWindowTokens, resolveProviderModality } from "./provider-capabilities";
 import { estimateTextTokens, estimateToolCallingMessagesTokens } from "./execution/context-window";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
+import { anthropicMirrorModelId } from "./model-routes";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -1113,7 +1114,11 @@ export async function generateToolCallingResponse(
     }
 
     if (provider.name === "bedrock") {
-      return callBedrockConverse(provider, messages, tools, onDelta, undefined, signal);
+      // Bedrock is the failure-prone leg of the chat loop (region capacity, 5xx,
+      // throttling, mid-stream resets). When a first-party Anthropic key is on
+      // hand and the model has an Anthropic-API mirror, race the two so a turn
+      // never stalls on a Bedrock hiccup; otherwise this is a plain Converse call.
+      return raceBedrockWithAnthropic(provider, messages, tools, onDelta, signal);
     }
 
     return callToolCallingChatCompletions(provider, messages, tools, onDelta, signal);
@@ -1140,6 +1145,141 @@ export async function generateToolCallingResponse(
       throw new ProviderAuthError(provider.name, message);
     }
     throw error;
+  }
+}
+
+// Bedrock↔Anthropic failover for the chat tool-calling path.
+//
+// Why: Amazon Bedrock is the flakiest leg of the chat loop — regional capacity
+// shortfalls, 5xx storms, throttling, and mid-stream connection resets all show
+// up as a stalled or crashed turn. The first-party Anthropic Messages API serves
+// the exact same Claude models (Bedrock's us/eu/apac/global ids are inference
+// profiles over the identical model), so when an ANTHROPIC_API_KEY is available
+// we can run both and let whichever succeeds answer the turn.
+//
+// Primitive: Promise.any, NOT Promise.race. Promise.race settles on the FIRST
+// promise to *settle* — a fast Bedrock rejection would lose us the turn even
+// though Anthropic was about to succeed. Promise.any resolves on the first to
+// *succeed* and only rejects if BOTH reject, which is exactly the failover we
+// want: a fast failure on one provider is absorbed as long as the other answers.
+//
+// Both calls run to completion. We deliberately do NOT abort the other provider
+// the moment one starts streaming: a stream-leader that crashes mid-stream still
+// needs a live backup that ran far enough to return a complete result. We only
+// abort both in the finally — once the turn has its answer (or both failed),
+// the loser is pure waste and gets cancelled to free the socket.
+//
+// Stream gating: with two providers potentially emitting deltas, the visible
+// token stream must come from exactly one of them or it interleaves into
+// garbage. The first provider to emit a delta claims the stream; the other's
+// deltas are dropped. onDelta is also fully shielded — a throw from the caller's
+// delta sink can never escape into a child call and turn a healthy provider into
+// a spurious rejection.
+//
+// Generality: the mirror model is resolved via anthropicMirrorModelId (the
+// MODEL_ALIASES table in model-routes.ts), so this covers every aliased Claude
+// model + region profile, not a single hardcoded id. A Bedrock model with no
+// first-party equivalent simply falls through to a plain Converse call.
+//
+// No-op fallback (plain callBedrockConverse, zero behavior change) unless ALL of:
+//   1. the provider is bedrock,
+//   2. ANTHROPIC_API_KEY is set (the mirror leg can authenticate), and
+//   3. the Bedrock model has an Anthropic-API mirror in MODEL_ALIASES.
+async function raceBedrockWithAnthropic(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void,
+  signal?: AbortSignal
+): Promise<ToolCallingResult> {
+  const mirrorModel = anthropicMirrorModelId(provider.model);
+  // Gate: only race when a first-party key exists AND the model has a mirror.
+  // Otherwise behave exactly like the legacy single-provider Bedrock path.
+  if (!process.env.ANTHROPIC_API_KEY || !mirrorModel) {
+    return callBedrockConverse(provider, messages, tools, onDelta, undefined, signal);
+  }
+
+  const anthropicProvider: ProviderConfig = {
+    name: "anthropic",
+    model: mirrorModel,
+    baseUrl: DEFAULT_ANTHROPIC_BASE_URL,
+    apiKeyEnv: "ANTHROPIC_API_KEY"
+  };
+
+  // One controller per leg so the finally can cancel the loser independently of
+  // the outer turn. The outer signal (cancelTask) aborts BOTH at once.
+  const bedrockController = new AbortController();
+  const anthropicController = new AbortController();
+  const onOuterAbort = (): void => {
+    bedrockController.abort(signal?.reason);
+    anthropicController.abort(signal?.reason);
+  };
+  if (signal) {
+    if (signal.aborted) onOuterAbort();
+    else signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+
+  // Stream gate: the first leg to emit claims the visible stream; the other's
+  // deltas are dropped so the two providers never interleave on the wire. The
+  // wrapper also swallows any onDelta throw so a caller-side sink error can't
+  // reject the child call (which would falsely fail a healthy provider).
+  let streamOwner: "bedrock" | "anthropic" | null = null;
+  const gatedDelta = (leg: "bedrock" | "anthropic"): ((text: string) => void) | undefined => {
+    if (!onDelta) return undefined;
+    return (text: string): void => {
+      if (streamOwner === null) streamOwner = leg;
+      if (streamOwner !== leg) return;
+      try {
+        onDelta(text);
+      } catch {
+        // Never let a delta-sink throw escape into the child call.
+      }
+    };
+  };
+
+  const bedrockPromise = callBedrockConverse(
+    provider,
+    messages,
+    tools,
+    gatedDelta("bedrock"),
+    undefined,
+    bedrockController.signal
+  );
+  const anthropicPromise = callAnthropicMessages(
+    anthropicProvider,
+    messages,
+    tools,
+    gatedDelta("anthropic"),
+    undefined,
+    anthropicController.signal
+  );
+  // Settle the loser's rejection so it can't surface as an unhandled rejection
+  // once Promise.any has already resolved from the winner.
+  bedrockPromise.catch(() => {});
+  anthropicPromise.catch(() => {});
+
+  try {
+    return await Promise.any([bedrockPromise, anthropicPromise]);
+  } catch (error) {
+    // Promise.any only throws once BOTH legs reject, wrapped in an AggregateError.
+    // If the outer turn was cancelled, surface the abort so the chat-task loop
+    // routes to its cancelled terminal path rather than a provider failure.
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException("Aborted", "AbortError");
+    }
+    const errors = error instanceof AggregateError ? error.errors : [error];
+    // Prefer the first non-abort error, and prefer the Bedrock one: the existing
+    // auth/region classifier keys on a ProviderAuthError tagged "bedrock", and a
+    // genuine Bedrock failure is the more actionable signal for a bedrock turn.
+    const nonAbort = errors.filter((e) => !isAbortError(e));
+    const bedrockErr = nonAbort.find((e) => e instanceof ProviderAuthError && e.provider === "bedrock");
+    throw bedrockErr ?? nonAbort[0] ?? errors[0] ?? error;
+  } finally {
+    if (signal) signal.removeEventListener("abort", onOuterAbort);
+    // The turn is decided (won or both-failed): cancel the loser to free its
+    // socket. Aborting an already-settled call is a no-op.
+    bedrockController.abort();
+    anthropicController.abort();
   }
 }
 

@@ -35,6 +35,19 @@ export const MODEL_ALIASES: Record<string, Record<string, { id: string; qualifie
   }
 };
 
+// Resolve the first-party Anthropic-API model id that mirrors a given
+// Bedrock model id, if one exists. The Bedrock cross-region inference
+// profiles (us/eu/apac/global prefixes) are the same Anthropic models the
+// first-party Messages API serves, so this is the general bridge the
+// Bedrock↔Anthropic failover (raceBedrockWithAnthropic in provider.ts) uses
+// to build its mirror provider — keyed off the same alias table the picker
+// uses, so it stays correct for every aliased model rather than one hardcoded
+// id. Returns undefined for a Bedrock model with no first-party equivalent
+// (e.g. a non-Anthropic Bedrock model), which the caller treats as "no race".
+export function anthropicMirrorModelId(bedrockModelId: string): string | undefined {
+  return MODEL_ALIASES.bedrock?.[bedrockModelId]?.id;
+}
+
 // Default-route preference, most-preferred first: the model vendor's own
 // API beats a reseller/aggregator (first-party endpoints get new model
 // revisions and features first), codex's OAuth bundle beats the metered

@@ -40,6 +40,7 @@ import {
   type ToolCallingMessage,
   type ToolFunctionSpec
 } from "./provider";
+import { anthropicMirrorModelId } from "./model-routes";
 import { userProfilePath } from "./runtime/identity-files";
 import { readTrace } from "./state/trace";
 import type { RuntimeConfig } from "./types";
@@ -5968,6 +5969,307 @@ describe("streaming idle/stall timeout", () => {
       fetchStub.restore();
       restoreIdle();
       restoreEnv();
+    }
+  });
+});
+
+// installFetch always returns one response regardless of URL; the race fires two
+// requests (Bedrock + Anthropic) at once, so it needs a router keyed on which
+// host the request hit. Bedrock → bedrock-runtime.*.amazonaws.com; the mirror →
+// api.anthropic.com. Each handler can return a Response or throw (network-level
+// failure) to model one leg crashing while the other answers.
+function installFetchRouter(handlers: {
+  bedrock: () => Response;
+  anthropic: () => Response;
+}): { calls: Array<{ url: string; init: RequestInit }>; restore: () => void } {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = String(input);
+    // Honor an aborted signal the way real fetch does, so the race's outer-abort
+    // path (both legs cancelled) is exercised deterministically.
+    const signal = init.signal as AbortSignal | undefined;
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    calls.push({ url, init });
+    try {
+      if (url.includes("bedrock-runtime")) return Promise.resolve(handlers.bedrock());
+      if (url.includes("api.anthropic.com")) return Promise.resolve(handlers.anthropic());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return Promise.reject(new Error(`unexpected fetch URL in race test: ${url}`));
+  }) as unknown as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+const bedrockConverseJson = (text: string): Response =>
+  anthropicJson({
+    output: { message: { role: "assistant", content: [{ text }] } },
+    stopReason: "end_turn",
+    usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 }
+  });
+
+const anthropicMessageJson = (text: string): Response =>
+  anthropicJson({
+    id: "msg_mirror",
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 5, output_tokens: 2 }
+  });
+
+describe("bedrock↔anthropic race (chat tool-calling failover)", () => {
+  // Same rationale as the bedrock signing tests: a stray ambient session token
+  // would change the signed-headers shape. Race tests don't assert signatures,
+  // but clearing it keeps the AWS leg's behavior deterministic across machines.
+  let restoreSessionToken: () => void;
+  beforeEach(() => { restoreSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
+  afterEach(() => { restoreSessionToken(); });
+
+  test("anthropicMirrorModelId maps Bedrock Claude profiles to first-party ids and returns undefined otherwise", () => {
+    expect(anthropicMirrorModelId("us.anthropic.claude-sonnet-4-6")).toBe("claude-sonnet-4-6");
+    expect(anthropicMirrorModelId("eu.anthropic.claude-sonnet-4-6")).toBe("claude-sonnet-4-6");
+    expect(anthropicMirrorModelId("us.anthropic.claude-opus-4-8")).toBe("claude-opus-4-8");
+    // A non-Anthropic Bedrock model has no first-party mirror.
+    expect(anthropicMirrorModelId("us.amazon.nova-pro-v1:0")).toBeUndefined();
+    expect(anthropicMirrorModelId("unknown.model")).toBeUndefined();
+  });
+
+  test("no key set: falls back to plain Bedrock (no mirror request, no behavior change)", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", undefined);
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetchRouter({
+      bedrock: () => bedrockConverseJson("from-bedrock"),
+      anthropic: () => anthropicMessageJson("from-anthropic")
+    });
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(result.text).toBe("from-bedrock");
+      // Exactly one request, and it went to Bedrock — the mirror never fired.
+      expect(fetchStub.calls).toHaveLength(1);
+      expect(fetchStub.calls[0]!.url).toContain("bedrock-runtime");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("model has no mirror: falls back to plain Bedrock even with the key set", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetchRouter({
+      bedrock: () => bedrockConverseJson("nova-only"),
+      anthropic: () => anthropicMessageJson("should-not-fire")
+    });
+    try {
+      // Nova is a non-Anthropic model: anthropicMirrorModelId returns undefined,
+      // so the race must not engage even though a key is present.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(result.text).toBe("nova-only");
+      expect(fetchStub.calls).toHaveLength(1);
+      expect(fetchStub.calls[0]!.url).toContain("bedrock-runtime");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("races: the Anthropic mirror answers when Bedrock returns a 5xx", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetchRouter({
+      bedrock: () => anthropicJson({ message: "ServiceUnavailableException: capacity" }, 503),
+      anthropic: () => anthropicMessageJson("mirror-saved-the-turn")
+    });
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      // Bedrock failed; Promise.any resolved from the mirror instead of stalling.
+      expect(result.text).toBe("mirror-saved-the-turn");
+      // Both legs were dispatched, and the mirror hit api.anthropic.com with the
+      // mapped first-party model id (claude-sonnet-4-6), not the Bedrock id.
+      const anthropicCall = fetchStub.calls.find((c) => c.url.includes("api.anthropic.com"));
+      expect(anthropicCall).toBeDefined();
+      expect(anthropicCall!.url).toBe("https://api.anthropic.com/v1/messages");
+      expect(JSON.parse(String(anthropicCall!.init.body)).model).toBe("claude-sonnet-4-6");
+      expect(fetchStub.calls.some((c) => c.url.includes("bedrock-runtime"))).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("races: a healthy Bedrock turn still answers, and both legs are dispatched", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetchRouter({
+      bedrock: () => bedrockConverseJson("from-bedrock"),
+      anthropic: () => anthropicMessageJson("from-anthropic")
+    });
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      // Either provider succeeding is a valid win for the turn; the contract is
+      // "a complete answer", and both legs were dispatched for resilience.
+      expect(["from-bedrock", "from-anthropic"]).toContain(result.text);
+      expect(fetchStub.calls.some((c) => c.url.includes("bedrock-runtime"))).toBe(true);
+      expect(fetchStub.calls.some((c) => c.url.includes("api.anthropic.com"))).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("both legs fail: throws the Bedrock-tagged ProviderAuthError so the AWS reauth CTA still fires", async () => {
+    // Key present so the race engages, but NO AWS creds resolve — the Bedrock leg
+    // throws a typed ProviderAuthError("bedrock") at the signing step (pre-fetch),
+    // and the mirror leg 401s. The race must surface the Bedrock-tagged error so
+    // the chat-task classifier routes to the AWS reauth CTA, not the Anthropic one.
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
+    const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
+    const restoreProfile = setEnv("AWS_PROFILE", undefined);
+    const fetchStub = installFetchRouter({
+      bedrock: () => anthropicJson({ message: "should-not-be-reached" }, 200),
+      anthropic: () => anthropicJson({ type: "error", error: { type: "authentication_error", message: "invalid key" } }, 401)
+    });
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const err = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("bedrock");
+      // The Bedrock leg never reached fetch (the creds throw is pre-network).
+      expect(fetchStub.calls.some((c) => c.url.includes("bedrock-runtime"))).toBe(false);
+    } finally {
+      fetchStub.restore();
+      restoreProfile();
+      restoreFile();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("stream gating: only the first emitter's deltas reach onDelta (no two-provider interleave)", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    // Both legs stream. Bedrock emits "AAAA" and Anthropic emits "bbbb"; whichever
+    // claims the stream first, the visible deltas must be ALL from that one leg —
+    // never a mix of upper- and lower-case characters.
+    const fetchStub = installFetchRouter({
+      bedrock: () => converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "AA" } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "AA" } } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } },
+        { type: "metadata", payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } }
+      ]),
+      anthropic: () => anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "bb" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "bb" } } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    });
+    const seen: string[] = [];
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      const joined = seen.join("");
+      // The visible stream is homogeneous: all 'A's OR all 'b's, never both.
+      const hasUpper = /A/.test(joined);
+      const hasLower = /b/.test(joined);
+      expect(hasUpper && hasLower).toBe(false);
+      expect(joined.length).toBeGreaterThan(0);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("outer abort: a pre-aborted turn signal cancels both legs and rethrows the abort", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    // The router would answer if reached, but a pre-aborted signal must short-
+    // circuit both legs at their entry guard — neither fetch should fire.
+    const fetchStub = installFetchRouter({
+      bedrock: () => bedrockConverseJson("late"),
+      anthropic: () => anthropicMessageJson("late")
+    });
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        undefined,
+        undefined,
+        controller.signal
+      ).catch((e) => e);
+      // Both legs threw AbortError; the race rethrows the abort so the chat-task
+      // loop routes to its cancelled terminal path, not a provider failure.
+      expect(isAbortError(err)).toBe(true);
+      expect(fetchStub.calls).toHaveLength(0);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
+    }
+  });
+
+  test("stream gating wrapper swallows an onDelta throw without failing the turn", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetchRouter({
+      bedrock: () => converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "ok" } } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } },
+        { type: "metadata", payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } }
+      ]),
+      anthropic: () => anthropicMessageJson("mirror")
+    });
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      // A throwing delta sink must never propagate out of the child call and fail
+      // an otherwise-healthy provider — the wrapper eats it and the turn resolves.
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        () => { throw new Error("sink blew up"); }
+      );
+      expect(["ok", "mirror"]).toContain(result.text);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+      restoreKey();
     }
   });
 });
