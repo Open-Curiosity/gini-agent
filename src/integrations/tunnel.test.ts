@@ -403,7 +403,7 @@ describe("tunnel integration", () => {
   });
 
   // A fresh login with GINI_RELAY_PROVISIONED set requests the Workspace
-  // services, so the relay can capture a Calendar/Gmail grant in one consent.
+  // services, so the relay can capture the grant in one consent.
   test("connectTunnel requests Workspace services on a fresh login when provisioned", async () => {
     process.env.GINI_RELAY_PROVISIONED = "true"; // restored in afterEach
     let seen: string[] | undefined = ["sentinel"];
@@ -418,7 +418,7 @@ describe("tunnel integration", () => {
     await connectTunnel(config, "gini-relay");
     await awaitTunnelSettled(config.instance);
     expect(getTunnel(config).status).toBe("connected");
-    expect(seen).toEqual(["calendar", "gmail"]);
+    expect(seen).toEqual(["calendar", "gmail", "drive", "sheets"]);
   });
 
   // Without the flag, a fresh login is identity-only: no services field, so the
