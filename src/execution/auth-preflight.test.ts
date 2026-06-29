@@ -20,7 +20,9 @@ let sanitizedEnv: NodeJS.ProcessEnv;
 
 beforeAll(() => {
   const emptyDir = mkdtempSync(join(tmpdir(), "auth-preflight-empty-"));
-  sanitizedEnv = { ...process.env, PATH: `${emptyDir}:/usr/bin:/bin` };
+  // Set GINI_RELAY_PROVISIONED so these tests get past the provisioned gate and
+  // actually exercise the probes; the empty PATH makes the probes fail.
+  sanitizedEnv = { ...process.env, PATH: `${emptyDir}:/usr/bin:/bin`, GINI_RELAY_PROVISIONED: "1" };
 });
 
 describe("buildAuthPreflightBlock", () => {
@@ -59,8 +61,28 @@ describe("buildAuthPreflightBlock", () => {
 
   test("returns a string (never throws) even on a hostile env", async () => {
     // A completely empty PATH can't even resolve bash; the module must degrade
-    // gracefully (best-effort) rather than throw into the turn.
-    const block = await buildAuthPreflightBlock({ ...process.env, PATH: "" });
+    // gracefully (best-effort) rather than throw into the turn. Keep the gate
+    // open so we exercise the probe path, not the early no-op.
+    const block = await buildAuthPreflightBlock({ ...process.env, PATH: "", GINI_RELAY_PROVISIONED: "1" });
     expect(typeof block).toBe("string");
+  });
+});
+
+describe("buildAuthPreflightBlock provisioned gate", () => {
+  test("no-ops (empty string) when GINI_RELAY_PROVISIONED is absent", async () => {
+    const env = { ...sanitizedEnv };
+    delete (env as Record<string, string | undefined>).GINI_RELAY_PROVISIONED;
+    const block = await buildAuthPreflightBlock(env);
+    expect(block).toBe("");
+  });
+
+  test("no-ops (empty string) when GINI_RELAY_PROVISIONED is empty/whitespace", async () => {
+    expect(await buildAuthPreflightBlock({ ...sanitizedEnv, GINI_RELAY_PROVISIONED: "" })).toBe("");
+    expect(await buildAuthPreflightBlock({ ...sanitizedEnv, GINI_RELAY_PROVISIONED: "   " })).toBe("");
+  });
+
+  test("runs the checks when GINI_RELAY_PROVISIONED is set (non-empty block in a no-tools env)", async () => {
+    const block = await buildAuthPreflightBlock({ ...sanitizedEnv, GINI_RELAY_PROVISIONED: "1" });
+    expect(block).toContain("AUTH PREFLIGHT");
   });
 });
