@@ -591,7 +591,8 @@ export interface TunnelDeps {
   // Persist a relay-provisioned Workspace grant: given the refresh token a
   // provisioned relay login returned (and the relay principal it belongs to),
   // write a gws-readable authorized_user credential and register it as a tagged
-  // Google account, so gws can use Calendar/Gmail with no per-user OAuth setup.
+  // Google account, so gws can use the provisioned Workspace services with no
+  // per-user OAuth setup.
   // Best-effort — the caller never lets a failure here break the tunnel connect.
   persistWorkspaceGrant: (refreshToken: string, principal?: string) => Promise<void>;
   // The manual tunnel drivers (tailscale / ngrok / cloudflared).
@@ -1622,7 +1623,7 @@ async function runManualConnect(
 // Workspace services a provisioned relay login requests extra Google scopes for.
 // The relay validates each name against its own allowlist (and its Google app
 // must be verified for the scope), so this list is a request, not a guarantee.
-const RELAY_PROVISIONED_SERVICES = ["calendar", "gmail"] as const;
+const RELAY_PROVISIONED_SERVICES = ["calendar", "gmail", "drive", "sheets"] as const;
 
 // When GINI_RELAY_PROVISIONED is truthy, a FRESH relay login also requests the
 // Workspace scopes above so the captured grant can drive gws — no separate
@@ -1815,7 +1816,7 @@ async function runConnect(
     });
     appendLog(config.instance, "tunnel.connected", { provider, url, port });
     // A provisioned login carries a Workspace refresh token; persist it as a
-    // gws-usable account so Calendar/Gmail work with no per-user OAuth setup.
+    // gws-usable account so the Workspace services work with no per-user OAuth setup.
     // Runs on every connect (fresh OR resume), but persistWorkspaceGrant is
     // idempotent: it reuses an already-provisioned account's config dir instead
     // of minting a new one, so a reconnect never duplicates the account, and a
