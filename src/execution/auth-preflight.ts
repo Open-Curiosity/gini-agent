@@ -109,6 +109,11 @@ async function checkGws(env: NodeJS.ProcessEnv): Promise<ToolStatus> {
 // act on. The string is plain factual text authored by the runtime (not
 // external/untrusted input), safe to inject verbatim.
 export async function buildAuthPreflightBlock(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  // Gate: only run on a provisioned machine. Absent/empty GINI_RELAY_PROVISIONED
+  // => safe no-op (no checks, no injected block), so an install without the
+  // fleet's yc/gws tooling never pays for (or fails) the probes on every turn.
+  const provisioned = env.GINI_RELAY_PROVISIONED;
+  if (!provisioned || provisioned.trim().length === 0) return "";
   let statuses: ToolStatus[];
   try {
     statuses = await Promise.all([checkYc(env), checkGws(env)]);
