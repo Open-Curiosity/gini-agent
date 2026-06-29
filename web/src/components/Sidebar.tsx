@@ -5,12 +5,14 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
+  Archive,
   ArchiveRestore,
+  Check,
   ChevronDown,
+  ChevronsUpDown,
   Menu,
+  MessageSquare,
   Moon,
-  MoreVertical,
-  Plus,
   RefreshCw,
   ScrollText,
   Settings,
@@ -27,11 +29,11 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAllChatSessions, useInvalidate, useStatus } from "@/lib/queries";
 import { useChatReadState } from "@/lib/use-chat-read-state";
-import { isOpenableJobChannel } from "@/lib/job-channel";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
@@ -40,7 +42,6 @@ import { ArchiveAgentDialog } from "@/components/ArchiveAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
-import type { JobRecord, JobRoute } from "@runtime/types";
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
@@ -51,9 +52,6 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const invalidate = useInvalidate();
   const [createOpen, setCreateOpen] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<AgentRow | null>(null);
-  const [agentsCollapsed, toggleAgents] = useSectionCollapsed("agents");
-  const [archivedCollapsed, toggleArchived] = useSectionCollapsed("agents-archived");
-  const [jobsCollapsed, toggleJobs] = useSectionCollapsed("jobs");
   const [topicsCollapsed, toggleTopics] = useSectionCollapsed("topics");
 
   const status = useStatus();
@@ -69,38 +67,14 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   // of the active list.
   const agents = useMemo(() => allAgents.filter((a) => !a.archivedAt), [allAgents]);
   const archivedAgents = useMemo(() => allAgents.filter((a) => a.archivedAt), [allAgents]);
+  const activeAgentName =
+    status.data?.activeAgent?.name ??
+    allAgents.find((a) => a.id === activeAgentId)?.name ??
+    "Gini";
 
-  // Recurring jobs and channel read-state are a constant union across all
-  // agents, so both source from unscoped fetches rather than the
-  // active-agent-scoped useJobs/useChatSessions.
-  const allJobs = useQuery({
-    queryKey: ["jobs", "all"],
-    queryFn: () => api<JobRecord[]>("/jobs"),
-    refetchInterval: 3000
-  });
+  // Channel read-state is a constant union across all agents, so it sources
+  // from an unscoped fetch rather than the active-agent-scoped useChatSessions.
   const allSessions = useAllChatSessions();
-
-  // A job is recurring when it isn't a one-shot reminder and carries an active
-  // schedule (cron or interval). Only channel-bound jobs get a sidebar row: a
-  // deliverTo:"chat" job delivers into — and is managed from — its bound
-  // conversation (Jobs tab), so a rail row would just be a confusing alias for
-  // that chat. A missing/unresolved bound session is treated as not-channel
-  // and hidden, as is an archived channel (archived sessions keep history and
-  // stay addressable by URL but leave the lists). Stable-sorted by createdAt
-  // (then name) so the list doesn't reorder as jobs fire.
-  const recurringJobs = useMemo<JobRecord[]>(() => {
-    const sessionsById = new Map((allSessions.data ?? []).map((s) => [s.id, s]));
-    return (allJobs.data ?? [])
-      .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
-      .filter((j) => {
-        if (j.chatSessionId == null) return false;
-        return isOpenableJobChannel(sessionsById.get(j.chatSessionId));
-      })
-      .sort(
-        (a, b) =>
-          (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
-      );
-  }, [allJobs.data, allSessions.data]);
 
   // Topics for the active agent: `kind:"topic"` sessions that aren't archived,
   // newest-activity first so the most recently touched subject sits on top.
@@ -170,11 +144,77 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
   return (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
-      <div className="flex items-center gap-2.5 px-3 pt-[18px] pb-2">
-        <Link href="/" onClick={onNavigate} className="flex min-w-0 items-center gap-2.5">
+      <div className="flex items-center gap-1.5 px-3 pt-[18px] pb-2">
+        <Link href="/" onClick={onNavigate} aria-label="Home" className="flex shrink-0 items-center">
           <Image src="/gini-agent-logo.png" alt="Gini" width={20} height={20} unoptimized className="size-5 shrink-0" />
-          <span className="text-sm font-semibold text-sidebar-accent-foreground">Gini</span>
         </Link>
+        <DropdownMenu>
+          <DropdownMenuTrigger className="flex min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-sidebar-accent/50">
+            <span className="min-w-0 truncate text-sm font-semibold text-sidebar-accent-foreground">
+              {activeAgentName}
+            </span>
+            <ChevronsUpDown className="size-3.5 shrink-0 text-sidebar-foreground/60" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-56">
+            {agents.map((agent) => {
+              const active = agent.id === activeAgentId;
+              const canArchive = agent.id !== defaultAgentId;
+              return (
+                <div key={agent.id} className="group relative">
+                  <DropdownMenuItem onSelect={() => selectAgent(agent.id)} className="pr-8">
+                    <AgentAvatar name={agent.name} seed={agent.id} size={18} initialColor="#0A0A0C" />
+                    <span className="min-w-0 flex-1 truncate">{agent.name}</span>
+                    {active ? <Check className="size-3.5 shrink-0 text-sidebar-foreground/60" /> : null}
+                  </DropdownMenuItem>
+                  {canArchive ? (
+                    <button
+                      type="button"
+                      aria-label={`Archive ${agent.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setArchiveTarget(agent);
+                      }}
+                      className="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <Archive className="size-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+              );
+            })}
+            {archivedAgents.length > 0 ? (
+              <>
+                <DropdownMenuSeparator />
+                <div className="px-2 py-1 text-[11px] font-semibold tracking-[0.5px] text-sidebar-foreground/55">
+                  Archived
+                </div>
+                {archivedAgents.map((agent) => (
+                  <div
+                    key={agent.id}
+                    className="group relative flex items-center gap-2 rounded-sm px-2 py-1.5 opacity-70"
+                  >
+                    <AgentAvatar name={agent.name} seed={agent.id} size={18} initialColor="#0A0A0C" />
+                    <span className="min-w-0 flex-1 truncate text-sm text-sidebar-foreground/70">
+                      {agent.name}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Restore ${agent.name}`}
+                      disabled={unarchiveMutation.isPending}
+                      onClick={() => unarchiveMutation.mutate(agent.id)}
+                      className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:opacity-50"
+                    >
+                      <ArchiveRestore className="size-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </>
+            ) : null}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => setCreateOpen(true)}>+ New agent</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <div className="flex-1" />
         {mounted ? (
           <button
@@ -190,204 +230,29 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-[18px] px-3 py-2">
-          {/* Agents (DMs) */}
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center justify-between px-2">
+          {/* Messages — the active agent's main DM */}
+          <ul className="flex flex-col gap-0.5">
+            <li>
               <button
                 type="button"
-                onClick={toggleAgents}
-                aria-expanded={!agentsCollapsed}
-                className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+                onClick={() => {
+                  router.push("/chat");
+                  onNavigate?.();
+                }}
+                className={cn(navItem(onChat && !selectedSession), "w-full")}
               >
-                <ChevronDown
-                  className={cn("size-3 transition-transform", agentsCollapsed && "-rotate-90")}
-                />
-                <span className="text-[11px] font-semibold tracking-[0.5px]">Agents</span>
+                <MessageSquare className="size-3.5 text-sidebar-foreground/70" />
+                <span className="min-w-0 flex-1 truncate text-left">Messages</span>
+                {!(onChat && !selectedSession) &&
+                activeAgentId &&
+                agentUnread.get(activeAgentId) === true ? (
+                  <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+                ) : null}
               </button>
-              <button
-                type="button"
-                aria-label="New agent"
-                onClick={() => setCreateOpen(true)}
-                className="flex items-center justify-center text-sidebar-foreground/70 hover:text-sidebar-accent-foreground"
-              >
-                <Plus className="size-3.5" />
-              </button>
-            </div>
-            <ul className={cn("flex flex-col gap-0.5", agentsCollapsed && "hidden")}>
-              {agents.length === 0 ? (
-                <li className="px-2.5 py-2 text-xs text-sidebar-foreground/55">No agents yet</li>
-              ) : (
-                agents.map((agent) => {
-                  const active = onChat && !selectedSession && agent.id === activeAgentId;
-                  const unread = !active && agentUnread.get(agent.id) === true;
-                  // The default agent has no kebab: it's the always-present
-                  // fallback selection and can't be archived server-side, so
-                  // don't offer a guaranteed error. Every other agent — the
-                  // active one included — gets it.
-                  const canArchive = agent.id !== defaultAgentId;
-                  return (
-                    <li key={agent.id} className="group relative">
-                      <button
-                        type="button"
-                        onClick={() => selectAgent(agent.id)}
-                        className={cn(
-                          "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
-                        )}
-                      >
-                        <AgentAvatar name={agent.name} seed={agent.id} size={22} initialColor="#0A0A0C" />
-                        <span
-                          className={cn(
-                            "min-w-0 flex-1 truncate text-[13px]",
-                            active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-                          )}
-                        >
-                          {agent.name}
-                        </span>
-                        {unread ? (
-                          <span aria-hidden className="mr-1 size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
-                        ) : null}
-                      </button>
-                      {canArchive ? (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger
-                            aria-label={`Agent options for ${agent.name}`}
-                            className="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
-                          >
-                            <MoreVertical className="size-4" />
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-32">
-                            <DropdownMenuItem variant="destructive" onSelect={() => setArchiveTarget(agent)}>
-                              Archive
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      ) : null}
-                    </li>
-                  );
-                })
-              )}
-            </ul>
+            </li>
+          </ul>
 
-            {/* Archived agents — collapsible, dimmed, indented. Rendered only
-                when at least one agent is archived. */}
-            {archivedAgents.length > 0 ? (
-              <div className="mt-1 flex flex-col gap-0.5">
-                <button
-                  type="button"
-                  onClick={toggleArchived}
-                  aria-expanded={!archivedCollapsed}
-                  className="flex items-center gap-1.5 px-2 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
-                >
-                  <ChevronDown
-                    className={cn("size-3 transition-transform", archivedCollapsed && "-rotate-90")}
-                  />
-                  <span className="text-[11px] font-semibold tracking-[0.5px]">Archived</span>
-                  <span className="rounded-full bg-sidebar-accent px-[7px] py-px text-[10px] font-semibold text-sidebar-foreground/70">
-                    {archivedAgents.length}
-                  </span>
-                </button>
-                <ul className={cn("flex flex-col gap-0.5 pl-[18px]", archivedCollapsed && "hidden")}>
-                  {archivedAgents.map((agent) => (
-                    <li key={agent.id} className="group flex items-center gap-1.5 rounded-lg px-2.5 py-2 opacity-70 hover:bg-sidebar-accent/50">
-                      <AgentAvatar name={agent.name} seed={agent.id} size={20} initialColor="#0A0A0C" />
-                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-sidebar-foreground/70">
-                        {agent.name}
-                      </span>
-                      <button
-                        type="button"
-                        aria-label={`Restore ${agent.name}`}
-                        disabled={unarchiveMutation.isPending}
-                        onClick={() => unarchiveMutation.mutate(agent.id)}
-                        className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-50"
-                      >
-                        <ArchiveRestore className="size-3.5" />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-          </div>
-
-          {/* Recurring jobs */}
-          {recurringJobs.length > 0 ? (
-            <div className="flex flex-col gap-1">
-              <div className="flex items-center justify-between px-2">
-                <button
-                  type="button"
-                  onClick={toggleJobs}
-                  aria-expanded={!jobsCollapsed}
-                  className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
-                >
-                  <ChevronDown
-                    className={cn("size-3 transition-transform", jobsCollapsed && "-rotate-90")}
-                  />
-                  <span className="text-[11px] font-semibold tracking-[0.5px]">Recurring jobs</span>
-                </button>
-              </div>
-              <ul className={cn("flex flex-col gap-0.5", jobsCollapsed && "hidden")}>
-                {recurringJobs.map((job) => {
-                  const routeEntries = fanoutRoutes(job);
-                  if (routeEntries) {
-                    return (
-                      <FanoutJobRow
-                        key={job.id}
-                        job={job}
-                        routeEntries={routeEntries}
-                        sessions={allSessions.data}
-                        selectedSession={selectedSession}
-                        onChat={onChat}
-                        isUnread={isUnread}
-                        selectChannel={selectChannel}
-                      />
-                    );
-                  }
-                  const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
-                  const active = onChat && selectedSession === job.chatSessionId;
-                  const unread = !active && channelSession ? isUnread(channelSession) : false;
-                  const onClick = () => {
-                    if (job.chatSessionId) {
-                      selectChannel(job.chatSessionId);
-                    } else {
-                      router.push("/jobs");
-                      onNavigate?.();
-                    }
-                  };
-                  return (
-                    <li key={job.id}>
-                      <button
-                        type="button"
-                        onClick={onClick}
-                        className={cn(
-                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
-                        )}
-                      >
-                        <span
-                          aria-hidden
-                          className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
-                        >
-                          #
-                        </span>
-                        <span
-                          className={cn(
-                            "min-w-0 flex-1 truncate text-[13px]",
-                            active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-                          )}
-                        >
-                          {job.name}
-                        </span>
-                        {unread ? (
-                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
-                        ) : null}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-          ) : null}
+          <div className="h-px bg-sidebar-border" />
 
           {/* Topics */}
           {topics.length > 0 ? (
@@ -486,119 +351,6 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         }}
       />
     </div>
-  );
-}
-
-// A fan-out email-watch job routes each detection bucket to its OWN per-concern
-// channel (`job.routes[routeKey].chatSessionId`); the job's shared
-// `chatSessionId` is a dead, empty session no route writes to. The sidebar
-// special-cases the gmail-watch marker to surface those concern channels
-// directly (the generic job machinery stays generic). Returns the route entries
-// when this is a fan-out email-watch job, else null (render as today).
-function fanoutRoutes(job: JobRecord): [string, JobRoute][] | null {
-  const isEmailWatch = job.preRunHook?.config?.skill === "gmail-watch";
-  if (!isEmailWatch) return null;
-  const entries = Object.entries(job.routes ?? {});
-  return entries.length > 0 ? entries : null;
-}
-
-// One "Recurring jobs" row for a fan-out email-watch job: the job name is an
-// expand/collapse toggle (it is NOT a link to the dead shared session), and its
-// per-concern channels nest underneath as clickable rows with unread dots.
-function FanoutJobRow({
-  job,
-  routeEntries,
-  sessions,
-  selectedSession,
-  onChat,
-  isUnread,
-  selectChannel
-}: {
-  job: JobRecord;
-  routeEntries: [string, JobRoute][];
-  sessions: ChatSession[] | undefined;
-  selectedSession: string | null;
-  onChat: boolean;
-  isUnread: (session: ChatSession) => boolean;
-  selectChannel: (sessionId: string) => void;
-}) {
-  const [collapsed, toggle] = useSectionCollapsed(`job:${job.id}`);
-  const byId = useMemo(() => {
-    const map = new Map<string, ChatSession>();
-    for (const s of sessions ?? []) map.set(s.id, s);
-    return map;
-  }, [sessions]);
-  const anyConcernUnread = routeEntries.some(([, route]) => {
-    const session = byId.get(route.chatSessionId);
-    return session ? isUnread(session) : false;
-  });
-
-  return (
-    <li>
-      <button
-        type="button"
-        onClick={toggle}
-        aria-expanded={!collapsed}
-        className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-sidebar-accent/50"
-      >
-        <ChevronDown
-          aria-hidden
-          className={cn(
-            "size-3.5 shrink-0 text-sidebar-foreground/55 transition-transform",
-            collapsed && "-rotate-90"
-          )}
-        />
-        <span
-          className={cn(
-            "min-w-0 flex-1 truncate text-[13px]",
-            anyConcernUnread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-          )}
-        >
-          {job.name}
-        </span>
-        {collapsed && anyConcernUnread ? (
-          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
-        ) : null}
-      </button>
-      <ul className={cn("flex flex-col gap-0.5 pl-[18px]", collapsed && "hidden")}>
-        {routeEntries.map(([routeKey, route]) => {
-          const session = byId.get(route.chatSessionId);
-          const active = onChat && selectedSession === route.chatSessionId;
-          const unread = !active && session ? isUnread(session) : false;
-          const title = session?.title ?? routeKey;
-          return (
-            <li key={routeKey}>
-              <button
-                type="button"
-                onClick={() => selectChannel(route.chatSessionId)}
-                className={cn(
-                  "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                  active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
-                )}
-              >
-                <span
-                  aria-hidden
-                  className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
-                >
-                  #
-                </span>
-                <span
-                  className={cn(
-                    "min-w-0 flex-1 truncate text-[13px]",
-                    active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-                  )}
-                >
-                  {title}
-                </span>
-                {unread ? (
-                  <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
-                ) : null}
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-    </li>
   );
 }
 
