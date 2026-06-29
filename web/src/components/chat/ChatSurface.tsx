@@ -16,6 +16,7 @@ import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { JobsTab } from "@/components/chat/JobsTab";
 import { SettingsTab } from "@/components/chat/SettingsTab";
+import { SentDraftsProvider } from "@/components/chat/SentDraftsContext";
 import { api, type UploadRef } from "@/lib/api";
 import { useChatReadState } from "@/lib/use-chat-read-state";
 import { useStickToBottom } from "@/lib/use-stick-to-bottom";
@@ -30,7 +31,8 @@ import {
   useChatRuns,
   useChatSessions,
   useInvalidate,
-  useRemovePendingChatMessage
+  useRemovePendingChatMessage,
+  useSentDrafts
 } from "@/lib/queries";
 import type { ChatSession } from "@/lib/view-types";
 
@@ -103,6 +105,12 @@ export function ChatSurface({
     sessionId,
     session.pendingMessages
   );
+
+  // Fire the sent-draft set eagerly on chat mount, in parallel with the blocks.
+  // Its payload is small, so it's normally settled before the (heavier) blocks
+  // render — letting an already-sent draft card paint "Sent" on first render
+  // with no "Send" flash. Provided to the cards via SentDraftsProvider below.
+  const sentDrafts = useSentDrafts();
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
@@ -400,23 +408,28 @@ export function ChatSurface({
                     <h2 className="text-2xl font-semibold">What can I help with?</h2>
                   </div>
                 ) : (
-                  <ul className="space-y-5">
-                    {itemSegments.map((segment, segmentIndex) =>
-                      segment.jobName ? (
-                        // Job-delivered messages: one light-blue left-bordered
-                        // container with a single "from <job name>" subtitle so
-                        // they're distinguishable from the user's own turn.
-                        <li key={`job-${segmentIndex}`}>
-                          <div className="rounded-r-lg border-l-2 border-sky-500/40 bg-sky-500/5 py-3 pl-4">
-                            <p className="mb-2 text-xs text-muted-foreground">from {segment.jobName}</p>
-                            <ul className="space-y-5">{segment.items.map(renderItem)}</ul>
-                          </div>
-                        </li>
-                      ) : (
-                        segment.items.map(renderItem)
-                      )
-                    )}
-                  </ul>
+                  // The eagerly-fetched sent-draft set reaches each nested
+                  // EmailDraftCard through this provider, so a sent card renders
+                  // "Sent" on first paint instead of flashing "Send".
+                  <SentDraftsProvider value={sentDrafts}>
+                    <ul className="space-y-5">
+                      {itemSegments.map((segment, segmentIndex) =>
+                        segment.jobName ? (
+                          // Job-delivered messages: one light-blue left-bordered
+                          // container with a single "from <job name>" subtitle so
+                          // they're distinguishable from the user's own turn.
+                          <li key={`job-${segmentIndex}`}>
+                            <div className="rounded-r-lg border-l-2 border-sky-500/40 bg-sky-500/5 py-3 pl-4">
+                              <p className="mb-2 text-xs text-muted-foreground">from {segment.jobName}</p>
+                              <ul className="space-y-5">{segment.items.map(renderItem)}</ul>
+                            </div>
+                          </li>
+                        ) : (
+                          segment.items.map(renderItem)
+                        )
+                      )}
+                    </ul>
+                  </SentDraftsProvider>
                 )}
                 <div ref={messagesEndRef} />
               </div>

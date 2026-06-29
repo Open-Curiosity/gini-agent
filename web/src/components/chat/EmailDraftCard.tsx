@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Mail, Copy, Check, Send } from "lucide-react";
+import { useState } from "react";
+import { Mail, Copy, Check, Send, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
+import { useSentDraftIds } from "@/components/chat/SentDraftsContext";
 
 // Inline email-draft card. The agent emits a ```email-draft fenced block after
 // saving a Gmail draft; MarkdownContent routes that block here so the user can
@@ -14,10 +15,10 @@ import { api } from "@/lib/api";
 // saved gws draft id and the account it was saved under; they are EXTRACTED
 // (never rendered as recipient rows). When a DraftId is present the card shows a
 // Send button that sends the SAVED draft directly server-side (POST
-// /api/email/drafts/send) with no agent turn; on mount it asks the gateway
-// whether that draft was already sent so the "Sent" state persists across a
-// page refresh. With no DraftId the card stays read-only (doc viewer / file
-// preview / skills page).
+// /api/email/drafts/send) with no agent turn. Whether the draft was already
+// sent comes from the SentDraftsContext (primed eagerly by ChatSurface), so the
+// "Sent" state persists across a page refresh with no "Send" flash. With no
+// DraftId the card stays read-only (doc viewer / file preview / skills page).
 
 const HEADER_KEYS = ["to", "cc", "bcc", "from", "subject"] as const;
 type HeaderKey = (typeof HEADER_KEYS)[number];
@@ -70,38 +71,40 @@ function parseDraft(raw: string): ParsedDraft {
   return { headers, body, draftId, account };
 }
 
-// The card's Send affordance state machine. "idle" shows Send; the click runs
-// the direct server-side send; "sent" is the durable terminal state (also the
-// initial state when the mount query reports the draft already sent).
-type SendState = "idle" | "sending" | "sent" | "error";
+// The card's local click-flow state. "idle" shows Send; the click runs the
+// direct server-side send; "sent"/"error" are the click outcomes. The durable
+// "already sent" signal comes from context (not this state), so a refresh
+// resolves to "Sent" without a click.
+type ClickState = "idle" | "sending" | "sent" | "error";
+
+// The effective state actually rendered. A click in progress/done wins; else
+// the context decides between the durable "sent", a brief "checking" spinner
+// (context not yet settled), or "idle".
+type DisplayState = ClickState | "checking";
 
 export function EmailDraftCard({ raw }: { raw: string }) {
   const [copied, setCopied] = useState(false);
   const { headers, body, draftId, account } = parseDraft(raw.trim());
-  const [sendState, setSendState] = useState<SendState>("idle");
+  const [clickState, setClickState] = useState<ClickState>("idle");
   const [sendError, setSendError] = useState<string | null>(null);
+  const { sentIds, loaded } = useSentDraftIds();
 
-  // On mount (with a draftId) ask the gateway whether THIS draft was already
-  // sent, so a page refresh restores the disabled "Sent" state. Best-effort: a
-  // failed query just leaves the button clickable.
-  useEffect(() => {
-    if (!draftId) return;
-    let cancelled = false;
-    api<{ sent: string[] }>(`/email/drafts/sent?ids=${encodeURIComponent(draftId)}`)
-      .then((res) => {
-        if (!cancelled && res.sent.includes(draftId)) setSendState("sent");
-      })
-      .catch(() => {
-        // Leave the button clickable; the send route is the source of truth.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [draftId]);
+  // Resolve what the button shows. The user's own click wins; otherwise the
+  // eagerly-primed context says whether this draft is already sent. The
+  // "checking" spinner is a rare fallback for the window before the context
+  // settles — a sent draft never flashes the active "Send" text.
+  const displayState: DisplayState =
+    clickState !== "idle"
+      ? clickState
+      : draftId && sentIds.has(draftId)
+        ? "sent"
+        : draftId && !loaded
+          ? "checking"
+          : "idle";
 
   const onSend = async () => {
-    if (!draftId || sendState === "sending" || sendState === "sent") return;
-    setSendState("sending");
+    if (!draftId || displayState === "sending" || displayState === "sent") return;
+    setClickState("sending");
     setSendError(null);
     try {
       const res = await api<{ ok: boolean; message?: string }>("/email/drafts/send", {
@@ -109,13 +112,13 @@ export function EmailDraftCard({ raw }: { raw: string }) {
         body: JSON.stringify({ draftId, ...(account ? { account } : {}) })
       });
       if (res.ok) {
-        setSendState("sent");
+        setClickState("sent");
       } else {
-        setSendState("error");
+        setClickState("error");
         setSendError(res.message ?? "Couldn't send the draft.");
       }
     } catch (error) {
-      setSendState("error");
+      setClickState("error");
       setSendError(error instanceof Error ? error.message : "Couldn't send the draft.");
     }
   };
@@ -132,7 +135,7 @@ export function EmailDraftCard({ raw }: { raw: string }) {
   };
 
   const sendLabel =
-    sendState === "sending" ? "Sending…" : sendState === "sent" ? "Sent" : "Send";
+    displayState === "sending" ? "Sending…" : displayState === "sent" ? "Sent" : "Send";
 
   return (
     <div className="my-2 overflow-hidden rounded-xl border bg-card text-card-foreground">
@@ -178,17 +181,26 @@ export function EmailDraftCard({ raw }: { raw: string }) {
       </div>
       {draftId ? (
         <div className="flex items-center justify-end gap-2 border-t px-3 py-2">
-          {sendState === "error" && sendError ? (
+          {displayState === "error" && sendError ? (
             <span className="mr-auto min-w-0 break-words text-[12px] text-destructive">{sendError}</span>
           ) : null}
           <button
             type="button"
             onClick={onSend}
-            disabled={sendState === "sending" || sendState === "sent"}
+            disabled={displayState === "sending" || displayState === "sent" || displayState === "checking"}
+            aria-label={displayState === "checking" ? "Checking draft status" : undefined}
             className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[13px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
           >
-            <Send className="size-[14px]" aria-hidden="true" />
-            {sendLabel}
+            {displayState === "checking" ? (
+              // Context not yet settled: a disabled spinner, never the active
+              // "Send" text — so a sent draft can't flash "Send" before "Sent".
+              <Loader2 className="size-[14px] animate-spin" aria-hidden="true" />
+            ) : (
+              <>
+                <Send className="size-[14px]" aria-hidden="true" />
+                {sendLabel}
+              </>
+            )}
           </button>
         </div>
       ) : null}
