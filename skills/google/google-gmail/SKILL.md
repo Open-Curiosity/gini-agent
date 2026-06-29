@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.2.6
+    version: 1.2.7
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -131,10 +131,10 @@ The `DraftId` and `Account` lines let the user send the draft straight from the 
 
 ### Preview a meeting change inline
 
-When the draft proposes, confirms, reschedules, or cancels a meeting at a specific time, show a `calendar` preview so the user can see the proposed slot against their existing schedule and catch a conflict. **Order matters: render the `calendar` preview FIRST, then the `email-draft` card LAST** — the draft is the actionable item, so it should be the final thing in the message. The preview is a **full-week view**, so pull the WHOLE week's agenda (the Sunday–Saturday week containing the meeting) — `gws calendar +agenda --week`, or `gws calendar events list` for that week's range — and include **every** event across the week (each line carries its own date), not just the meeting day. Every day the user has something should be populated; only the proposed/changed slot gets `proposed` (or `cancel`). Emit the calendar block, then the draft block:
+When the draft proposes, confirms, reschedules, or cancels a meeting at a specific time, show a `calendar` preview so the user can see the proposed slot against their existing schedule and catch a conflict. The app renders the `calendar` block as **its own full-width card placed ABOVE your message** (like the standalone Question cards), so do NOT narrate it — don't write "here's where it lands"; the card's header speaks for itself. Lead with a short line about the **draft** (what you saved), emit the calendar block, then the draft block. The preview is a **full-week view**, so pull the WHOLE week's agenda (the Sunday–Saturday week containing the meeting) — `gws calendar +agenda --week`, or `gws calendar events list` for that week's range — and include **every** event across the week (each line carries its own date), not just the meeting day. Every day the user has something should be populated; only the proposed/changed slot gets `proposed` (or `cancel`).
 
 ````text
-Here's where that lands this week — your Thursday afternoon is clear of it:
+I saved the draft in your work account.
 
 ```calendar
 date: 2026-07-02

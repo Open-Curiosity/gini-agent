@@ -64,33 +64,24 @@ export function BlockAssistantText({
     );
   }
 
-  // Calendar hoisted to its OWN full-width card (no avatar indent), with the prose
-  // before/after it kept in Gini's normal avatar-indented bubbles.
+  // Calendar hoisted to its OWN full-width card that renders BEFORE Gini's
+  // message (like the standalone Question/Setup cards that precede the reply),
+  // with the prose around it collapsed into one bubble under Gini's avatar.
+  const prose = (split.before + split.after).trim();
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
+      <CalendarView raw={split.calendarRaw} />
       <div className="flex items-start gap-2.5">
         <AgentAvatar name={name} seed={seed} size={24} className="mt-0.5" />
         <div className="min-w-0 flex-1">
           {header}
-          {split.before.trim() ? (
+          {prose ? (
             <div className={BUBBLE}>
-              <MarkdownContent text={split.before} dropForeignImages />
+              <MarkdownContent text={prose} streaming={block.streaming} dropForeignImages />
             </div>
           ) : null}
         </div>
       </div>
-      <CalendarView raw={split.calendarRaw} />
-      {split.after.trim() ? (
-        <div className="flex items-start gap-2.5">
-          {/* avatar-width spacer so the trailing prose stays aligned under Gini */}
-          <div className="w-6 shrink-0" aria-hidden="true" />
-          <div className="min-w-0 flex-1">
-            <div className={BUBBLE}>
-              <MarkdownContent text={split.after} streaming={block.streaming} dropForeignImages />
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 }
