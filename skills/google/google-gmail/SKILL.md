@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.2.5
+    version: 1.2.6
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -225,6 +225,6 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 6. Attachment cap is 25 MB total. For larger files, upload via `google-drive` and send the share link instead.
 7. Never paste raw message bodies that contain secrets (API keys, passwords, MFA codes) back into the chat transcript. Summarize, redact, or write to a file the user controls.
 8. When you save a draft, surface it to the user with an `email-draft` fenced block (see "Show a saved draft to the user") instead of pointing them at Gmail. The user should be able to read the draft without leaving the app.
-9. When that draft proposes, confirms, reschedules, or cancels a meeting at a specific time, you are not done with just the `email-draft` block: pull that day's agenda (`gws calendar +agenda` for the date) and render a `calendar` preview **before** the draft card — calendar first, draft last (see "Preview a meeting change inline") — with the proposed slot marked `proposed`, so the user sees it against their existing schedule. This is part of the deliverable for a meeting email, not an optional extra — do it without being asked.
+9. When that draft proposes, confirms, reschedules, or cancels a meeting at a specific time, you are not done with just the `email-draft` block: pull the **whole week's** agenda (the Sunday–Saturday week containing the meeting — `gws calendar +agenda --week`, or `events list` over that week's range) and render a `calendar` preview **before** the draft card — calendar first, draft last (see "Preview a meeting change inline") — with the proposed slot marked `proposed`. **Embed EVERY event the week query returned, on every day — not just the meeting day.** The preview is a full-week view; if the query returns 17 events across the week, the block has 17 event lines (each carrying its own date), so the user sees their whole week with the proposed slot in context. Dropping the other days is wrong. This is part of the deliverable for a meeting email, not an optional extra — do it without being asked.
 
 For flags not shown here, run `gws gmail --help` or `gws gmail <verb> --help` (e.g. `gws gmail +send --help`).
