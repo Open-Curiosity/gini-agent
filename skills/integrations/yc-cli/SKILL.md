@@ -179,7 +179,7 @@ yc tools run search --input '{"entity":"companies","ids":"{comma_separated_ids}"
 | **Series A Leads** | {series_a_leads} |
 | **Invests Internationally** | {invests_internationally} |
 
-**Portfolio by Batch**
+**Recent Portfolio by Batch**
 
 | Batch | # | Companies |
 |---|---|---|
