@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
@@ -10,6 +11,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import {
@@ -31,8 +33,16 @@ import { closeAllMemoryDbs, getMemoryDb } from "../state/memory-db";
 import { readSecret } from "../state/secrets";
 
 // Isolated roots so the tests never touch ~/.gini or ~/.openclaw on the
-// developer's machine.
-const ROOT = "/tmp/gini-openclaw-migrate-test";
+// developer's machine. Use mkdtempSync for a per-run unique root, matching
+// every other suite (import-table, setup-sweep, etc.): a hardcoded
+// `/tmp/<name>` shares one path across every process and run on a host,
+// which is the fragility the archive test ("writes a zip ... to imports")
+// flaked on under CI's `bun test --parallel`. That test shells out to `zip
+// -rqy . ` over this root, and a zero-entry archive (zip exit 0, file
+// present, `unzip -l` listing the seeded marker absent) is the symptom of
+// the source dir being empty at snapshot time — only possible when the
+// fixed path is shared. A unique dir removes the shared-path hazard.
+const ROOT = mkdtempSync(join(tmpdir(), "gini-openclaw-migrate-test-"));
 const GINI_STATE = `${ROOT}/gini-state`;
 const GINI_HOME = `${ROOT}/home`;
 const OPENCLAW_ROOT = `${ROOT}/openclaw-state`;
