@@ -50,6 +50,7 @@ import type {
 } from "../types";
 import { chatBlockArgsPreviewFor, chatBlockLabelFor } from "./tool-catalog";
 import { redactSensitiveToolArgs } from "./tool-args-redact";
+import { isSilentReply } from "../jobs/silent";
 
 // Resolved chat-task emission context. Callers pass this through every
 // per-iteration emission so we don't re-read state on each row.
@@ -64,6 +65,12 @@ export interface ChatEmitContext {
   // for main-chat turns.
   threadId?: string;
   parentBlockId?: string;
+  // Render-only Topic→Chat activity mirror target (ADR
+  // chat-topics-tasks-subagents.md). Set when the emitting session is a
+  // kind:"topic" with a parentChatSessionId, so every emit helper can mirror
+  // its block into the parent Chat. Forwarded copies are never replayed into
+  // the model context.
+  forward?: { sessionId: string; topicId: string; topicTitle: string };
 }
 
 // Resolve the emission context for a task. Returns undefined when the
@@ -83,6 +90,12 @@ export function resolveEmitContext(
   if (!task?.chatSessionId) return undefined;
   const session = state.chatSessions.find((s) => s.id === task.chatSessionId);
   if (!session) return undefined;
+  // When the turn runs inside a Topic spawned from a Chat, every block it
+  // emits is mirrored render-only into the parent Chat (Change below).
+  const forward =
+    session.kind === "topic" && session.parentChatSessionId
+      ? { sessionId: session.parentChatSessionId, topicId: session.id, topicTitle: session.title }
+      : undefined;
   return {
     instance: config.instance,
     sessionId: task.chatSessionId,
@@ -92,7 +105,8 @@ export function resolveEmitContext(
     // Pre-thread the context when the task was spawned to reply inside a
     // thread. The whole response then threads.
     ...(task.threadId ? { threadId: task.threadId } : {}),
-    ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {})
+    ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {}),
+    ...(forward ? { forward } : {})
   };
 }
 
@@ -126,11 +140,22 @@ export function emitPhase(
   label: string
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "phase",
     label,
     ...bookkeepingFor(ctx)
   });
+  mirrorInsert(ctx, (forward) => ({
+    kind: "phase",
+    sessionId: forward.sessionId,
+    label,
+    taskId: ctx.taskId,
+    runId: ctx.runId,
+    agentId: ctx.agentId,
+    forwardedFromTopicId: forward.forwardedFromTopicId,
+    forwardedFromTopicTitle: forward.forwardedFromTopicTitle
+  }));
+  return block;
 }
 
 // Emit a system_note block. Used for terminal-bail-out markers
@@ -144,12 +169,24 @@ export function emitSystemNote(
   authError?: SystemNoteAuthError
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "system_note",
     text,
     ...(authError ? { authError } : {}),
     ...bookkeepingFor(ctx)
   });
+  mirrorInsert(ctx, (forward) => ({
+    kind: "system_note",
+    sessionId: forward.sessionId,
+    text,
+    ...(authError ? { authError } : {}),
+    taskId: ctx.taskId,
+    runId: ctx.runId,
+    agentId: ctx.agentId,
+    forwardedFromTopicId: forward.forwardedFromTopicId,
+    forwardedFromTopicTitle: forward.forwardedFromTopicTitle
+  }));
+  return block;
 }
 
 // Emit a user_text block. Called by submitChatMessage right after
@@ -218,6 +255,24 @@ export function finalizeAssistantText(
     text: finalText,
     streaming: false
   });
+  // Sole Topic→Chat forwarder of assistant_text (both intermediate narration
+  // and the final answer). Mirror a non-streaming copy into the parent Chat,
+  // skipping text the parent should never show: empty, the "(no content)"
+  // placeholder, or a [SILENT] reply (retracted in the Topic too).
+  const trimmed = finalText.trim();
+  if (trimmed.length > 0 && trimmed !== "(no content)" && !isSilentReply(finalText)) {
+    mirrorInsert(ctx, (forward) => ({
+      kind: "assistant_text",
+      sessionId: forward.sessionId,
+      text: finalText,
+      streaming: false,
+      taskId: ctx.taskId,
+      runId: ctx.runId,
+      agentId: ctx.agentId,
+      forwardedFromTopicId: forward.forwardedFromTopicId,
+      forwardedFromTopicTitle: forward.forwardedFromTopicTitle
+    }));
+  }
   return updated?.kind === "assistant_text" ? updated : undefined;
 }
 
@@ -253,7 +308,7 @@ export function emitToolCallRunning(
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "tool_call",
     toolName: params.toolName,
     displayLabel: chatBlockLabelFor(params.toolName),
@@ -263,6 +318,24 @@ export function emitToolCallRunning(
     callId: params.callId,
     ...bookkeepingFor(ctx)
   });
+  if (block.kind === "tool_call") {
+    mirrorInsert(ctx, (forward) => ({
+      kind: "tool_call",
+      sessionId: forward.sessionId,
+      toolName: block.toolName,
+      displayLabel: block.displayLabel,
+      argsPreview: block.argsPreview,
+      argsFull: block.argsFull,
+      status: "running",
+      callId: block.callId,
+      taskId: ctx.taskId,
+      runId: ctx.runId,
+      agentId: ctx.agentId,
+      forwardedFromTopicId: forward.forwardedFromTopicId,
+      forwardedFromTopicTitle: forward.forwardedFromTopicTitle
+    }));
+  }
+  return block;
 }
 
 // Attach a `runningHint` to a tool_call block that's already mounted in
@@ -282,6 +355,7 @@ export function setToolCallRunningHint(
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint }, ctx.taskId);
+  mirrorToolCallUpdate(ctx, callId, { runningHint: hint });
   return updated ?? undefined;
 }
 
@@ -306,6 +380,11 @@ export function emitToolCallStatus(
     errorMessage: params.errorMessage,
     errorSeverity: params.errorSeverity
   }, ctx.taskId);
+  mirrorToolCallUpdate(ctx, params.callId, {
+    status: params.status,
+    errorMessage: params.errorMessage,
+    errorSeverity: params.errorSeverity
+  });
   return updated ?? undefined;
 }
 
@@ -326,13 +405,26 @@ export function emitToolResult(
   const trimmed = params.result.length > MAX
     ? params.result.slice(0, MAX - 1) + "…"
     : params.result;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "tool_result",
     callId: params.callId,
     preview: trimmed,
     truncated: params.result.length > MAX,
     ...bookkeepingFor(ctx)
   });
+  mirrorInsert(ctx, (forward) => ({
+    kind: "tool_result",
+    sessionId: forward.sessionId,
+    callId: params.callId,
+    preview: trimmed,
+    truncated: params.result.length > MAX,
+    taskId: ctx.taskId,
+    runId: ctx.runId,
+    agentId: ctx.agentId,
+    forwardedFromTopicId: forward.forwardedFromTopicId,
+    forwardedFromTopicTitle: forward.forwardedFromTopicTitle
+  }));
+  return block;
 }
 
 // Topic → Chat gate forward (ADR chat-topics-tasks-subagents.md). When a
@@ -367,6 +459,67 @@ function forwardGateToChat(
     appendLog(ctx.instance, "chat.topic_gate_forward.insert_failed", {
       topicId: session.id,
       parentChatSessionId: session.parentChatSessionId,
+      taskId: ctx.taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// Topic → Chat activity mirror (ADR chat-topics-tasks-subagents.md). When the
+// emitting session is a kind:"topic" spawned from a Chat (ctx.forward set),
+// mirror a render-only copy of each block into the parent Chat so the user
+// watching Chat sees the Topic turn's tool calls, narration, phases, and system
+// notes — not just the forwarded final answer. Modeled on forwardGateToChat;
+// best-effort: a mirror failure must never break the Topic write.
+function mirrorInsert(
+  ctx: ChatEmitContext,
+  build: (forward: {
+    sessionId: string;
+    forwardedFromTopicId: string;
+    forwardedFromTopicTitle: string;
+  }) => InsertChatBlockInput
+): void {
+  if (!ctx.forward) return;
+  try {
+    insertChatBlock(
+      ctx.instance,
+      build({
+        sessionId: ctx.forward.sessionId,
+        forwardedFromTopicId: ctx.forward.topicId,
+        forwardedFromTopicTitle: ctx.forward.topicTitle
+      })
+    );
+  } catch (error) {
+    appendLog(ctx.instance, "chat.topic_mirror.insert_failed", {
+      topicId: ctx.forward.topicId,
+      parentChatSessionId: ctx.forward.sessionId,
+      taskId: ctx.taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// Status/hint variant of the activity mirror: flip the parent Chat's mirrored
+// tool_call copy by (callId, taskId). The mirror shares both the callId and the
+// taskId with the Topic copy, so updateToolCallBlock with the parent sessionId
+// finds the right row.
+function mirrorToolCallUpdate(
+  ctx: ChatEmitContext,
+  callId: string,
+  patch: {
+    status?: ToolCallStatus;
+    errorMessage?: string;
+    errorSeverity?: "info" | "error";
+    runningHint?: string;
+  }
+): void {
+  if (!ctx.forward) return;
+  try {
+    updateToolCallBlock(ctx.instance, callId, ctx.forward.sessionId, patch, ctx.taskId);
+  } catch (error) {
+    appendLog(ctx.instance, "chat.topic_mirror.update_failed", {
+      topicId: ctx.forward.topicId,
+      parentChatSessionId: ctx.forward.sessionId,
       taskId: ctx.taskId,
       error: error instanceof Error ? error.message : String(error)
     });

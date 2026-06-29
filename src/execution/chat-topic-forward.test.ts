@@ -200,6 +200,81 @@ describe("topic dispatch + forward", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("tool calls and thinking mirror into Chat", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-topic-ws-"));
+    const config = buildConfig(workspaceRoot, `topic-fwd-mirror-${basename(workspaceRoot)}`);
+    const provider = normalizeProvider(config.provider);
+
+    const { chatId, topicId } = await mutateState(config.instance, (state) => {
+      const chat = createChatSession(state, "Messages", undefined, undefined, undefined, "agent");
+      const topic = createTopic(state, {
+        agentId: chat.agentId,
+        title: "Investor scheduling",
+        parentChatSessionId: chat.id
+      });
+      return { chatId: chat.id, topicId: topic.id };
+    });
+
+    // Turn drives one tool call (get_current_time is always-on, read-only,
+    // auto-approved) then a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Checking the time.",
+      toolCalls: [{ id: "call_clock", type: "function", function: { name: "get_current_time", arguments: "{}" } }],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "It's mid-afternoon, so let's aim for tomorrow morning.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const result = await dispatchChatMessageToTopic(
+      config,
+      chatId,
+      topicId,
+      prepared(config, "when can we meet?", chatId)
+    );
+    if ("queued" in result) throw new Error("expected a run-now dispatch, got queued");
+    const finished = await waitForTerminal(config, result.taskId);
+    expect(finished.status).toBe("completed");
+
+    // The parent Chat mirrors the Topic turn's full activity: the tool call
+    // (settled to "ok"), at least one phase marker, and the final answer — all
+    // tagged with the originating Topic.
+    const chatBlocks = listChatBlocks(config.instance, chatId);
+
+    const mirroredToolCall = chatBlocks.find(
+      (b) => b.kind === "tool_call" && b.forwardedFromTopicId === topicId
+    );
+    expect(mirroredToolCall).toBeDefined();
+    if (mirroredToolCall!.kind === "tool_call") {
+      expect(mirroredToolCall!.callId).toBe("call_clock");
+      expect(mirroredToolCall!.status).toBe("ok");
+      expect(mirroredToolCall!.taskId).toBe(finished.id);
+    }
+
+    const mirroredPhase = chatBlocks.find(
+      (b) => b.kind === "phase" && b.forwardedFromTopicId === topicId
+    );
+    expect(mirroredPhase).toBeDefined();
+    expect(mirroredPhase!.taskId).toBe(finished.id);
+
+    // finalize forwards both intermediate narration and the final answer, so
+    // the final answer is among the forwarded assistant_text blocks.
+    const forwardedAnswer = chatBlocks.find(
+      (b) =>
+        b.kind === "assistant_text" &&
+        b.forwardedFromTopicId === topicId &&
+        b.text === "It's mid-afternoon, so let's aim for tomorrow morning."
+    );
+    expect(forwardedAnswer).toBeDefined();
+    expect(forwardedAnswer!.taskId).toBe(finished.id);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("replay scoping: a second Topic turn replays the first answer (no re-answer)", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-topic-ws-"));
     const config = buildConfig(workspaceRoot, `topic-fwd-replay-${basename(workspaceRoot)}`);
