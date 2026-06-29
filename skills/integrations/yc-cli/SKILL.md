@@ -1,153 +1,147 @@
 ---
 name: yc-cli
-description: "Interact with Y Combinator's Bookface from the terminal via the `yc` CLI: authenticate, look up the current user, and search the YC network (companies, founders, investors, deals, jobs, forum posts, and more). Run YC agent tools directly and read YC playbooks. Use when the user asks about YC, Bookface, an investor/fund/company/founder lookup, YC deals, or the `yc` command."
+description: "Operator's guide to the YC CLI (`yc`) for the Gini batch demo — scoped to the yc commands the demo actually uses: the validated browser-forward login flow (tmux + browser_connect) and investor research against Bookface. Assumes yc is installed but NOT logged in yet. Load before staging or running the demo."
 license: MIT
-compatibility: "macOS and Linux. Requires the `yc` CLI; this skill installs it if missing. Authentication is browser-based OAuth."
-allowed-tools: "terminal_exec browser_connect browser_navigate read_skill"
+compatibility: "macOS and Linux. Requires the yc CLI installed (binary at ~/.yc/bin/yc or ~/.local/bin/yc) and tmux for the login flow."
+allowed-tools: "terminal_exec browser_connect browser_navigate"
 metadata:
   gini:
     version: 1.0.0
-    author: Gini
+    author: Sheldon + Wilson
     platforms: [macos, linux]
     prerequisites:
-      commands: [yc]
+      commands: [yc, tmux]
 ---
 
-# YC CLI (`yc`)
+# YC CLI (`yc`) — demo operator's guide
 
-`yc` is the Y Combinator CLI. It talks to **Bookface** — YC's internal founder
-platform — over an authenticated API, so a YC community member can search the YC
-network, run the YC agent's tools, and read YC playbooks from the terminal.
+`yc` is the Y Combinator CLI; it talks to **Bookface** over an authenticated
+API. In our demo it's the **investor-research source** behind Step 5: pulling a
+fund's track record (check size, YC conversion, recent deals) from the terminal.
+This guide covers only the parts the demo touches.
 
-The body below is loaded on demand; check `yc --help` and `yc <command> --help`
-for the authoritative, current syntax before relying on exact flags — the CLI
-evolves and this skill should not drift from the installed version.
+## 0. PATH gotcha (will bite you live)
 
-## When to use
-
-- The user asks about YC, Bookface, or the `yc` command.
-- Looking up an investor / fund, a YC company, a founder, a YC deal, a job, or a forum post.
-- Asking the YC agent a question, or loading a YC playbook (`yc skills read <name>`).
-
-## When NOT to use
-
-- General web search unrelated to the YC network → use `web_search`.
-- The user is not a YC community member / has no `yc` account — `yc` requires YC auth and will not return data.
-
-## Prerequisites
-
-`yc` must be installed and on `PATH`.
-
-- **Install (if missing):** `curl -fsSL https://bookface.ycombinator.com/cli/install.sh | bash`
-- The installer drops the binary under the user's home (commonly `~/.yc/bin/yc`,
-  sometimes `~/.local/bin/yc`) and adds it to `PATH`. A non-interactive shell
-  (e.g. `terminal_exec`) may not have that on `PATH` yet, so prefer a robust
-  invocation:
-
-  ```bash
-  export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
-  ```
-
-- If an existing `yc` command was detected at install time, the CLI may be
-  installed as **`ycp`** instead — fall back to `ycp` if `yc` is absent.
-- Verify: `yc --version`.
-
-## Authentication
-
-Auth is OAuth-based; the token is cached in `~/.yc/credentials.json` and
-refreshes automatically. Always check state first and only log in when needed —
-re-running login on an already-authenticated session rewrites credentials for
-nothing.
+The binary is often not on PATH (`~/.yc/bin/yc`, sometimes `~/.local/bin/yc`).
+A bare `yc` may say "command not found." Fix once at the top of any shell:
 
 ```bash
-yc me            # prints the signed-in user, or reports "Not logged in"
+export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
 ```
 
-If not logged in, pick the login mode that fits where the agent is running:
+(Non-interactive SSH shells don't source `~/.zshrc`, so set it in the script.)
 
-- **Local machine the user is sitting at:** `yc login` — opens a browser on this
-  machine for OAuth.
-- **Remote / headless machine the user reaches through Gini (the common case for
-  an agent):** `yc login --device` — prints a verification URL and short code so
-  the user authenticates on their own device; nothing needs a browser on the box.
-  Surface both the URL and the code to the user and wait for them to finish
-  before continuing.
-- **No browser/device flow available:** `yc login --manual` — prints the auth URL
-  and accepts the redirect URL pasted back.
+## 1. The optimal login flow (VALIDATED — use this)
 
-When a browser sign-in is required and the agent has browser tools, drive it the
-way Gini drives any auth wall: open the URL and hand off with `browser_connect`
-so the user signs in through a live view of the agent's browser. The agent never
-sees the password.
+We are NOT logged in yet. This is the flow we rehearsed to convergence — it's
+the demo's Step 5 trust beat: the agent forwards its browser to the user, the
+user signs in on their own device, the agent never sees the password. `yc login`
+spins a local callback listener on `localhost:19876`; the agent's forwarded
+browser can't reach that localhost, so we keep `yc login` alive in **tmux** and
+let the CLI catch the callback directly while the user signs in.
+
+> **Keep tmux backstage — do NOT mention it to the user.** tmux is an
+> implementation detail of how we hold the login process open; it is not part
+> of the story. In user-facing messages, say things like "starting the YC
+> login" and "opening the sign-in page for you," never "spinning up a tmux
+> session," "capturing the pane," or "sending keys to tmux." Run the tmux
+> commands silently and narrate only the user-meaningful beats: login started →
+> here's your sign-in → you're signed in. Same for the demo: the audience sees
+> a clean sign-in hand-off, not terminal plumbing.
+
+**4 steps, no redundancy:**
+
+1. **Parallel logout** — clear both the CLI and the YC browser session:
+   ```bash
+   yc logout
+   ```
+   and in the same turn `browser_navigate` to the YC logout/session-clear URL so
+   the next sign-in is fresh (no silent reuse of an existing Google session).
+
+2. **tmux + grab the OAuth URL in one shot.** Long URLs wrap in the pane, so
+   capture with `-J` (join wrapped lines) or you'll get a truncated URL:
+   ```bash
+   tmux kill-session -t yclogin 2>/dev/null; tmux new-session -d -s yclogin
+   tmux send-keys -t yclogin 'export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"; yc login' Enter
+   sleep 2
+   tmux capture-pane -t yclogin -p -J | grep -o 'https://[^ ]*'
+   ```
+
+3. **`browser_navigate` + `browser_connect`** — open that OAuth URL and hand off
+   to the user to sign in. The CLI's listener on `localhost:19876` receives the
+   callback **directly** once they authorize — no manual code extraction, no
+   pasting a redirect URL back.
+
+4. **Confirm:**
+   ```bash
+   tmux capture-pane -t yclogin -p -J | grep -i successful
+   yc me     # should print the founder + company, e.g. "Gini Agent (S26)"
+   ```
+
+Why tmux: a bare `yc login` over a non-interactive shell dies when the call
+returns; tmux keeps the process alive to catch the callback. The `browser_requests`
+inspection step is **not needed** — the localhost callback fires on its own.
+
+### Fallbacks (only if the above stalls)
+- `yc login --device` — prints a URL + code; user authenticates on another
+  device. Cleanest when browser-forward is flaky, but it's NOT what we rehearsed.
+- `yc login --manual` — prints the auth URL, takes the redirect URL pasted back.
+- Token lives in `~/.yc/credentials.json` and refreshes automatically. If
+  `yc me` already shows the right founder, do NOT re-run login.
+
+## 2. The investor lookup (the yc beat of the demo)
+
+Feeds Step 5. Always `--json` + a small `limit` — investor results are **huge**
+(each fund embeds its full partner roster + deal history), so an unbounded call
+stalls on stage.
 
 ```bash
-yc logout        # clears stored credentials from ~/.yc
+yc search "<fund name>" --type investors        # human: columns id,link,type,users,investments
+yc tools run search --input '{"entity":"investors","query":"<fund>","limit":3}'   # structured — PREFER live
 ```
 
-## Core commands
+- Pin the **exact query and fund name** during staging; confirm clean fields
+  (check size, conversion, recent deals). The "accurate, not fragile" check.
+- Investor research is the **high-latency step** — pre-warm it or run it while
+  narrating the plan view, never into silence.
+- Real-vs-fixture is decided ahead of time; if going real via `yc`, keep a
+  seeded fixture as the pre-recorded fallback.
+
+## 3. Other commands the demo might touch
 
 ```bash
-yc me                              # current user / auth check         | --json
-yc search "<query>" --type <type>  # search Bookface                   | --json
-yc agent "<question>"              # ask the YC agent (streams output) | --json
-yc tools list                      # list YC agent tools               | --json
-yc tools describe <name>           # show a tool's JSON schema          | --json
-yc tools run <name> --input '<json>'   # run a YC agent tool directly  | --json
-yc skills list                     # list YC playbooks                  | --json
-yc skills read <name>              # print a YC playbook's content
+yc me                              # who am I (verify auth)     | add --json
+yc search "<q>" --type companies   # company lookups            | --type founders|deals|...
+yc agent "<question>"              # ask the YC agent (streams)  | add --json
+yc skills read <name>              # load a YC playbook by name
 ```
 
-`--json` is supported on the read commands above. Prefer it whenever you are
-going to parse or summarize the result — the default human output (plain text
-for `me`, CSV-with-markdown-links for `search`) is for a terminal, not a stable
-parse target.
+- `yc <cmd> --help` for exact current syntax — don't guess flags on stage.
+- Batch filters use short names (`W25`, `S26`), never long form (`w2025`).
 
-## Search
+## 4. Logout — FULL logout means BOTH steps (always)
 
-`yc search` covers many entity types via `--type` (companies, founders,
-investors, deals, meetups, forum, jobs, launches, and more — see
-`yc tools describe search` for the full list and each type's filters).
+When the user mentions logging out of `yc` (for any reason), **always perform both steps in the same turn, without exception**:
 
-```bash
-yc search "developer tools" --type companies
-yc search "fintech seed" --type investors --json
-```
+1. **CLI logout** — clears stored credentials:
+   ```bash
+   export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
+   yc logout
+   ```
 
-The structured form goes through the agent's `search` tool and returns a JSON
-envelope with `total_count`, `available_filters`, and `available_extra_fields`:
+2. **Browser session logout** — navigates to clear the active YC/Bookface session:
+   ```bash
+   browser_navigate("https://bookface.ycombinator.com/signout")
+   ```
+   If the page redirects to a login screen, the session is cleared. If it requires interaction, use `browser_connect` to hand off to the user.
 
-```bash
-yc tools run search --input '{"entity":"investors","query":"<fund>","limit":3}'
-```
+A partial logout (CLI only, or browser only) leaves credentials or session tokens active and the user is NOT fully logged out. Both steps are required every time. Never report logout as complete until both have been executed.
 
-Useful conventions:
-
-- **Use a small `limit`.** Some entities (notably `investors`) embed large nested
-  payloads — a fund record carries its full partner roster and investment
-  history — so an unbounded query is slow and noisy. Start with `limit: 3` and
-  page up only if needed.
-- **Request the fields you need with `extra_fields`.** The base result is lean;
-  detail fields are opt-in. For an investor, fields like
-  `average_series_a_check_size`, `n_investments`, `rating`, and `description`
-  only come back when named in `extra_fields`. Probe with `limit: 0` first to
-  read `available_extra_fields` for that entity.
-- **Batch values use short names** (`W25`, `S26`), not long form (`w2025`).
-  Filter values must match exactly ("Harvard" ≠ "Harvard University").
-
-## Running YC agent tools and playbooks
-
-The YC agent exposes named tools (search, deals, company/profile lookups, and
-more). `yc tools list` enumerates them; `yc tools describe <name>` shows the
-JSON-Schema arguments; `yc tools run <name> --input '<json>'` invokes one.
-Dotted names select an action — `tool:search.companies` means run `search` with
-`entity: "companies"`. `yc tools context` prints the current user's role and
-guidance. `yc skills read <name>` loads a YC playbook (e.g. fundraising,
-pricing, sales advice) on demand.
-
-## Rules
-
-1. Check `yc me` before assuming auth; only run `yc login` when it reports "Not logged in", and prefer `--device` on any machine the user reaches remotely.
-2. If `yc` is not on `PATH`, set `PATH` to include `~/.yc/bin` and `~/.local/bin`, fall back to `ycp`, and only run the install script if the binary is genuinely absent.
-3. Never expose the user's password or token — login is browser/device-based and the token stays in `~/.yc`; the agent never handles the credential.
-4. Prefer `--json` for anything you will parse; use a small `limit` and request `extra_fields` explicitly on heavy entities like investors.
-5. Don't refuse a YC-network ask without checking — confirm syntax with `yc <command> --help` or `yc tools describe <name>` before concluding something isn't supported.
+## Don'ts
+- Don't mention tmux (or pane-capture / send-keys) in user-facing messages — run it silently, narrate only login started → sign-in → signed in.
+- Don't run a bare `yc login` outside tmux on the demo Mac — it dies before the callback lands.
+- Don't re-run login if `yc me` already shows the right founder — it rewrites credentials for nothing.
+- Don't make an unbounded `--type investors` call live — always `--json` + small `limit`.
+- Don't forget `capture-pane -J` — without it the OAuth URL truncates at the pane width.
+- Don't do a partial logout — if the user mentions logging out of `yc`, always run BOTH the CLI logout AND the browser session logout in the same turn, no exceptions.
+- Don't report logout as done after only one step — confirm both the CLI and browser steps completed before telling the user they're logged out.
