@@ -151,17 +151,19 @@ describe("groupExchanges by taskId", () => {
     expect(groups[0]!.calls.length).toBe(2);
   });
 
-  test("the latest cycle still streaming stays inline (no premature group)", () => {
+  test("a still-streaming cycle folds like a completed one, with its streaming reply as the trailing bubble", () => {
     const items = groupExchanges([
       ...cycle("task_done", "first"),
       ...cycle("task_live", "second", /* streaming */ true)
     ]);
     const groups = items.filter((i) => i.kind === "tool_group");
-    // Completed cycle groups; the streaming one keeps its tool call inline.
-    expect(groups.length).toBe(1);
-    expect(groups[0]!.calls[0]!.argsPreview).toBe("first");
-    const inlineToolCalls = items.filter((i) => i.kind === "block" && i.block.kind === "tool_call");
-    expect(inlineToolCalls.length).toBe(1);
+    // Both cycles fold — the in-flight one no longer leaks its tool call inline.
+    expect(groups.length).toBe(2);
+    expect(groups.map((g) => g.calls[0]!.argsPreview)).toEqual(["first", "second"]);
+    expect(items.some((i) => i.kind === "block" && i.block.kind === "tool_call")).toBe(false);
+    // Each cycle's reply (the streaming one included) stays a standalone bubble.
+    const bubbles = items.filter((i) => i.kind === "block" && i.block.kind === "assistant_text");
+    expect(bubbles.length).toBe(2);
   });
 
   test("interleaved task blocks still group by task (manual run overlapping a scheduled run)", () => {
@@ -192,22 +194,25 @@ describe("groupExchanges by taskId", () => {
     expect(items.length).toBe(2);
   });
 
-  test("an exchange ending on a running tool call (no final reply) stays inline", () => {
+  test("an exchange mid-tool-call (no final reply) folds into a group, not a loose inline tool call", () => {
     const items = groupExchanges([
       user("search", "task_run"),
       toolCall({ toolName: "web_search", argsPreview: "q", status: "running", taskId: "task_run" })
     ]);
-    // Incomplete: no non-streaming assistant_text closes it, so no group forms.
-    expect(items.some((i) => i.kind === "tool_group")).toBe(false);
-    expect(items.filter((i) => i.kind === "block" && i.block.kind === "tool_call").length).toBe(1);
+    // In flight with a tool call → folds immediately (the collapsed group grows
+    // as the turn runs); the running call lives in the group, not inline.
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    expect(groups[0]!.calls.length).toBe(1);
+    expect(items.some((i) => i.kind === "block" && i.block.kind === "tool_call")).toBe(false);
   });
 
   test("a block with no taskId forms its own single-block exchange in place", () => {
     const items = groupExchanges([
       { kind: "phase", id: "p0", sessionId: "s", instance: "test", ordinal: ordinal++, createdAt: "2026-01-01T00:00:00.000Z", label: "thinking" } as ChatBlock
     ]);
-    // No assistant_text anywhere ⇒ isExchangeComplete falls through to false,
-    // so the phase block passes through as a raw block, never a group.
+    // No tool calls in the exchange ⇒ it passes through as a raw block, never
+    // a group.
     expect(items.some((i) => i.kind === "tool_group")).toBe(false);
     expect(items).toEqual([{ kind: "block", block: expect.objectContaining({ kind: "phase" }) }]);
   });
@@ -267,7 +272,7 @@ describe("groupExchanges narration folding", () => {
     ).toBe("answer");
   });
 
-  test("an incomplete version keeps narration inline as standalone blocks (no group)", () => {
+  test("an in-flight version folds narration into the group as Thinking steps, with only the streaming answer standalone", () => {
     const items = groupExchanges([
       user("look into it", "task_stream"),
       assistant("let me check", "task_stream"),
@@ -276,12 +281,28 @@ describe("groupExchanges narration folding", () => {
       toolCall({ toolName: "web_fetch", argsPreview: "second", status: "ok", taskId: "task_stream" }),
       assistant("answer", "task_stream", /* streaming */ true)
     ]);
-    expect(items.some((i) => i.kind === "tool_group")).toBe(false);
-    // Every narration block (and the still-streaming final) renders inline.
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    const group = groups[0]!;
+    expect(group.calls.length).toBe(2);
+    // Narration folds in as "Thinking" steps, interleaved with the tool calls —
+    // exactly as it would once the turn completes (no reflow on finish).
+    expect(group.steps.map((s) => s.kind)).toEqual([
+      "narration",
+      "tool_call",
+      "narration",
+      "tool_call"
+    ]);
+    // Only the still-streaming final answer remains a standalone bubble.
     const standaloneAssistant = items.filter(
       (i) => i.kind === "block" && i.block.kind === "assistant_text"
     );
-    expect(standaloneAssistant.length).toBe(3);
+    expect(standaloneAssistant.length).toBe(1);
+    expect(
+      standaloneAssistant[0]!.kind === "block" &&
+        standaloneAssistant[0]!.block.kind === "assistant_text" &&
+        standaloneAssistant[0]!.block.text
+    ).toBe("answer");
   });
 
   test("a terminal run that ended on a tool call (no final answer) folds all narration with no standalone bubble", () => {
