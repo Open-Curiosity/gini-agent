@@ -1688,17 +1688,6 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
-  // Delivery binding: "channel" (default) mints a dedicated job channel
-  // for chat-bound invocations; "chat" binds the job's fires to the
-  // originating conversation instead (validated against the resolved
-  // session below).
-  let deliverTo: "channel" | "chat" | undefined;
-  if (args.deliverTo !== undefined && args.deliverTo !== null) {
-    if (args.deliverTo !== "channel" && args.deliverTo !== "chat") {
-      throw new Error("Invalid input: deliverTo must be one of \"channel\" | \"chat\".");
-    }
-    deliverTo = args.deliverTo;
-  }
   const deliveryTargets = parseDeliveryTargets(config, args.deliveryTargets);
   // `preRunHook` passes through UNVALIDATED on purpose: the authoritative
   // shape + known-handler (isKnownHook) validation lives in
@@ -1709,11 +1698,10 @@ async function createJobTool(
   const preRunHook = args.preRunHook;
 
   // Walk task -> run -> conversation to determine whether the agent is
-  // invoking us from inside a chat task. If so, we want each scheduled
-  // job to publish into its OWN dedicated chat thread (so a daily report
-  // doesn't bury the originating conversation under 365 future fires).
-  // Otherwise (CLI / imperative task), the job runs without any chat
-  // delivery target — same as before.
+  // invoking us from inside a chat task. If so, the job binds to that same
+  // conversation (a Topic or the main agent chat) and delivers each fire
+  // into it. Otherwise (CLI / imperative task), the job runs without any
+  // chat delivery target — same as before.
   const state = readState(config.instance);
   const task = state.tasks.find((item) => item.id === taskId);
   // Pre-side-effect terminal check. `create_job` persists a
@@ -1726,9 +1714,8 @@ async function createJobTool(
     return `Error: create_job skipped because task is already ${task.status}.`;
   }
   // The agent's caller is "chat-bound" when its task is attached to a run
-  // whose conversation still exists. That's the trigger to mint a fresh
-  // chat thread for the job to deliver into — or, with deliverTo "chat",
-  // the session the job binds to directly.
+  // whose conversation still exists. That originating conversation is the
+  // session the job binds to and delivers each fire into.
   let originatingSessionId: string | undefined;
   if (task?.runId) {
     const run = state.runs.find((item) => item.id === task.runId);
@@ -1738,22 +1725,15 @@ async function createJobTool(
     }
   }
   const invokedFromChat = originatingSessionId !== undefined;
-  // deliverTo "chat" is only meaningful when there IS an originating
-  // conversation to deliver into. Imperative/CLI tasks have none, so
-  // surface a tool error instead of silently creating a session-less job.
-  if (deliverTo === "chat" && !invokedFromChat) {
-    return `Error: create_job deliverTo "chat" requires invocation from a chat conversation, and this task has no originating chat session. Omit deliverTo (or pass "channel") instead.`;
-  }
 
   // Pass `parentTaskId` so `createScheduledJob`'s own `mutateState`
   // callback can re-check terminal status atomically. The earlier
   // lock-free `readState` pre-check is kept as a fast path / error-
   // message-quality improvement; this is the authoritative
   // serialization point. `createScheduledJob` throws if the parent
-  // task is already terminal. When `invokedFromChat`, we ask
-  // createScheduledJob to mint a fresh ChatSessionRecord atomically
-  // alongside the JobRecord (single mutateState write — no orphan
-  // session on a validation failure).
+  // task is already terminal. When `invokedFromChat`, the job binds to the
+  // originating conversation; `requireChatSession` makes createScheduledJob
+  // re-verify that session still exists inside the same mutateState write.
   let job;
   try {
     job = await createScheduledJob(config, {
@@ -1765,15 +1745,13 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       prompt,
-      // Dedicated Topic for chat-driven jobs (ADR
-      // chat-topics-tasks-subagents.md, "Jobs → Topics"). A job ALWAYS runs in
-      // its OWN Topic regardless of `deliverTo` — the originating conversation
-      // is never re-pointed. Title defaults to the job name, the natural label
-      // in the session list. (createChatSession truncates to 80 chars.)
-      // `deliverTo:"chat"` only flips `forwardToChat` below so each fire ALSO
-      // surfaces its final answer in Chat, tagged with this Topic.
-      createDedicatedSession: invokedFromChat ? { title: name } : undefined,
-      forwardToChat: deliverTo === "chat",
+      // Bind chat-driven jobs to their originating conversation (the Topic or
+      // main agent chat the create_job tool ran in), so each fire delivers into
+      // that same thread. When the originating session is a Topic, the
+      // Topic→Chat activity mirror (resolveEmitContext) surfaces the fire's
+      // full turn in the parent Chat for free, so `forwardToChat` stays unset
+      // to avoid double-posting the final answer.
+      chatSessionId: invokedFromChat ? originatingSessionId : undefined,
       oneShot,
       // Skill attachments pass through verbatim — createScheduledJob is the
       // single validation choke point (shape + enabled-skill resolution),
@@ -1792,11 +1770,11 @@ async function createJobTool(
       // doesn't reattribute the job to whichever agent happens to be
       // active at fire time. Threaded through the trusted options bag
       // so a malicious HTTP client can't spoof it via the request body.
-      originatingAgentId: task?.agentId
-      // No `requireChatSession`: the job no longer binds to the originating
-      // conversation — its dedicated Topic is minted inside the same
-      // mutateState write, so there is no caller-supplied chatSessionId to
-      // re-verify against a racing deletion.
+      originatingAgentId: task?.agentId,
+      // Re-verify the originating session still exists inside the same
+      // mutateState write: its id came from a lock-free readState above, so a
+      // racing deletion could otherwise persist a job bound to a dead session.
+      requireChatSession: invokedFromChat
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
@@ -1807,10 +1785,8 @@ async function createJobTool(
     }
     throw err;
   }
-  // The job's chatSessionId is the freshly-minted dedicated Topic when
-  // invokedFromChat (for BOTH deliverTo:"channel" and deliverTo:"chat" — the
-  // latter additionally sets forwardToChat), or undefined for imperative/CLI
-  // invocations.
+  // The job's chatSessionId is the originating conversation when
+  // invokedFromChat, or undefined for imperative/CLI invocations.
   const chatSessionId = job.chatSessionId;
 
   await mutateState(config.instance, (current) => {
@@ -1877,10 +1853,10 @@ async function createJobTool(
     : cronExpression
       ? `cron \"${cronExpression}\" (${cronTimezone ?? "UTC"})`
       : `every ${intervalSeconds}s`;
-  // When the job has a dedicated chat thread, surface its id in the
+  // When the job is bound to a chat conversation, surface its id in the
   // tool-call result so the model's follow-up reply can mention both the
-  // job id and the new chat id ("Each run posts into a dedicated thread.").
-  // Imperative/CLI invocations skip this suffix — there's no chat to point at.
+  // job id and the conversation each fire delivers into. Imperative/CLI
+  // invocations skip this suffix — there's no chat to point at.
   const sessionSuffix = chatSessionId ? ` into ${chatSessionId}` : "";
   return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}${sessionSuffix}.`;
 }

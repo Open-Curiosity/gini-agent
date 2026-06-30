@@ -470,7 +470,7 @@ describe("cron lifecycle", () => {
     expect(nan.status).toBe(400);
   });
 
-  test("create_job dispatch from a chat-bound task mints a dedicated chat session", async () => {
+  test("create_job dispatch from a chat-bound task binds the job to the originating session", async () => {
     const config = testConfig("jobs-create-tool-chat");
     // Build a chat session and a task whose runId points at it. This is
     // the shape submitChatMessage produces — we synthesize it directly so
@@ -518,191 +518,34 @@ describe("cron lifecycle", () => {
     const stateAfter = readState(config.instance);
     const jobs = stateAfter.jobs;
     expect(jobs).toHaveLength(1);
-    // The job points at a FRESH chat session, not the originating one —
-    // future fires post into the dedicated thread so the originating
-    // conversation doesn't get buried under repeated reports.
-    expect(jobs[0]?.chatSessionId).toBeDefined();
-    expect(jobs[0]?.chatSessionId).not.toBe(sessionId);
+    // The job binds to the ORIGINATING session — each fire delivers into the
+    // conversation it was created from. No separate dedicated channel is
+    // minted (the Topic→Chat mirror surfaces Topic fires in the parent Chat),
+    // and forwardToChat stays unset so the final answer isn't double-posted.
+    expect(jobs[0]?.chatSessionId).toBe(sessionId);
+    expect(jobs[0]?.forwardToChat).toBeUndefined();
     expect(jobs[0]?.oneShot).toBe(true);
     expect(jobs[0]?.intervalSeconds).toBe(60);
     expect(jobs[0]?.prompt).toBe("Remind me.");
 
-    // The new session exists and its title is exactly the job's name so the
-    // user can scan a list of dedicated threads — no "Scheduled:" prefix or
-    // other framing, since the chat IS bound to that job's delivery.
-    const newSession = stateAfter.chatSessions.find((s) => s.id === jobs[0]!.chatSessionId);
-    expect(newSession).toBeDefined();
-    expect(newSession?.title).toBe("test-reminder");
+    // No new chat session was created — the originating one is reused as-is.
+    expect(stateAfter.chatSessions).toHaveLength(1);
+    const originating = stateAfter.chatSessions.find((s) => s.id === sessionId)!;
+    expect(originating.kind).toBeUndefined();
+    expect(originating.title).toBe("Test chat");
 
-    // Confirmation string contains the new job id, cadence, and the new
+    // Confirmation string contains the new job id, cadence, and the bound
     // session id so the model can reference both in its reply to the user.
     if (result.kind === "sync") {
       expect(result.result).toContain(jobs[0]!.id);
       expect(result.result).toContain("one-shot");
-      expect(result.result).toContain(jobs[0]!.chatSessionId!);
+      expect(result.result).toContain(sessionId);
     }
     // Audit row with actor:"agent" action:"job.created".
     const audit = stateAfter.audit.find(
       (event) => event.action === "job.created" && event.target === jobs[0]!.id
     );
     expect(audit?.actor).toBe("agent");
-  });
-
-  test("create_job dispatch with deliverTo \"chat\" binds the job to the originating session", async () => {
-    const config = testConfig("jobs-create-tool-deliverto-chat");
-    const { taskId, sessionId } = await mutateState(config.instance, (state) => {
-      state.chatSessions.unshift({
-        id: "session_deliverto_chat",
-        instance: state.instance,
-        title: "Test chat",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        messageIds: [],
-        taskIds: [],
-        runIds: []
-      });
-      const at = new Date().toISOString();
-      state.runs.unshift({
-        id: "run_deliverto_chat",
-        instance: state.instance,
-        kind: "conversation_turn",
-        status: "running",
-        title: "test",
-        input: "test",
-        createdAt: at,
-        updatedAt: at,
-        conversationId: "session_deliverto_chat",
-        planStepIds: [],
-        childRunIds: [],
-        approvalIds: []
-      });
-      const task = createTask(state.instance, "test", undefined, undefined, undefined, "run_deliverto_chat");
-      upsertTask(state, task);
-      return { taskId: task.id, sessionId: "session_deliverto_chat" };
-    });
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_create_job_deliverto_chat",
-      JSON.stringify({ name: "in-chat-reminder", intervalSeconds: 120, prompt: "Remind me.", oneShot: true, deliverTo: "chat" })
-    );
-    expect(result.kind).toBe("sync");
-
-    const stateAfter = readState(config.instance);
-    expect(stateAfter.jobs).toHaveLength(1);
-    // The job ALWAYS runs in its OWN dedicated Topic — deliverTo:"chat" only
-    // flips forwardToChat, never re-points at the originating conversation
-    // (ADR chat-topics-tasks-subagents.md, "Jobs → Topics").
-    const job = stateAfter.jobs[0]!;
-    expect(job.chatSessionId).toBeDefined();
-    expect(job.chatSessionId).not.toBe(sessionId);
-    expect(job.forwardToChat).toBe(true);
-    // A fresh dedicated channel/Topic was minted alongside the originating one.
-    const topic = stateAfter.chatSessions.find((s) => s.id === job.chatSessionId);
-    expect(topic?.kind).toBe("channel");
-    expect(topic?.origin).toBe("job");
-    expect(topic?.title).toBe("in-chat-reminder");
-    // The originating session stays a normal chat: no kind/title mutation.
-    const originating = stateAfter.chatSessions.find((s) => s.id === sessionId)!;
-    expect(originating.kind).toBeUndefined();
-    expect(originating.title).toBe("Test chat");
-  });
-
-  test("create_job dispatch with explicit deliverTo \"channel\" still mints a dedicated chat session", async () => {
-    const config = testConfig("jobs-create-tool-deliverto-channel");
-    const { taskId, sessionId } = await mutateState(config.instance, (state) => {
-      state.chatSessions.unshift({
-        id: "session_deliverto_channel",
-        instance: state.instance,
-        title: "Test chat",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        messageIds: [],
-        taskIds: [],
-        runIds: []
-      });
-      const at = new Date().toISOString();
-      state.runs.unshift({
-        id: "run_deliverto_channel",
-        instance: state.instance,
-        kind: "conversation_turn",
-        status: "running",
-        title: "test",
-        input: "test",
-        createdAt: at,
-        updatedAt: at,
-        conversationId: "session_deliverto_channel",
-        planStepIds: [],
-        childRunIds: [],
-        approvalIds: []
-      });
-      const task = createTask(state.instance, "test", undefined, undefined, undefined, "run_deliverto_channel");
-      upsertTask(state, task);
-      return { taskId: task.id, sessionId: "session_deliverto_channel" };
-    });
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_create_job_deliverto_channel",
-      JSON.stringify({ name: "channel-report", intervalSeconds: 60, prompt: "Report.", deliverTo: "channel" })
-    );
-    expect(result.kind).toBe("sync");
-
-    const stateAfter = readState(config.instance);
-    expect(stateAfter.jobs).toHaveLength(1);
-    // Same behavior as omitting deliverTo: a fresh dedicated channel.
-    expect(stateAfter.jobs[0]?.chatSessionId).toBeDefined();
-    expect(stateAfter.jobs[0]?.chatSessionId).not.toBe(sessionId);
-    const newSession = stateAfter.chatSessions.find((s) => s.id === stateAfter.jobs[0]!.chatSessionId);
-    expect(newSession?.title).toBe("channel-report");
-  });
-
-  test("create_job dispatch rejects deliverTo \"chat\" from a non-chat-bound task", async () => {
-    const config = testConfig("jobs-create-tool-deliverto-nochat");
-    const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
-      upsertTask(state, task);
-      return task.id;
-    });
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_create_job_deliverto_nochat",
-      JSON.stringify({ name: "orphan", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
-    );
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      expect(result.result).toContain("Error:");
-      expect(result.result).toContain("requires invocation from a chat conversation");
-    }
-    // No job persisted.
-    expect(readState(config.instance).jobs).toHaveLength(0);
-  });
-
-  test("create_job dispatch rejects an invalid deliverTo value", async () => {
-    const config = testConfig("jobs-create-tool-deliverto-invalid");
-    const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
-      upsertTask(state, task);
-      return task.id;
-    });
-
-    await expect(
-      dispatchToolCall(
-        config,
-        taskId,
-        "create_job",
-        "call_create_job_deliverto_bad",
-        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", deliverTo: "inbox" })
-      )
-    ).rejects.toThrow(/deliverTo must be one of/);
-    expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
   test("createScheduledJob with requireChatSession rejects a vanished chat session and persists no job", async () => {
@@ -2903,19 +2746,20 @@ describe("update_job deliverTo rebinding", () => {
   test("deliverTo \"channel\" clears forwardToChat, keeps the job's Topic, and no-ops on repeat", async () => {
     const config = testConfig("jobs-rebind-chat-to-channel");
     const { taskId, sessionId } = await seedChatTask(config, "c2ch");
-    // Forward-to-chat job: runs in its own Topic AND forwards into chat.
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_rebind_create",
-      JSON.stringify({ name: "haiku-job", intervalSeconds: 60, prompt: "Haiku.", deliverTo: "chat" })
-    );
-    const jobBefore = readState(config.instance).jobs[0]!;
+    // Seed a forward-to-chat job directly: a dedicated Topic that ALSO forwards
+    // into chat — the shape the rebind operates on.
+    const jobBefore = await createScheduledJob(config, {
+      name: "haiku-job",
+      intervalSeconds: 60,
+      prompt: "Haiku.",
+      createDedicatedSession: { title: "haiku-job" },
+      forwardToChat: true,
+      parentTaskId: taskId
+    });
     const jobId = jobBefore.id;
     const topicId = jobBefore.chatSessionId!;
-    // The job ALWAYS runs in its own dedicated Topic — never the originating
-    // conversation. deliverTo:"chat" only sets forwardToChat.
+    // The job runs in its own dedicated Topic, distinct from the originating
+    // conversation, with forwardToChat set.
     expect(topicId).not.toBe(sessionId);
     expect(jobBefore.forwardToChat).toBe(true);
 
@@ -2965,15 +2809,14 @@ describe("update_job deliverTo rebinding", () => {
   test("deliverTo \"chat\" sets forwardToChat, keeps the job's Topic (no archive), and no-ops on repeat", async () => {
     const config = testConfig("jobs-rebind-channel-to-chat");
     const { taskId, sessionId } = await seedChatTask(config, "ch2c");
-    // Channel-only job (the default): a dedicated Topic is minted, no forward.
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_rebind_create_channel",
-      JSON.stringify({ name: "briefing", intervalSeconds: 60, prompt: "Brief." })
-    );
-    const jobBefore = readState(config.instance).jobs[0]!;
+    // Seed a channel-only job directly: a dedicated Topic, no forward.
+    const jobBefore = await createScheduledJob(config, {
+      name: "briefing",
+      intervalSeconds: 60,
+      prompt: "Brief.",
+      createDedicatedSession: { title: "briefing" },
+      parentTaskId: taskId
+    });
     const jobId = jobBefore.id;
     const topicId = jobBefore.chatSessionId!;
     expect(topicId).not.toBe(sessionId);
@@ -3116,18 +2959,19 @@ describe("update_job deliverTo rebinding", () => {
       // taskIds (as a real chat turn does), so seed the link.
       if (!session.taskIds.includes(taskId)) session.taskIds.push(taskId);
     });
-    // The job ALWAYS mints its own Topic; create-time minting clones the
-    // originating conversation's `source` onto the Topic's outboundMirror so
-    // scheduled fires keep reaching the bridge.
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_mirror_create",
-      JSON.stringify({ name: "mirror-job", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const topicId = readState(config.instance).jobs[0]!.chatSessionId!;
+    // A dedicated-Topic job; create-time minting clones the originating
+    // conversation's `source` onto the Topic's outboundMirror so scheduled
+    // fires keep reaching the bridge.
+    const seededJob = await createScheduledJob(config, {
+      name: "mirror-job",
+      intervalSeconds: 60,
+      prompt: "x",
+      createDedicatedSession: { title: "mirror-job" },
+      forwardToChat: true,
+      parentTaskId: taskId
+    });
+    const jobId = seededJob.id;
+    const topicId = seededJob.chatSessionId!;
     const topic = readState(config.instance).chatSessions.find((s) => s.id === topicId);
     expect(topic?.kind).toBe("channel");
     expect(topic?.outboundMirror).toEqual(source);
