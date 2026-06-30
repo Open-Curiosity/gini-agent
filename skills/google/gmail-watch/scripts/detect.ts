@@ -678,16 +678,18 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
 // moves FORWARD (to newer mail): you can never reach an older, un-listed tail by
 // advancing it, so a path that needs the tail is wrong.
 //
-//  1. SEEDING (no cursor): BASELINE + draft the single newest pending inbound.
-//     Take the newest listed id (Gmail lists newest-first => window.ids[0]), set
-//     the cursor at its internalDate, and record that id plus any sibling sharing
-//     its exact epoch second (Gmail's `after:` is inclusive of the boundary
-//     second) in `seen`. If the newest passes the SAME drop filter as steady
-//     state (non-self, non-automated unless explicitly watched), draft THAT ONE
-//     message so creating a watch on a conversation with a pending reply produces
-//     a draft immediately; a self/automated newest stays silent. Pre-existing
-//     mail OLDER than the baseline is excluded by `after:` forever — never a
-//     backlog draft, regardless of inbox size (only the single newest is drafted).
+//  1. SEEDING (no cursor): BASELINE + drain the RECENT matching backlog HEAD.
+//     Consider the newest up to MAX_MESSAGES_PER_TICK listed ids (Gmail lists
+//     newest-first, so window.ids[0..cap] is the most-recent window), baseline the
+//     cursor at the NEWEST listed id's internalDate, and record the boundary-second
+//     ids in `seen` (Gmail's `after:` is inclusive of the boundary second). Each
+//     head id that passes the SAME drop filter as steady state (non-self,
+//     non-automated unless explicitly watched) is drafted, oldest-first — so
+//     creating a watch on an inbox with pending mail replies to the recent head
+//     immediately; a self/automated head id is dropped but STILL advances the
+//     baseline (a watch whose newest is an automated notice still drafts the older
+//     real mail in the head). Mail OLDER than the considered head is excluded by
+//     `after:` forever — never a backlog draft, regardless of inbox size.
 //
 //  2. STEADY-STATE, window NOT truncated: drain OLDEST-FIRST, cap the matches at
 //     MAX_MESSAGES_PER_TICK, advance the cursor ONCE to the LAST CONSUMED item's
@@ -730,55 +732,54 @@ export async function detect(
   throwOnGwsErrorBody(listOut);
   const window = parseMessageWindow(listOut);
 
-  // Regime 1: SEEDING — baseline the cursor at the newest match. If that newest
-  // match is a non-self inbound (passes the SAME drop filter as steady state),
-  // draft THAT ONE message so creating a watch on a conversation with a pending
-  // reply immediately produces a draft for it; older backlog is still excluded by
-  // `after:` forever (only the single newest qualifying message is drafted).
+  // Regime 1: SEEDING — drain the RECENT matching backlog HEAD. Consider the
+  // newest up to MAX_MESSAGES_PER_TICK listed messages (Gmail lists newest-first,
+  // so the head is the most-recent window), fetch each, drop self/automated, and
+  // draft the survivors. The cursor baselines at the NEWEST listed message so the
+  // entire considered head — drafted or not — and everything OLDER than it is
+  // excluded by `after:` forever: only the recent head ever seeds, never an
+  // ancient backlog, regardless of inbox size. A self/automated message in the
+  // head is dropped by the SAME safety floor as steady state but STILL advances
+  // the baseline, so a watch whose newest is an automated notice still drafts the
+  // older real mail in the head.
   if (isSeeding) {
     const newest = window.ids[0];
-    const seen: string[] = [];
-    let cursor: string;
-    let seedItem: ResultItem | undefined;
-    if (newest) {
-      // Fetch the newest's metadata so the drop filter + body fetch see real
-      // headers (seeding was previously metadata-only on internalDate alone).
-      const newestMeta = parseMessageMetadata(await gwsSpawn(buildGetArgs(newest)), newest);
-      const internalDate = newestMeta.internalDate ? Number(newestMeta.internalDate) : 0;
-      cursor = String(internalDate > 0 ? internalDate : Date.now());
-      seen.push(newest);
-      // The newest is a pending inbound to answer => draft this ONE message
-      // (fetch its body exactly as the steady path does). A self/automated newest
-      // drops, so seeding stays silent (there's nothing pending to reply to).
-      if (!shouldDropMessage(newestMeta, selfEmail, args.sender)) {
-        newestMeta.body = await fetchMessageBody(gwsSpawn, newest, newestMeta.snippet ?? "");
-        seedItem = buildMatchItem(newestMeta);
-      }
-      // Gmail's `after:<sec>` is INCLUSIVE of the boundary second, so any other
-      // pre-existing message sharing the newest's exact second is re-listed on
-      // the first steady tick. Record each such sibling now (they're already on
-      // this first listed page, newest-first) so they aren't drafted as "new"
-      // (siblings are seen-only — only the single newest is ever drafted on seed).
-      if (internalDate > 0) {
-        const newestSec = Math.floor(internalDate / 1000);
-        for (let i = 1; i < window.ids.length; i++) {
-          const sib = window.ids[i]!;
-          const sibDate = await fetchInternalDate(gwsSpawn, sib);
-          if (sibDate <= 0 || Math.floor(sibDate / 1000) !== newestSec) break;
-          seen.push(sib);
-        }
-      }
-    } else {
-      cursor = String(Date.now());
+    if (!newest) {
+      // Empty matching window: baseline at now, nothing to draft.
+      return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor: String(Date.now()), seen: [], status: "ok" } };
     }
-    if (seedItem) {
-      const items: ResultItem[] = [seedItem];
-      // The seeded draft carries the watch's standing objective just like a steady
-      // match (one trusted item alongside the untrusted match).
-      if (args.objective) items.push(buildObjectiveItem(args.sender ?? args.query, args.objective));
-      return { kind: "context", items, state: { cursor, seen, status: "ok" } };
+    // Truncation is irrelevant on seed: the newest page is always listed and we
+    // never reach for the older tail, so there's no pageLimitHit special-case here.
+    const headIds = window.ids.slice(0, MAX_MESSAGES_PER_TICK);
+    const collected: EmailMetadata[] = [];
+    let newestInternalDate = 0;
+    for (const id of headIds) {
+      const meta = parseMessageMetadata(await gwsSpawn(buildGetArgs(id)), id);
+      const internalDate = meta.internalDate ? Number(meta.internalDate) : 0;
+      if (Number.isFinite(internalDate) && internalDate > newestInternalDate) newestInternalDate = internalDate;
+      // A self/automated head message drops (no pending reply to draft) but still
+      // counts toward the baseline above.
+      if (shouldDropMessage(meta, selfEmail, args.sender)) continue;
+      // A surviving head match WILL be drafted: fetch its body now (best-effort,
+      // falls back to the snippet), exactly as the steady path does.
+      meta.body = await fetchMessageBody(gwsSpawn, id, meta.snippet ?? "");
+      collected.push(meta);
     }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
+    const cursor = String(newestInternalDate > 0 ? newestInternalDate : Date.now());
+    // Boundary dedup set: the listed ids sharing the cursor's exact epoch second
+    // (Gmail's inclusive `after:` would otherwise re-list them next tick).
+    const seen = await boundarySeen(gwsSpawn, window.ids, cursor, new Set());
+    if (collected.length === 0) {
+      return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
+    }
+    // Deliver oldest-first so the drafting turn reads the backlog chronologically
+    // (mirrors the steady-state drain order).
+    collected.reverse();
+    const items: ResultItem[] = collected.map(buildMatchItem);
+    // The seeded drafts carry the watch's standing objective just like a steady
+    // match (one trusted item alongside the untrusted matches).
+    if (args.objective) items.push(buildObjectiveItem(args.sender ?? args.query, args.objective));
+    return { kind: "context", items, state: { cursor, seen, status: "ok" } };
   }
 
   // Regime 3: TRUNCATED steady-state window — the older tail isn't listed, so a
