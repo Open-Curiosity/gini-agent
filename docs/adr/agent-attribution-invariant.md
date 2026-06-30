@@ -70,6 +70,14 @@ leak after an active-agent switch — needed a structural fix.
   audits (`agent.created`, `agent.activated`, `agent.deleted`) attribute
   to the subject agent itself rather than `system: true`, so the new
   agent's own inbox carries its provenance.
+- `migrateRecordAgentIds` re-stamps records whose `agentId` is missing
+  or points at a deleted agent onto the default agent — tasks, chat
+  sessions, jobs, job runs, subagents, authorizations, setup requests,
+  AND email watchers. Including `EmailWatcherRecord` keeps an orphaned
+  watcher re-homed in lockstep with its (also re-homed) backing job
+  rather than split apart under a dead `agentId`; a split watcher would
+  leave the startup email-watch backfill minting a duplicate shared job
+  each boot.
 - `migrateRecordAgentIds` no longer backfills events or audits. A
   missing `agentId` on those rows is now a first-class signal that the
   row is system-attributed; stamping legacy rows with the migration-

@@ -190,10 +190,14 @@ silently bypassing the filter.
 - Default agent on a fresh instance with `gini run --provider codex`
   → `providerName: "codex"` after install.
 - Agents can be deleted via `DELETE /api/agents/:id`; cascade removes
-  legacy `MemoryRecord` rows owned by the agent and the per-agent
-  Hindsight bank plus all of its units. The default agent
-  (`agent_default`) and the currently active agent are protected and
-  return 400 with a typed error.
+  legacy `MemoryRecord` rows owned by the agent, the per-agent
+  Hindsight bank plus all of its units, and the agent's email-watch
+  cluster — every `EmailWatcherRecord` it owns (tearing down the shared
+  backing job + per-concern channels as the last watcher goes) plus its
+  whole-inbox triage opt-in — so no watcher or job is stranded under a
+  deleted `agentId` (see [Email Watch](email-watch.md)). The default
+  agent (`agent_default`) and the currently active agent are protected
+  and return 400 with a typed error.
 - Agents can be archived via `POST /api/agents/:id/archive` and restored
   via `POST /api/agents/:id/unarchive` (also `gini agent archive` /
   `gini agent unarchive`). Archive sets `AgentRecord.archivedAt`; the
