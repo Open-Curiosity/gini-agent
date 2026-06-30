@@ -12,6 +12,7 @@ import {
   backfillEmailWatcherJobs,
   buildWatcherQuery,
   closeAllMemoryDbs,
+  createAgentRecord,
   createChatSession,
   getEmailWatcher,
   listEmailWatchers,
@@ -190,6 +191,26 @@ describe("watcher CRUD", () => {
   test("remove on a missing watcher throws", async () => {
     const config = buildConfig("ew-remove-missing");
     await expect(removeEmailWatcher(config, "nope")).rejects.toThrow("Email watcher not found");
+  });
+
+  test("list is agent-scoped when an agentId is given; unscoped returns all", async () => {
+    const config = buildConfig("ew-list-scope");
+    // Real registered agents — the store re-stamps any watcher whose agentId
+    // doesn't point at an existing agent back to the default, so synthetic ids
+    // wouldn't survive a state reload.
+    const { agentA, agentB } = await mutateState(config.instance, (state) => ({
+      agentA: createAgentRecord(state, { name: "agent-a", toolsets: [], messagingTargets: [] }).id,
+      agentB: createAgentRecord(state, { name: "agent-b", toolsets: [], messagingTargets: [] }).id
+    }));
+    const a = await addEmailWatcher(config, { sender: "a@x.com", agentId: agentA });
+    const b = await addEmailWatcher(config, { sender: "b@x.com", agentId: agentB });
+    // Each agent sees ONLY its own watcher.
+    expect(listEmailWatchers(config, agentA).map((w) => w.id)).toEqual([a.id]);
+    expect(listEmailWatchers(config, agentB).map((w) => w.id)).toEqual([b.id]);
+    // A different (unrelated) agent sees none of the above.
+    expect(listEmailWatchers(config, "agent-none")).toHaveLength(0);
+    // No agentId (back-compat for internal callers) returns all.
+    expect(listEmailWatchers(config).map((w) => w.id).sort()).toEqual([a.id, b.id].sort());
   });
 });
 

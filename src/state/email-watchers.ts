@@ -838,9 +838,15 @@ function withDerivedHealth(watcher: EmailWatcherRecord, state: RuntimeState): Em
   };
 }
 
-export function listEmailWatchers(config: RuntimeConfig): EmailWatcherRecord[] {
+// List watchers. With `agentId`, returns only that agent's watchers (per-agent
+// isolation for the tool/HTTP channels); without it, returns every watcher for
+// internal/system callers (backfill, agent-delete cascade) that filter or sweep
+// instance-wide.
+export function listEmailWatchers(config: RuntimeConfig, agentId?: string): EmailWatcherRecord[] {
   const state = readState(config.instance);
-  return state.emailWatchers.map((watcher) => withDerivedHealth(watcher, state));
+  return state.emailWatchers
+    .filter((watcher) => agentId === undefined || watcher.agentId === agentId)
+    .map((watcher) => withDerivedHealth(watcher, state));
 }
 
 export function getEmailWatcher(config: RuntimeConfig, watcherId: string): EmailWatcherRecord | undefined {

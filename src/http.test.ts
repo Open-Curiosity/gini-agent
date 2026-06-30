@@ -7305,6 +7305,38 @@ describe("agent-chat and thread endpoints", () => {
 });
 
 describe("email watcher routes", () => {
+  test("GET /api/email/watchers is scoped to the active agent", async () => {
+    const config = testConfig("http-email-list-scope");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+
+    // A watcher created under the default agent.
+    const underDefault = await call(handler, config, "/api/email/watchers", {
+      method: "POST",
+      body: JSON.stringify({ sender: "alice@example.com" })
+    });
+    // Switch to scout and create another watcher under it.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const underScout = await call(handler, config, "/api/email/watchers", {
+      method: "POST",
+      body: JSON.stringify({ sender: "bob@example.com" })
+    });
+
+    // GET now reflects the active agent (scout) — only its watcher.
+    const scoutList = await call(handler, config, "/api/email/watchers");
+    expect(scoutList.map((w: { id: string }) => w.id)).toEqual([(underScout as { id: string }).id]);
+
+    // Switch back: GET returns only the default agent's watcher.
+    await call(handler, config, `/api/agents/${defaultAgentId}/use`, { method: "POST" });
+    const defaultList = await call(handler, config, "/api/email/watchers");
+    expect(defaultList.map((w: { id: string }) => w.id)).toEqual([(underDefault as { id: string }).id]);
+  });
+
   test("PATCH /api/email/watchers/:id toggles enabled and tears down / recreates the shared job", async () => {
     const config = testConfig("http-email-patch");
     const handler = createHandler(config);

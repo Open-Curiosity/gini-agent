@@ -2375,7 +2375,11 @@ async function emailWatchTool(
   const action = requireString(args, "action");
 
   if (action === "list") {
-    const watchers = listEmailWatchers(config);
+    // Scope to the calling agent so it sees only its own watches (mirrors how
+    // `add` resolves the owning agent) — otherwise an agent reads every agent's
+    // watches and wrongly concludes a matching one already exists.
+    const callingAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
+    const watchers = listEmailWatchers(config, callingAgentId);
     const summary = watchers.map((w) => ({
       id: w.id,
       query: w.query,
