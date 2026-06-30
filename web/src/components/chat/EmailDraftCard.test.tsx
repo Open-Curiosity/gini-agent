@@ -1,16 +1,16 @@
 /// <reference lib="dom" />
 
 // EmailDraftCard parses an RFC-ish plain-text draft (header lines up to the
-// first blank line, then the body) and renders it read-only with a copy
-// affordance. When the fence carries a DraftId, it also shows a Send button
-// that sends the SAVED Gmail draft directly server-side (no agent turn). Whether
-// the draft is already sent comes from SentDraftsContext (primed eagerly by
-// ChatSurface), so the disabled "Sent" renders on first paint with no "Send"
-// flash on refresh. These tests pin the parser folds (recognized headers, the
-// non-header line that ends headers, CRLF, no-header), both copy outcomes, the
-// DraftId/Account metadata extraction (never shown as recipients), the
-// Send-only-with-DraftId rule, the context-driven Sent/Send/checking states,
-// and the click → POST → Sent/Sending/error branches.
+// first blank line, then the body), renders it with a copy affordance, and
+// ALWAYS shows a Send button that sends the SAVED Gmail draft directly
+// server-side (no agent turn) using the fence's DraftId. Whether the draft is
+// already sent comes from SentDraftsContext (primed eagerly by ChatSurface), so
+// the disabled "Sent" renders on first paint with no "Send" flash on refresh.
+// These tests pin the parser folds (recognized headers, the non-header line that
+// ends headers, CRLF, no-header), both copy outcomes, the DraftId/Account
+// metadata extraction (never shown as recipients), the always-rendered Send
+// footer, the context-driven Sent/Send/checking states, and the click → POST →
+// Sent/Sending/error branches.
 
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -114,11 +114,13 @@ describe("EmailDraftCard", () => {
     expect(screen.queryByText(/body only/)).not.toBeNull();
   });
 
-  // Without a DraftId (doc viewer / file preview / skills page, or a draft the
-  // agent didn't tag) the card stays read-only — no Send affordance, no api call.
-  test("renders no Send button without a DraftId", () => {
+  // The Send footer always renders. Without a DraftId the button is still shown
+  // (every real emitter tags a DraftId now), but the onSend guard makes a click a
+  // no-op so it never POSTs without an id to send.
+  test("renders the Send button and a click is a no-op without a DraftId", () => {
     renderCard(<EmailDraftCard raw={"To: a@b.c\nSubject: Hi\n\nbody"} />);
-    expect(screen.queryByText("Send")).toBeNull();
+    expect(screen.queryByText("Send")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Send/ }));
     expect(api).not.toHaveBeenCalled();
   });
 
