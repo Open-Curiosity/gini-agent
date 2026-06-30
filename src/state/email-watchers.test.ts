@@ -386,12 +386,16 @@ describe("shared backing job lifecycle", () => {
     expect(prompt).toContain("UNTRUSTED quoted data");
     expect(prompt).toContain("Do NOT send it.");
     expect(prompt).toContain("[SILENT]");
-    // The deliverable is an `email-draft` CARD (read-only, no DraftId/Account), not
-    // prose — so a watch-drafted reply renders as a draft card like an interactive
-    // Gmail draft, and the calendar preview is reserved for a specific-time meeting.
+    // The deliverable is an `email-draft` CARD that carries DraftId/Account so its
+    // Send button works — the worker saves a Gmail draft (--draft, which does NOT
+    // send) and emits the returned id. The calendar preview is reserved for a
+    // specific-time meeting.
     expect(prompt).toContain("an `email-draft` card, never plain prose");
     expect(prompt).toContain("```email-draft");
-    expect(prompt).toContain("OMIT any `DraftId`/`Account` lines");
+    expect(prompt).toContain("--draft");
+    expect(prompt).toContain("DraftId:");
+    expect(prompt).toContain("/api/email/drafts/send");
+    expect(prompt).toContain("Saving the draft is NOT sending");
     expect(prompt).toContain("meeting at a SPECIFIC date and time");
     expect(prompt).not.toContain("compose a PROPOSED reply and post it in this chat");
   });

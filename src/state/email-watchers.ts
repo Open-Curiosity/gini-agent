@@ -90,14 +90,16 @@ const TRIAGE_ROUTE_KEY = "triage";
 // gets — instead of a markdown blob. Inlined here (rather than relying on the agent
 // reading the google-gmail skill, which the watch path otherwise never does) so the
 // card renders deterministically on every matched tick; mirrors that skill's "Show
-// a saved draft to the user" grammar. The watch flow never SAVES a Gmail draft — it
-// sends via `gws gmail +reply` on the user's explicit approval — so the card is
-// READ-ONLY (omit DraftId/Account; EmailDraftCard renders a no-DraftId block as a
-// read-only card). The calendar preview stays conditional: only a reply proposing a
+// a saved draft to the user" grammar. The watch flow SAVES a Gmail draft (`gws gmail
+// +send … --draft`) and emits the returned draft id + account as `DraftId`/`Account`
+// header lines, so EmailDraftCard renders an actionable Send button (POST
+// /api/email/drafts/send — a direct, no-LLM-turn send the user triggers with one
+// click). Saving a draft is not sending: nothing reaches the recipient until the
+// user clicks Send. The calendar preview stays conditional: only a reply proposing a
 // meeting at a SPECIFIC time pulls it in, so a window-offer reply gets the card alone.
 const PROPOSED_REPLY_CARD_FORMAT = [
-  "DELIVERABLE FORMAT — a proposed reply MUST be an `email-draft` card, never plain prose. For each, lead with ONE short sentence naming the sender and the gist, then render the reply as a fenced ```email-draft``` block: a `To:` line, a `Subject:` line, a blank line, then the exact reply body (signed as the user). You have NOT saved a Gmail draft, so OMIT any `DraftId`/`Account` lines — the card is read-only; the user sends by replying 'send it', and you then send via `gws gmail +reply` (approval-gated). Render the fences literally, like this:",
-  "```email-draft\nTo: them@example.com\nSubject: Re: <their subject>\n\nHi <name>,\n\n<the reply body>\n\nBest,\n<the user's name>\n```",
+  "DELIVERABLE FORMAT — a proposed reply MUST be an `email-draft` card, never plain prose. For each, lead with ONE short sentence naming the sender and the gist. FIRST save the reply as a Gmail draft so the card carries a one-click Send button: read_skill google-gmail, then via terminal_exec run `gws gmail +reply --message-id <the matched email's id> --body '<the reply body>' --draft` (use the watch's account configDir when one is set: prefix with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR=\"<configDir>\"`). That saves the draft WITHOUT sending and returns the saved draft's `.id`. Then render the reply as a fenced ```email-draft``` block: a `To:` line, a `Subject:` line, a `DraftId:` line carrying that returned id, an `Account:` line carrying the watch's account email, a blank line, then the exact reply body (signed as the user). The DraftId/Account lines are metadata (never shown as recipient rows) — they wire the card's Send button to POST /api/email/drafts/send, a direct no-LLM-turn send the user triggers with one click. Saving the draft is NOT sending: nothing reaches the recipient until the user clicks Send. If the `--draft` save fails or returns no id, fall back to a card WITHOUT DraftId/Account (read-only — the user sends by replying 'send it') rather than bailing. Render the fences literally, like this:",
+  "```email-draft\nTo: them@example.com\nSubject: Re: <their subject>\nDraftId: <the saved draft id>\nAccount: <the watch's account email>\n\nHi <name>,\n\n<the reply body>\n\nBest,\n<the user's name>\n```",
   "ONLY when the reply proposes a meeting at a SPECIFIC date and time (not merely a time window): read_skill google-gmail and ALSO render a `calendar` preview block ABOVE the draft card per its 'Preview a meeting change inline' rule. A reply that just offers a time window, or proposes no meeting, gets the draft card alone."
 ].join("\n");
 
@@ -115,7 +117,7 @@ const EMAIL_WATCH_JOB_PROMPT = [
   PROPOSED_REPLY_CARD_FORMAT,
   "Draft only what the objective, the email body/thread, and your stored knowledge actually support. Use '⏸ Needs your input' ONLY when the body and objective genuinely lack a fact or decision you cannot supply (they asked a question the objective doesn't answer, or requested information you can't verify) — never merely because a thread fetch failed. When you do, post a message in this chat that starts with '⏸ Needs your input', states exactly what you need and why, and offers the options when applicable. If only a small detail is missing, draft the reply with an explicit [PLACEHOLDER: …] and ask only for that. Do NOT invent facts and do NOT send a vague holding reply.",
   "A follow-up notice means the counterparty has gone silent on a watched thread — draft a brief, polite follow-up that advances the objective; post it as a PROPOSED reply like any other draft.",
-  "Only send if the user explicitly says so — then reply via gws gmail +reply (approval-gated).",
+  "The Send button on the card is the primary approval path. If the user instead replies 'send it' in chat, send the SAVED draft (`gws gmail users drafts send`) rather than composing a fresh `gws gmail +reply`, so the same draft isn't sent twice; only fall back to a fresh `+reply` when no draft was saved.",
   "If nothing is actionable, respond with exactly [SILENT] and nothing else."
 ].join("\n");
 
