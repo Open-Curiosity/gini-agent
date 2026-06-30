@@ -16,8 +16,14 @@ export type ProcessStep =
 // through (no reflow when the turn finishes); the only difference is the
 // generated-files card, which waits until the turn is complete. A turn with no
 // tool calls passes its blocks through as raw bubbles.
+//
+// `isFinalAnswer` marks the one block that is the turn's closing answer —
+// only set on a standalone assistant_text that comes after the last tool call
+// (or the lone reply of a no-tool turn). A forwarded Topic turn's per-iteration
+// narration is NOT the final answer, so its "# topic" deep-link chip is
+// suppressed; only the final answer carries it.
 export type ChatRenderItem =
-  | { kind: "block"; block: ChatBlock }
+  | { kind: "block"; block: ChatBlock; isFinalAnswer?: boolean }
   | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[] }
   | { kind: "file_artifact"; id: string; files: { path: string; toolName: string }[] };
 
@@ -71,7 +77,18 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
   // call). Pass every block through as its own bubble — nothing to fold and no
   // narration to demote.
   if (calls.length === 0) {
-    for (const b of exchange) items.push({ kind: "block", block: b });
+    // No tool calls: the final answer is the last assistant_text. Mark it so a
+    // forwarded turn shows its "# topic" chip only on the closing reply.
+    let finalIdx = -1;
+    for (let i = exchange.length - 1; i >= 0; i--) {
+      if (exchange[i]!.kind === "assistant_text") {
+        finalIdx = i;
+        break;
+      }
+    }
+    for (let i = 0; i < exchange.length; i++) {
+      items.push({ kind: "block", block: exchange[i]!, ...(i === finalIdx ? { isFinalAnswer: true } : {}) });
+    }
     return;
   }
   // The final answer is the LAST assistant_text, but only when it comes AFTER
@@ -120,7 +137,7 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
     const b = exchange[i]!;
     if (b.kind === "tool_call" || b.kind === "tool_result") continue;
     if (b.kind === "assistant_text" && i !== finalAnswerIdx) continue;
-    items.push({ kind: "block", block: b });
+    items.push({ kind: "block", block: b, ...(i === finalAnswerIdx ? { isFinalAnswer: true } : {}) });
   }
   // Once the turn settles, group every successfully generated file into one
   // always-visible card so the user can open them directly instead of digging

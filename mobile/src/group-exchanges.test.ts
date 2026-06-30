@@ -286,11 +286,25 @@ describe("groupExchanges narration folding", () => {
       (i) => i.kind === "block" && i.block.kind === "assistant_text"
     );
     expect(standaloneAssistant.length).toBe(1);
+    const finalBubble = standaloneAssistant[0]!;
     expect(
-      standaloneAssistant[0]!.kind === "block" &&
-        standaloneAssistant[0]!.block.kind === "assistant_text" &&
-        standaloneAssistant[0]!.block.text
+      finalBubble.kind === "block" &&
+        finalBubble.block.kind === "assistant_text" &&
+        finalBubble.block.text
     ).toBe("answer");
+    // The trailing answer slot is the final answer (streaming or settled), so it
+    // carries isFinalAnswer; the folded narration never does, so a forwarded turn
+    // shows its "# topic" chip only on this closing reply.
+    expect(finalBubble.kind === "block" && finalBubble.isFinalAnswer).toBe(true);
+  });
+
+  test("a completed no-tool exchange flags only its lone reply as the final answer", () => {
+    const items = groupExchanges([user("hi", "task_q"), assistant("hello there", "task_q")]);
+    const standaloneAssistant = items.filter(
+      (i) => i.kind === "block" && i.block.kind === "assistant_text"
+    );
+    expect(standaloneAssistant.length).toBe(1);
+    expect(standaloneAssistant[0]!.kind === "block" && standaloneAssistant[0]!.isFinalAnswer).toBe(true);
   });
 
   test("a terminal run that ended on a tool call (no final answer) folds all narration with no standalone bubble", () => {
