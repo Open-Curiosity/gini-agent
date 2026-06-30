@@ -66,6 +66,11 @@ export function AgentsDrawer({
   // (no <Modal>) because the drawer overlays this same screen — a left
   // slide-in over a dimmed home, not a separate native presentation.
   const [mounted, setMounted] = useState(visible);
+  // Ref mirror of `mounted` so the effect can read mount state without
+  // depending on it — otherwise the first open's false→true mount would
+  // re-run the effect and restart the entrance mid-slide (cf. AttachmentSheet).
+  const mountedRef = useRef(mounted);
+  mountedRef.current = mounted;
   const translateX = useRef(new Animated.Value(-panelWidth)).current;
   const opacity = useRef(new Animated.Value(0)).current;
   const animRef = useRef<Animated.CompositeAnimation | null>(null);
@@ -90,7 +95,7 @@ export function AgentsDrawer({
       animRef.current.start();
       return () => animRef.current?.stop();
     }
-    if (!mounted) return () => animRef.current?.stop();
+    if (!mountedRef.current) return () => animRef.current?.stop();
     animRef.current = Animated.parallel([
       Animated.timing(translateX, {
         toValue: -panelWidth,
@@ -109,7 +114,7 @@ export function AgentsDrawer({
     return () => animRef.current?.stop();
     // panelWidth is derived from a one-shot Dimensions read and stable for the
     // life of the screen, so it doesn't belong in the dependency list.
-  }, [visible, translateX, opacity, mounted]);
+  }, [visible, translateX, opacity]);
 
   if (!mounted) return null;
 
