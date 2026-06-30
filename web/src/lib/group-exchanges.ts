@@ -7,19 +7,21 @@ export type ProcessStep =
   | { kind: "tool_call"; block: ToolCallBlock }
   | { kind: "narration"; block: AssistantTextBlock };
 
-// Render-time view of the chat block stream. In a completed exchange
-// (user_text → final non-streaming assistant_text), the tool calls AND
-// the per-iteration narration the model emitted between them collapse
-// into a single "tool_group" item, leaving only the final answer as a
-// standalone bubble; everything else passes through as the raw block.
-// In-flight exchanges keep their tool calls and narration inline so the
-// user sees progress as it streams.
+// Render-time view of the chat block stream. Whenever a turn makes tool
+// calls, those calls AND the per-iteration narration the model emitted
+// between them collapse into a single "tool_group" item — the narration
+// renders as "Thinking" rows alongside the tool-call rows — leaving only the
+// final answer as a standalone bubble. This holds while the turn is still
+// streaming and after it settles, so the process reads the same the whole way
+// through (no reflow when the turn finishes); the only difference is the
+// generated-files card, which waits until the turn is complete. A turn with no
+// tool calls passes its blocks through as raw bubbles.
 //
 // `isFinalAnswer` marks the one block that is the turn's closing answer —
-// only set on a standalone assistant_text that comes after the last tool
-// call (or the lone reply of a no-tool turn). A forwarded Topic turn's
-// per-iteration narration is NOT the final answer, so its "# topic"
-// deep-link chip is suppressed; only the final answer carries it.
+// only set on a standalone assistant_text that comes after the last tool call
+// (or the lone reply of a no-tool turn). A forwarded Topic turn's per-iteration
+// narration is NOT the final answer, so its "# topic" deep-link chip is
+// suppressed; only the final answer carries it.
 export type ChatRenderItem =
   | { kind: "block"; block: ChatBlock; isFinalAnswer?: boolean }
   | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[] }
@@ -67,14 +69,13 @@ export function groupExchanges(
 }
 
 function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminalTaskIds: ReadonlySet<string>) {
-  if (!isExchangeComplete(exchange, terminalTaskIds)) {
-    for (const b of exchange) items.push({ kind: "block", block: b });
-    return;
-  }
   const calls: ToolCallBlock[] = [];
   for (const b of exchange) {
     if (b.kind === "tool_call") calls.push(b);
   }
+  // No tool calls: a plain Q&A turn (or one just starting before its first tool
+  // call). Pass every block through as its own bubble — nothing to fold and no
+  // narration to demote.
   if (calls.length === 0) {
     // No tool calls: the final answer is the last assistant_text. Mark it so a
     // forwarded turn shows its "# topic" chip only on the closing reply.
@@ -90,12 +91,13 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
     }
     return;
   }
-  // The final answer is the LAST assistant_text in a completed exchange,
-  // but only when it comes AFTER the last tool call; every earlier
-  // assistant_text is pre-tool narration. A terminal run that stopped on a
-  // tool call (no closing answer) has its last assistant_text before that
-  // call, so finalAnswerIdx stays -1 and every narration folds into the
-  // collapsed group rather than rendering as a standalone bubble.
+  // The final answer is the LAST assistant_text, but only when it comes AFTER
+  // the last tool call; every earlier assistant_text is per-iteration narration
+  // that folds into the group as a "Thinking" row. A turn that stopped on a
+  // tool call (no closing answer — still streaming, or terminated there) has
+  // its last assistant_text before that call, so finalAnswerIdx stays -1 and
+  // every narration folds with no standalone bubble. Computed the same whether
+  // the turn is still in flight or already settled.
   let lastToolCallIdx = -1;
   for (let i = exchange.length - 1; i >= 0; i--) {
     if (exchange[i]!.kind === "tool_call") {
@@ -137,22 +139,25 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
     if (b.kind === "assistant_text" && i !== finalAnswerIdx) continue;
     items.push({ kind: "block", block: b, ...(i === finalAnswerIdx ? { isFinalAnswer: true } : {}) });
   }
-  // Group every successfully generated file into one always-visible card so
-  // the user can open them directly instead of digging through the collapsed
-  // tool group. Dedupe by path, keeping the last write's toolName. The card is
-  // pushed after the trailing blocks (assistant_text) so it renders below the
-  // agent's reply rather than above it.
-  const filesByPath = new Map<string, string>();
-  for (const call of calls) {
-    if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;
-    if (call.status !== "ok") continue;
-    const path = String(call.argsFull?.path ?? call.argsPreview ?? "").trim();
-    if (!path) continue;
-    filesByPath.set(path, call.toolName);
-  }
-  if (filesByPath.size > 0) {
-    const files = Array.from(filesByPath, ([path, toolName]) => ({ path, toolName }));
-    items.push({ kind: "file_artifact", id: `files-${calls[0]!.id}`, files });
+  // Once the turn settles, group every successfully generated file into one
+  // always-visible card so the user can open them directly instead of digging
+  // through the collapsed tool group. Dedupe by path, keeping the last write's
+  // toolName. The card is pushed after the trailing blocks (assistant_text) so
+  // it renders below the agent's reply rather than above it. Skipped while the
+  // turn is still in flight — a mid-stream write isn't a final artifact yet.
+  if (isExchangeComplete(exchange, terminalTaskIds)) {
+    const filesByPath = new Map<string, string>();
+    for (const call of calls) {
+      if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;
+      if (call.status !== "ok") continue;
+      const path = String(call.argsFull?.path ?? call.argsPreview ?? "").trim();
+      if (!path) continue;
+      filesByPath.set(path, call.toolName);
+    }
+    if (filesByPath.size > 0) {
+      const files = Array.from(filesByPath, ([path, toolName]) => ({ path, toolName }));
+      items.push({ kind: "file_artifact", id: `files-${calls[0]!.id}`, files });
+    }
   }
 }
 

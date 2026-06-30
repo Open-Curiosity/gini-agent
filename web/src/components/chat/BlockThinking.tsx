@@ -3,13 +3,15 @@
 import { useState } from "react";
 import { Brain } from "lucide-react";
 import type { AssistantTextBlock } from "@runtime/types";
-import { MarkdownContent } from "./MarkdownContent";
 
-// A single pre-tool narration step, rendered as a row that mirrors
-// BlockToolCall's layout: [icon 15px] [bold "Thinking"] [one-line preview].
-// Clicking the row reveals the full settled message below (indented to align
-// with the label, like the tool-call detail). Narration is always settled —
-// the streaming path never collapses — so there is no cursor.
+// A single per-iteration narration step, rendered to read exactly like a
+// BlockToolCall row: [icon 15px] [bold "Thinking" label] [brief content chip],
+// click to expand the full text in a content box — the same brief-then-more
+// affordance a tool call uses for its args preview + result. The chip and the
+// expanded box reuse BlockToolCall's chip / result-box styling so a Thinking
+// step is visually a peer of the tool calls in the collapsed group. Narration
+// is always settled (the streaming path never collapses to a step), so there
+// is no cursor.
 
 export function BlockThinking({ block }: { block: AssistantTextBlock }) {
   const [expanded, setExpanded] = useState(false);
@@ -24,16 +26,16 @@ export function BlockThinking({ block }: { block: AssistantTextBlock }) {
       >
         <Brain className="size-[15px] shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="shrink-0 text-[13px] font-semibold text-foreground">Thinking</span>
-        {!expanded && preview ? (
-          <span className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
+        {preview ? (
+          <span className="min-w-0 flex-1 truncate rounded-md bg-muted px-2 py-[3px] text-[12px] text-foreground">
             {preview}
           </span>
         ) : null}
       </button>
       {expanded ? (
-        <div className="ml-[23px] text-[13px] text-muted-foreground">
-          <MarkdownContent text={text} dropForeignImages />
-        </div>
+        <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-2.5 text-[12px] text-foreground">
+          {text}
+        </pre>
       ) : null}
     </div>
   );
