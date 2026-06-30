@@ -213,23 +213,24 @@ describe("parse + safety helpers", () => {
 });
 
 describe("detect — regimes", () => {
-  test("seeding drafts the newest pending inbound, baselines, records boundary seen", async () => {
+  test("seeding drafts the pending inbound head oldest-first, baselines at newest, records boundary seen", async () => {
     const spawn = stubSpawn(["m2", "m1"], {
       m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
       m2: { id: "m2", internalDate: "2000", from: "alice@x.com", subject: "b" }
     });
     const r = await detect({ query: "from:alice@x.com is:unread", state: null }, spawn, "me@example.com");
-    // The newest match is a non-self inbound => seed drafts THAT ONE message.
+    // Both head messages are non-self inbound => seed drafts BOTH, oldest-first.
     expect(r.kind).toBe("context");
-    expect(draftedIds(r.items)).toEqual(["m2"]);
+    expect(draftedIds(r.items)).toEqual(["m1", "m2"]);
+    // Baselined at the newest head id; only its boundary id is recorded (different
+    // seconds => no sibling).
     expect(r.state.cursor).toBe("2000");
-    // Only the newest boundary id is recorded (different seconds => no sibling).
     expect(r.state.seen).toEqual(["m2"]);
   });
 
-  test("seeding drafts ONLY the newest, not the older backlog; next tick does not re-draft", async () => {
-    // Three matching messages already in the inbox. Seed drafts ONLY the newest;
-    // the older two are never drafted (excluded by `after:` forever).
+  test("seeding drains the recent head oldest-first; older-than-head backlog excluded; next tick does not re-draft", async () => {
+    // Three matching messages already in the inbox, all within the cap. Seed drains
+    // the whole head oldest-first; the cursor baselines at the newest.
     const corpus: Meta[] = [
       { id: "s-new", internalDate: "1780000003000", from: "Alice <alice@x.com>", subject: "newest" },
       { id: "s-mid", internalDate: "1780000002000", from: "Alice <alice@x.com>", subject: "mid" },
@@ -238,39 +239,68 @@ describe("detect — regimes", () => {
     const spawn = afterHonoringSpawn(corpus);
     const seed = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
     expect(seed.kind).toBe("context");
-    // ONLY the newest is drafted — not the older backlog.
-    expect(draftedIds(seed.items)).toEqual(["s-new"]);
+    // The whole head is drafted, oldest-first.
+    expect(draftedIds(seed.items)).toEqual(["s-old", "s-mid", "s-new"]);
     expect(seed.state.cursor).toBe("1780000003000");
     expect(seed.state.seen).toEqual(["s-new"]);
 
-    // The next steady tick (with the seeded state) re-lists nothing newer => no
-    // re-draft of the seeded message.
+    // The next steady tick (with the seeded state) re-lists nothing newer than the
+    // baseline => no re-draft of any seeded message.
     const steady = await detect({ query: "from:alice@x.com", state: seed.state }, spawn, "me@example.com");
     expect(steady.kind).toBe("shortCircuit");
   });
 
-  test("seeding stays silent when the newest is self (nothing pending to answer)", async () => {
+  test("seeding stays silent when the head is only self (nothing pending to answer)", async () => {
     const spawn = stubSpawn(["m2", "m1"], {
-      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
+      m1: { id: "m1", internalDate: "1000", from: "me@example.com", subject: "earlier reply" },
       m2: { id: "m2", internalDate: "2000", from: "me@example.com", subject: "our reply" }
     });
     const r = await detect({ query: "from:alice@x.com is:unread", state: null }, spawn, "me@example.com");
-    // The newest is our OWN message => draft nothing, baseline silently.
+    // Every head message is our OWN => draft nothing, baseline silently.
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
     expect(r.state.cursor).toBe("2000");
     expect(r.state.seen).toEqual(["m2"]);
   });
 
-  test("seeding stays silent when the newest is an automated sender", async () => {
+  test("seeding with a self newest still drafts an older non-self inbound in the head", async () => {
     const spawn = stubSpawn(["m2", "m1"], {
-      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
-      m2: { id: "m2", internalDate: "2000", from: "no-reply@service.com", subject: "auto" }
+      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "their pending question" },
+      m2: { id: "m2", internalDate: "2000", from: "me@example.com", subject: "our reply" }
+    });
+    const r = await detect({ query: "from:alice@x.com is:unread", state: null }, spawn, "me@example.com");
+    // The self newest is dropped but still advances the baseline; the older non-self
+    // inbound in the head is drafted.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m1"]);
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("seeding stays silent when the head is only an automated sender", async () => {
+    const spawn = stubSpawn(["m2", "m1"], {
+      m1: { id: "m1", internalDate: "1000", from: "no-reply@service.com", subject: "auto a" },
+      m2: { id: "m2", internalDate: "2000", from: "no-reply@service.com", subject: "auto b" }
     });
     const r = await detect({ query: "is:unread", state: null }, spawn, "me@example.com");
-    // The newest is automated (the steady drop filter rejects it) => silent seed.
+    // Every head message is automated (the steady drop filter rejects it) => silent.
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("seeding with an automated newest still drafts the older real mail in the head", async () => {
+    // The exact real-world bug: the newest matching email is an automated notice,
+    // and the real pending inbound sits just below it in the head. The automated
+    // newest is dropped but advances the baseline; the older real mail drafts.
+    const spawn = stubSpawn(["m2", "m1"], {
+      m1: { id: "m1", internalDate: "1000", from: "Investor <vc@fund.com>", subject: "Coffee chat?" },
+      m2: { id: "m2", internalDate: "2000", from: "workspace-noreply@google.com", subject: "security notice" }
+    });
+    const r = await detect({ query: "in:inbox", state: null }, spawn, "me@example.com");
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m1"]);
     expect(r.state.cursor).toBe("2000");
     expect(r.state.seen).toEqual(["m2"]);
   });
@@ -280,14 +310,11 @@ describe("detect — regimes", () => {
     const fullBody = "The full pending email body the drafting turn replies to.";
     const spawn: GwsSpawn = async (args) => {
       const joined = args.join(" ");
-      if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      if (joined.includes("messages list")) return listResponse(["m2"]);
       if (joined.includes("messages get") && joined.includes('"format":"full"')) {
         return PREAMBLE + JSON.stringify({ id: "m2", payload: { mimeType: "text/plain", body: { data: Buffer.from(fullBody, "utf8").toString("base64url") } } });
       }
-      if (joined.includes("messages get")) {
-        const id = getArgId(joined)!;
-        return id === "m2" ? metadataResponse(meta) : metadataResponse({ id, internalDate: "1000", from: "alice@x.com" });
-      }
+      if (joined.includes("messages get")) return metadataResponse(meta);
       return PREAMBLE + "{}";
     };
     const r = await detect(
@@ -302,35 +329,49 @@ describe("detect — regimes", () => {
     expect(trusted[0]!.text).toBe("Objective for this watch (alice@x.com): Get a refund");
   });
 
-  test("seeding on a truncated window baselines + drafts the newest without enumerating", async () => {
-    const newest = "huge-newest";
+  test("seeding on a truncated window drains the head and baselines at newest, never the un-listed tail", async () => {
+    // The window is truncated (pageLimitHit), but seeding ignores truncation: it
+    // walks only the newest head (up to the cap), never the older un-listed tail.
+    // Build the head with distinct, decreasing timestamps so the drain order and
+    // the baseline are unambiguous; an extra page-tail sits below the head.
+    const head = Array.from({ length: 25 }, (_, i) => `h${i}`); // h0 newest .. h24
+    const tail = Array.from({ length: 20 }, (_, i) => `t${i}`); // below the head
+    const dateOf = (id: string): string => {
+      const hi = head.indexOf(id);
+      if (hi >= 0) return String(9000 - hi); // h0=9000 .. h24=8976
+      return "1000"; // tail timestamps far below the head
+    };
     let metaGets = 0;
     const spawn: GwsSpawn = async (args) => {
       const joined = args.join(" ");
       if (joined.includes("messages list")) {
-        const tail = Array.from({ length: 40 }, (_, i) => [`old-${i}`]);
-        return pagedListResponse([[newest], ...tail], true);
+        // 10 pages of the head + tail, last page carries a token (truncated).
+        const all = [...head, ...tail];
+        const per = Math.ceil(all.length / 10);
+        const pages = Array.from({ length: 10 }, (_, i) => all.slice(i * per, (i + 1) * per));
+        return pagedListResponse(pages, true);
       }
       if (joined.includes("messages get") && joined.includes('"format":"full"')) {
-        return PREAMBLE + JSON.stringify({ id: newest, payload: { mimeType: "text/plain", body: { data: Buffer.from("body", "utf8").toString("base64url") } } });
+        const id = getArgId(joined)!;
+        return PREAMBLE + JSON.stringify({ id, payload: { mimeType: "text/plain", body: { data: Buffer.from("body", "utf8").toString("base64url") } } });
       }
       if (joined.includes("messages get")) {
         metaGets += 1;
         const id = getArgId(joined)!;
-        return metadataResponse({ id, internalDate: id === newest ? "8000" : "7000", from: "alice@x.com" });
+        return metadataResponse({ id, internalDate: dateOf(id), from: "alice@x.com" });
       }
       return PREAMBLE + "{}";
     };
     const r = await detect({ query: "is:unread", state: null }, spawn, "me@example.com");
-    // Seeding runs BEFORE the truncated regime: the newest is a pending inbound,
-    // so it's drafted and the older backlog tail is never walked.
     expect(r.kind).toBe("context");
-    expect(draftedIds(r.items)).toEqual([newest]);
-    // Newest + one older-tail metadata probe (different second) — bounded, not a
-    // full enumeration of the truncated window.
-    expect(metaGets).toBe(2);
-    expect(r.state.cursor).toBe("8000");
-    expect(r.state.seen).toEqual([newest]);
+    // The whole head (25 non-self) drafts, oldest-first; the cursor baselines at
+    // the newest head id and the older un-listed tail is never drafted.
+    expect(matchCount(r.items)).toBe(25);
+    expect(draftedIds(r.items)).toEqual(head.slice().reverse());
+    expect(r.state.cursor).toBe("9000");
+    expect(r.state.seen).toEqual(["h0"]);
+    // Only the head (+ a boundary probe) is walked — never the full window.
+    expect(metaGets).toBeLessThan(head.length + tail.length);
   });
 
   test("seeding records same-second siblings so the inclusive after: does not re-draft them", async () => {
@@ -360,10 +401,12 @@ describe("detect — regimes", () => {
     };
 
     const seed = await detect({ query: "is:unread", state: null }, inclusiveAfter, "me@example.com");
-    // The newest (s-new) is a non-self inbound => drafted; the same-second sibling
-    // s-sib is seen-only (only the single newest is ever drafted on seed).
+    // All three are non-self inbound in the head => all drafted oldest-first. Both
+    // same-second boundary ids (s-new + its sibling s-sib) ride forward in `seen`,
+    // with the cursor at their shared second, so the inclusive `after:` next tick
+    // re-lists them but they're skipped.
     expect(seed.kind).toBe("context");
-    expect(draftedIds(seed.items)).toEqual(["s-new"]);
+    expect(draftedIds(seed.items)).toEqual(["s-old", "s-sib", "s-new"]);
     expect(seed.state.cursor).toBe("1780000000900");
     expect(new Set(seed.state.seen)).toEqual(new Set(["s-new", "s-sib"]));
 
@@ -373,6 +416,35 @@ describe("detect — regimes", () => {
       inclusiveAfter,
       "me@example.com"
     );
+    expect(steady.kind).toBe("shortCircuit");
+  });
+
+  test("seeding a head LARGER than the cap drafts only the newest cap; the rest are excluded; next tick does not re-draft", async () => {
+    // 30 matching messages already in the inbox, more than MAX_MESSAGES_PER_TICK
+    // (25). Seeding considers only the newest 25 head ids, drafts them oldest-first,
+    // and baselines at the newest; the 5 oldest are below the head and excluded by
+    // `after:` forever.
+    const ids = Array.from({ length: 30 }, (_, i) => `g${i}`);
+    const corpus: Meta[] = ids.map((id, i) => ({
+      id,
+      internalDate: String(11_000_000 + i * 1000), // g0 oldest .. g29 newest
+      from: "Alice <alice@x.com>",
+      subject: `m${i}`
+    }));
+    const spawn = afterHonoringSpawn(corpus);
+    const seed = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
+    expect(seed.kind).toBe("context");
+    // Only the newest 25 (g5..g29) are drafted, oldest-first; the 5 oldest are NOT.
+    const newest25 = ids.slice(5); // g5 .. g29
+    expect(matchCount(seed.items)).toBe(25);
+    expect(draftedIds(seed.items)).toEqual(newest25);
+    for (const old of ids.slice(0, 5)) expect(draftedIds(seed.items)).not.toContain(old);
+    expect(seed.state.cursor).toBe(String(11_000_000 + 29 * 1000));
+    expect(seed.state.seen).toEqual(["g29"]);
+
+    // Next tick (with the seeded state): `after:` excludes everything at/below the
+    // baseline => no re-draft of the head or the excluded tail.
+    const steady = await detect({ query: "from:alice@x.com", state: seed.state }, spawn, "me@example.com");
     expect(steady.kind).toBe("shortCircuit");
   });
 
@@ -682,7 +754,7 @@ describe("detect — body in matched items", () => {
     expect(body.length).toBe(4000 + "…[truncated]".length);
   });
 
-  test("a silent seed (newest is self) does NOT fetch a body (no format=full get)", async () => {
+  test("a silent seed (head is only self) does NOT fetch a body (no format=full get)", async () => {
     let fullGets = 0;
     const spawn: GwsSpawn = async (args) => {
       const joined = args.join(" ");
@@ -693,13 +765,13 @@ describe("detect — body in matched items", () => {
       }
       if (joined.includes("messages get")) {
         const id = getArgId(joined)!;
-        // Newest is our OWN message => silent seed, no body fetch.
-        return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: id === "m2" ? "me@example.com" : "alice@x.com" });
+        // Every head message is our OWN => silent seed, no body fetch.
+        return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: "me@example.com" });
       }
       return PREAMBLE + "{}";
     };
     const r = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
-    expect(r.kind).toBe("shortCircuit"); // silent seed (self newest), drafts nothing
+    expect(r.kind).toBe("shortCircuit"); // silent seed (self-only head), drafts nothing
     expect(fullGets).toBe(0);
   });
 
@@ -1214,7 +1286,7 @@ describe("run — health in state", () => {
       if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
       if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
       if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
-      // Newest is our own message => a silent seed (drafts nothing).
+      // Every head message is our own => a silent seed (drafts nothing).
       if (joined.includes("messages get")) {
         const id = getArgId(joined)!;
         return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: "me@example.com" });
@@ -1222,7 +1294,7 @@ describe("run — health in state", () => {
       return PREAMBLE + "{}";
     };
     const r = await run({ query: "is:unread", state: null }, healthy);
-    expect(r.kind).toBe("shortCircuit"); // silent seed (self newest)
+    expect(r.kind).toBe("shortCircuit"); // silent seed (self-only head)
     expect(r.state.status).toBe("ok");
     expect(r.state.lastError).toBeUndefined();
   });
