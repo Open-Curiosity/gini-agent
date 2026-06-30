@@ -13,12 +13,13 @@ import { useSentDraftIds } from "@/components/chat/SentDraftsContext";
 // (To/Cc/Bcc/From/Subject, case-insensitive) up to the first blank line, then
 // the body. Two extra metadata header lines — DraftId and Account — carry the
 // saved gws draft id and the account it was saved under; they are EXTRACTED
-// (never rendered as recipient rows). When a DraftId is present the card shows a
-// Send button that sends the SAVED draft directly server-side (POST
-// /api/email/drafts/send) with no agent turn. Whether the draft was already
-// sent comes from the SentDraftsContext (primed eagerly by ChatSurface), so the
-// "Sent" state persists across a page refresh with no "Send" flash. With no
-// DraftId the card stays read-only (doc viewer / file preview / skills page).
+// (never rendered as recipient rows). The card ALWAYS shows a Send button that
+// sends the SAVED draft directly server-side (POST /api/email/drafts/send) with
+// no agent turn — every emitter (the interactive Gmail flow and the email-watch
+// worker) saves a real Gmail draft and tags the fence with its DraftId. Whether
+// the draft was already sent comes from the SentDraftsContext (primed eagerly by
+// ChatSurface), so the "Sent" state persists across a page refresh with no
+// "Send" flash.
 
 const HEADER_KEYS = ["to", "cc", "bcc", "from", "subject"] as const;
 type HeaderKey = (typeof HEADER_KEYS)[number];
@@ -179,31 +180,29 @@ export function EmailDraftCard({ raw }: { raw: string }) {
           {body}
         </div>
       </div>
-      {draftId ? (
-        <div className="flex items-center justify-end gap-2 border-t px-3 py-2">
-          {displayState === "error" && sendError ? (
-            <span className="mr-auto min-w-0 break-words text-[12px] text-destructive">{sendError}</span>
-          ) : null}
-          <button
-            type="button"
-            onClick={onSend}
-            disabled={displayState === "sending" || displayState === "sent" || displayState === "checking"}
-            aria-label={displayState === "checking" ? "Checking draft status" : undefined}
-            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[13px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
-          >
-            {displayState === "checking" ? (
-              // Context not yet settled: a disabled spinner, never the active
-              // "Send" text — so a sent draft can't flash "Send" before "Sent".
-              <Loader2 className="size-[14px] animate-spin" aria-hidden="true" />
-            ) : (
-              <>
-                <Send className="size-[14px]" aria-hidden="true" />
-                {sendLabel}
-              </>
-            )}
-          </button>
-        </div>
-      ) : null}
+      <div className="flex items-center justify-end gap-2 border-t px-3 py-2">
+        {displayState === "error" && sendError ? (
+          <span className="mr-auto min-w-0 break-words text-[12px] text-destructive">{sendError}</span>
+        ) : null}
+        <button
+          type="button"
+          onClick={onSend}
+          disabled={displayState === "sending" || displayState === "sent" || displayState === "checking"}
+          aria-label={displayState === "checking" ? "Checking draft status" : undefined}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[13px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
+        >
+          {displayState === "checking" ? (
+            // Context not yet settled: a disabled spinner, never the active
+            // "Send" text — so a sent draft can't flash "Send" before "Sent".
+            <Loader2 className="size-[14px] animate-spin" aria-hidden="true" />
+          ) : (
+            <>
+              <Send className="size-[14px]" aria-hidden="true" />
+              {sendLabel}
+            </>
+          )}
+        </button>
+      </div>
     </div>
   );
 }
