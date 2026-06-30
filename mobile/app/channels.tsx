@@ -8,116 +8,69 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View
 } from "react-native";
-import ReanimatedSwipeable from "react-native-gesture-handler/ReanimatedSwipeable";
-import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { clearCredentials } from "@/src/auth";
 import { consumeLaunchNotificationRoute } from "@/src/push";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
+import { AgentsDrawer } from "@/src/components/AgentsDrawer";
 import { NewAgentSheet } from "@/src/components/NewAgentSheet";
-import { chatListTime, jobCadence } from "@/src/format";
+import { chatListTime } from "@/src/format";
 import {
+  useAgentChat,
   useAgents,
   useArchiveAgent,
-  useChannels,
   useCreateAgent,
-  useJobs,
   useTopics,
   useUnarchiveAgent,
-  useUnreadCounts
+  useUnreadCounts,
+  useUseAgent
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
-import type { AgentRecord, ChatSession, JobRecord } from "@/src/types";
+import type { AgentRecord, ChatSession } from "@/src/types";
 
-// Channels — the redesigned home. Three sections: "Agents" (each agent is
-// a DM with its single canonical chat), "Topics" (the active agent's
-// subject-scoped side-conversations), and "Recurring Jobs" (channels =
-// job-derived sessions). Tapping an agent resolves its one chat and pushes
-// into the chat detail; tapping a topic or channel pushes directly into that
-// session.
+// Home — scoped to a single active agent, mirroring the web sidebar's
+// one-agent-per-panel model and the Pencil "Mobile — Chat (New Model)" frame.
+// The header is the agent switcher (tap opens the slide-out Agents Drawer);
+// below it sit the active agent's "Messages" (its one canonical chat) and
+// "Topics" (its subject-scoped side-conversations). Recurring jobs are no
+// longer a top-level concept here — they surface as Topics.
 export default function ChannelsScreen() {
   const agents = useAgents();
-  const channels = useChannels();
-  const jobs = useJobs("all");
   const createAgent = useCreateAgent();
+  const useAgentMutation = useUseAgent();
   const archiveMutation = useArchiveAgent();
   const unarchiveMutation = useUnarchiveAgent();
   const unreadCountsQuery = useUnreadCounts();
   const unreadCounts = unreadCountsQuery.data ?? {};
-  // Topics belong to the active agent (the runtime scopes new topics to it),
-  // so the Topics section lists that agent's `kind:"topic"` sessions.
-  const topics = useTopics(agents.data?.activeAgentId ?? null);
-  const topicList = topics.data ?? [];
-
-  // Index jobs by their delivery channel so each channel row can show the
-  // job's schedule + next-run (the design's "Every day · 9:00 AM" / "2h").
-  const jobBySessionId = useMemo(() => {
-    const map = new Map<string, JobRecord>();
-    for (const job of jobs.data ?? []) {
-      if (job.chatSessionId) map.set(job.chatSessionId, job);
-    }
-    return map;
-  }, [jobs.data]);
-
-  const [query, setQuery] = useState("");
-  const [createOpen, setCreateOpen] = useState(false);
-  const [newAgentName, setNewAgentName] = useState("");
-  const [newAgentError, setNewAgentError] = useState<string | null>(null);
-  // Resolving an agent's canonical chat is a network hop; track which
-  // agent row is mid-resolve so its tap shows a spinner instead of a
-  // dead press. The ref is the actual re-entrancy guard — state alone
-  // would re-create openAgent and weaken a synchronous double-tap.
-  const [openingAgentId, setOpeningAgentId] = useState<string | null>(null);
-  const openingRef = useRef(false);
-  // Each home section collapses independently. Agents and Recurring Jobs
-  // open by default (the primary content); Archived stays closed — it's a
-  // tucked-away dropdown beneath the active agent list.
-  const [agentsCollapsed, setAgentsCollapsed] = useState(false);
-  const [topicsCollapsed, setTopicsCollapsed] = useState(false);
-  const [jobsCollapsed, setJobsCollapsed] = useState(false);
-  const [archivedCollapsed, setArchivedCollapsed] = useState(true);
-
-  // Cold-start launch-tap recovery. If a notification tap launched the app
-  // from a killed state, iOS doesn't replay it through the response
-  // listener; consume the stored launch response here (the authed landing
-  // screen) and push the named chat on top of this list, so the tap lands on
-  // the right conversation with a natural channels → chat back stack.
-  //
-  // We run this from channels rather than the index gate because the gate
-  // (app/index.tsx) only checks credential PRESENCE, not validity — it
-  // routes a missing credential to /setup but lets a stale/expired one
-  // through. A dead token here pushes the chat optimistically (same as
-  // tapping any agent/channel row, which also pushes before validating),
-  // then the chat screen's own 401 handler clears the token and redirects to
-  // /setup; the next cold start then skips straight to /setup. So the worst
-  // case is a brief loading frame, never a wrong landing.
-  useEffect(() => {
-    consumeLaunchNotificationRoute();
-  }, []);
-
-  const unauthorized =
-    agents.error instanceof ApiError && agents.error.status === 401;
-  useEffect(() => {
-    if (!unauthorized) return;
-    // A 401 means the stored token is dead (revoked/expired). Drop it before
-    // redirecting so the next cold start goes straight to /setup instead of
-    // optimistically routing here, 401-ing, and bouncing — the cold-start flash.
-    void clearCredentials();
-    router.replace("/setup");
-  }, [unauthorized]);
 
   const agentList = useMemo<AgentRecord[]>(() => agents.data?.agents ?? [], [agents.data]);
-  const channelList = channels.data ?? [];
+  const activeAgentId = agents.data?.activeAgentId;
   const defaultAgentId = agents.data?.defaultAgentId;
 
-  // `archivedAt` is a soft-delete marker orthogonal to `status`. Archived
-  // agents leave the main "Agents" list and render in their own section, so
-  // the main list and its search filter operate on the active set only.
+  // The active agent drives the whole screen. Fall back to the default (then
+  // the first agent) so the header and Messages row still render during the
+  // brief window before the runtime reports a selection.
+  const activeAgent = useMemo<AgentRecord | undefined>(
+    () =>
+      agentList.find((a) => a.id === activeAgentId) ??
+      agentList.find((a) => a.id === defaultAgentId) ??
+      agentList[0],
+    [agentList, activeAgentId, defaultAgentId]
+  );
+
+  // The active agent's single canonical chat (the "Messages" row). The
+  // resolver is idempotent server-side; the cached session feeds the row's
+  // preview / unread, and the tap re-resolves to be safe on first paint.
+  const activeChat = useAgentChat(activeAgent?.id ?? null);
+  const topics = useTopics(activeAgent?.id ?? null);
+  const topicList = topics.data ?? [];
+
+  // `archivedAt` is a soft-delete marker orthogonal to `status`. The drawer
+  // lists active agents and tucks archived ones into their own subsection.
   const activeAgents = useMemo(
     () => agentList.filter((a) => !a.archivedAt),
     [agentList]
@@ -127,15 +80,65 @@ export default function ChannelsScreen() {
     [agentList]
   );
 
-  const filteredAgents = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return activeAgents;
-    return activeAgents.filter((a) => a.name.toLowerCase().includes(q));
-  }, [activeAgents, query]);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newAgentName, setNewAgentName] = useState("");
+  const [newAgentError, setNewAgentError] = useState<string | null>(null);
+  // Opening the canonical chat is a network hop; track the in-flight state so
+  // the Messages row shows a spinner instead of a dead press. The ref is the
+  // real re-entrancy guard — state alone would weaken a synchronous double-tap.
+  const [opening, setOpening] = useState(false);
+  const openingRef = useRef(false);
 
-  // Confirm before archiving — it stops the agent and moves it out of the
-  // main list. The default agent never reaches here (its row is unswipeable),
-  // matching the server guard that refuses to archive it.
+  // Cold-start launch-tap recovery. If a notification tap launched the app
+  // from a killed state, iOS doesn't replay it through the response listener;
+  // consume the stored launch response here and push the named chat on top of
+  // this list. (See the longer note in git history — unchanged from the prior
+  // home screen.)
+  useEffect(() => {
+    consumeLaunchNotificationRoute();
+  }, []);
+
+  const unauthorized =
+    agents.error instanceof ApiError && agents.error.status === 401;
+  useEffect(() => {
+    if (!unauthorized) return;
+    // A 401 means the stored token is dead (revoked/expired). Drop it before
+    // redirecting so the next cold start goes straight to /setup.
+    void clearCredentials();
+    router.replace("/setup");
+  }, [unauthorized]);
+
+  // Open the active agent's canonical chat. Resolve the session id directly
+  // (idempotent) so the push targets the right route even on the first tap.
+  const openActiveChat = useCallback(async () => {
+    const agentId = activeAgent?.id;
+    if (!agentId || openingRef.current) return;
+    openingRef.current = true;
+    setOpening(true);
+    try {
+      const session = await api<ChatSession>(`/agents/${agentId}/chat`);
+      router.push(`/chat/${session.id}`);
+    } catch {
+      // A failed resolve is rare (agent just deleted on another device);
+      // leave the user on the list rather than pushing a dead route.
+    } finally {
+      openingRef.current = false;
+      setOpening(false);
+    }
+  }, [activeAgent?.id]);
+
+  const selectAgent = useCallback(
+    (agent: AgentRecord) => {
+      setDrawerOpen(false);
+      if (agent.id !== activeAgentId) useAgentMutation.mutate(agent.id);
+    },
+    [activeAgentId, useAgentMutation]
+  );
+
+  // Confirm before archiving — it stops the agent and removes it from the
+  // active list. The default agent never reaches here (the drawer renders it
+  // as a plain row), matching the server guard that refuses to archive it.
   const confirmArchive = useCallback(
     (agent: AgentRecord) => {
       Alert.alert(
@@ -168,25 +171,6 @@ export default function ChannelsScreen() {
     [unarchiveMutation]
   );
 
-  // Open an agent's single chat. The resolver is idempotent server-side;
-  // we fetch the session id directly here (rather than via the cached
-  // hook) so the push targets the right route even on the first tap.
-  const openAgent = useCallback(async (agent: AgentRecord) => {
-    if (openingRef.current) return;
-    openingRef.current = true;
-    setOpeningAgentId(agent.id);
-    try {
-      const session = await api<ChatSession>(`/agents/${agent.id}/chat`);
-      router.push(`/chat/${session.id}`);
-    } catch {
-      // A failed resolve is rare (agent just deleted on another device);
-      // leave the user on the list rather than pushing a dead route.
-    } finally {
-      openingRef.current = false;
-      setOpeningAgentId(null);
-    }
-  }, []);
-
   const onSubmitNewAgent = useCallback(() => {
     const trimmed = newAgentName.trim();
     if (!trimmed) return;
@@ -202,50 +186,35 @@ export default function ChannelsScreen() {
 
   if (unauthorized) return null;
 
-  const refreshing =
-    (agents.isFetching && agentList.length > 0) ||
-    (channels.isFetching && channelList.length > 0);
+  const refreshing = agents.isFetching && agentList.length > 0;
+  const activeName = activeAgent?.name ?? "Gini";
+  const online = activeAgent?.status === "ready" || activeAgent?.status === "active";
+  const chatSession = activeChat.data;
+  const messagesUnread = chatSession ? unreadCounts[chatSession.id] ?? 0 : 0;
+  const messagesPreview =
+    chatSession?.lastMessagePreview?.trim() ||
+    chatSession?.summary?.trim() ||
+    "No messages yet";
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      {/* Header — brand title left, compose icon right. */}
+      {/* Header — the agent switcher. Tapping opens the Agents Drawer. */}
       <View style={styles.header}>
-        <Text style={styles.brand}>Gini</Text>
-        <View style={styles.headerActions}>
-          <TouchableOpacity
-            onPress={() => {
-              setNewAgentError(null);
-              setNewAgentName("");
-              setCreateOpen(true);
-            }}
-            hitSlop={8}
-            style={styles.headerIconButton}
-            accessibilityRole="button"
-            accessibilityLabel="New agent"
-          >
-            <Feather name="edit" size={20} color={theme.text} />
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <View style={styles.searchWrap}>
-        <View style={styles.searchPill}>
-          <Feather name="search" size={16} color={theme.placeholder} />
-          <TextInput
-            value={query}
-            onChangeText={setQuery}
-            placeholder="Search agents"
-            placeholderTextColor={theme.placeholder}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-            clearButtonMode="while-editing"
-            style={styles.searchInput}
-            accessibilityLabel="Search agents"
-          />
-        </View>
+        <TouchableOpacity
+          onPress={() => setDrawerOpen(true)}
+          activeOpacity={0.7}
+          style={styles.switcher}
+          accessibilityRole="button"
+          accessibilityLabel="Switch agent"
+        >
+          <AgentAvatar name={activeName} size={34} online={online} />
+          <Text style={styles.switcherName} numberOfLines={1}>
+            {activeName}
+          </Text>
+          <Feather name="chevron-down" size={18} color={theme.muted} />
+        </TouchableOpacity>
       </View>
 
       {agents.isLoading && agentList.length === 0 ? (
@@ -254,10 +223,8 @@ export default function ChannelsScreen() {
         </View>
       ) : agents.isError && agentList.length === 0 ? (
         // Only commandeer the screen with the error + Retry when there's
-        // nothing cached to show. A background poll failure (the 30s
-        // refetch) with a populated list keeps rendering the cached agents
-        // and chats — the next poll or a pull-to-refresh recovers quietly —
-        // rather than blowing a usable list away with a full-screen error.
+        // nothing cached to show. A background poll failure with a populated
+        // list keeps rendering — the next poll or a pull-to-refresh recovers.
         <View style={styles.center}>
           <Text style={styles.error}>
             {agents.error instanceof Error ? agents.error.message : "Failed to load agents"}
@@ -275,176 +242,78 @@ export default function ChannelsScreen() {
               refreshing={refreshing}
               onRefresh={() => {
                 agents.refetch();
-                channels.refetch();
+                activeChat.refetch();
                 topics.refetch();
               }}
               tintColor={theme.muted}
             />
           }
         >
-          {/* Agents section — collapsible. Active agents render here; the
-              Archived dropdown nests beneath them. */}
+          {/* Messages — the active agent's one canonical chat. */}
           <TouchableOpacity
-            style={styles.sectionHeader}
-            onPress={() => setAgentsCollapsed((v) => !v)}
-            activeOpacity={0.6}
+            onPress={() => void openActiveChat()}
+            activeOpacity={0.7}
+            style={styles.messagesRow}
             accessibilityRole="button"
-            accessibilityLabel={agentsCollapsed ? "Expand agents" : "Collapse agents"}
+            accessibilityLabel={`Open ${activeName} messages`}
           >
-            <View style={styles.sectionHeaderLeft}>
-              <Feather
-                name={agentsCollapsed ? "chevron-right" : "chevron-down"}
-                size={16}
-                color="#8A8A90"
-              />
-              <Text style={styles.sectionLabel}>Agents</Text>
-            </View>
-            <Text style={styles.sectionCount}>{filteredAgents.length}</Text>
-          </TouchableOpacity>
-          {!agentsCollapsed ? (
-            <>
-              {filteredAgents.length === 0 ? (
-                <Text style={styles.emptySub}>
-                  {query.trim() ? `No agents match “${query}”` : "No agents yet"}
+            <AgentAvatar name={activeName} size={48} online={online} />
+            <View style={styles.messagesBody}>
+              <View style={styles.messagesTop}>
+                <Text style={styles.messagesTitle} numberOfLines={1}>
+                  Messages
                 </Text>
-              ) : (
-                filteredAgents.map((agent) =>
-                  // The default agent can't be archived server-side, so it renders
-                  // as a plain row — offering a guaranteed-fail swipe would be a
-                  // dead affordance.
-                  agent.id === defaultAgentId ? (
-                    <AgentRow
-                      key={agent.id}
-                      agent={agent}
-                      opening={openingAgentId === agent.id}
-                      onPress={() => void openAgent(agent)}
-                    />
-                  ) : (
-                    <SwipeableAgentRow
-                      key={agent.id}
-                      agent={agent}
-                      opening={openingAgentId === agent.id}
-                      onPress={() => void openAgent(agent)}
-                      onArchive={confirmArchive}
-                    />
-                  )
-                )
-              )}
+                {opening ? (
+                  <ActivityIndicator size="small" color={theme.muted} />
+                ) : null}
+              </View>
+              <Text style={styles.messagesPreview} numberOfLines={1}>
+                {messagesPreview}
+              </Text>
+            </View>
+            {messagesUnread > 0 ? (
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>
+                  {messagesUnread > 99 ? "99+" : messagesUnread}
+                </Text>
+              </View>
+            ) : null}
+          </TouchableOpacity>
 
-              {/* Archived dropdown — soft-deleted agents, tucked under the
-                  active list and collapsed by default. Rendered only when at
-                  least one agent is archived. */}
-              {archivedAgents.length > 0 ? (
-                <>
-                  <TouchableOpacity
-                    style={[styles.sectionHeader, styles.archivedHeader]}
-                    onPress={() => setArchivedCollapsed((v) => !v)}
-                    activeOpacity={0.6}
-                    accessibilityRole="button"
-                    accessibilityLabel={
-                      archivedCollapsed ? "Expand archived" : "Collapse archived"
-                    }
-                  >
-                    <View style={styles.sectionHeaderLeft}>
-                      <Feather
-                        name={archivedCollapsed ? "chevron-right" : "chevron-down"}
-                        size={14}
-                        color="#8A8A90"
-                      />
-                      <Text style={styles.archivedLabel}>Archived</Text>
-                    </View>
-                    <Text style={styles.sectionCount}>{archivedAgents.length}</Text>
-                  </TouchableOpacity>
-                  {!archivedCollapsed
-                    ? archivedAgents.map((agent) => (
-                        <ArchivedAgentRow
-                          key={agent.id}
-                          agent={agent}
-                          restoring={
-                            unarchiveMutation.isPending &&
-                            unarchiveMutation.variables === agent.id
-                          }
-                          onRestore={() => restoreAgent(agent)}
-                        />
-                      ))
-                    : null}
-                </>
-              ) : null}
-            </>
-          ) : null}
-
-          {/* Topics section — the active agent's subject-scoped
-              side-conversations, collapsible and ordered most-recent first.
-              Each row reads as `#<title>` and opens the topic's chat detail. */}
+          {/* Topics — the active agent's subject-scoped side-conversations. */}
           {topicList.length > 0 ? (
             <>
-              <TouchableOpacity
-                style={[styles.sectionHeader, styles.jobsHeader]}
-                onPress={() => setTopicsCollapsed((v) => !v)}
-                activeOpacity={0.6}
-                accessibilityRole="button"
-                accessibilityLabel={
-                  topicsCollapsed ? "Expand topics" : "Collapse topics"
-                }
-              >
-                <View style={styles.sectionHeaderLeft}>
-                  <Feather
-                    name={topicsCollapsed ? "chevron-right" : "chevron-down"}
-                    size={14}
-                    color="#8A8A90"
-                  />
-                  <Text style={styles.sectionLabel}>Topics</Text>
-                </View>
-                <Text style={styles.sectionCount}>{topicList.length}</Text>
-              </TouchableOpacity>
-              {!topicsCollapsed
-                ? topicList.map((topic) => (
-                    <TopicRow
-                      key={topic.id}
-                      topic={topic}
-                      unreadCount={unreadCounts[topic.id] ?? 0}
-                    />
-                  ))
-                : null}
-            </>
-          ) : null}
-
-          {/* Recurring Jobs section — collapsible channels. */}
-          {channelList.length > 0 ? (
-            <>
-              <TouchableOpacity
-                style={[styles.sectionHeader, styles.jobsHeader]}
-                onPress={() => setJobsCollapsed((v) => !v)}
-                activeOpacity={0.6}
-                accessibilityRole="button"
-                accessibilityLabel={
-                  jobsCollapsed ? "Expand recurring jobs" : "Collapse recurring jobs"
-                }
-              >
-                <View style={styles.sectionHeaderLeft}>
-                  <Feather
-                    name={jobsCollapsed ? "chevron-right" : "chevron-down"}
-                    size={14}
-                    color="#8A8A90"
-                  />
-                  <Text style={styles.sectionLabel}>Recurring Jobs</Text>
-                </View>
-                <Text style={styles.sectionCount}>{channelList.length}</Text>
-              </TouchableOpacity>
-              {!jobsCollapsed
-                ? channelList.map((channel) => (
-                    <ChannelRow
-                      key={channel.id}
-                      channel={channel}
-                      job={jobBySessionId.get(channel.id)}
-                      unreadCount={unreadCounts[channel.id] ?? 0}
-                    />
-                  ))
-                : null}
+              <Text style={styles.sectionLabel}>Topics</Text>
+              {topicList.map((topic) => (
+                <TopicRow
+                  key={topic.id}
+                  topic={topic}
+                  unreadCount={unreadCounts[topic.id] ?? 0}
+                />
+              ))}
             </>
           ) : null}
         </ScrollView>
       )}
+
+      <AgentsDrawer
+        visible={drawerOpen}
+        agents={activeAgents}
+        archivedAgents={archivedAgents}
+        activeAgentId={activeAgentId}
+        defaultAgentId={defaultAgentId}
+        restoringId={unarchiveMutation.isPending ? unarchiveMutation.variables : null}
+        onSelect={selectAgent}
+        onArchive={confirmArchive}
+        onRestore={restoreAgent}
+        onNewAgent={() => {
+          setDrawerOpen(false);
+          setNewAgentError(null);
+          setNewAgentName("");
+          setCreateOpen(true);
+        }}
+        onClose={() => setDrawerOpen(false)}
+      />
 
       <NewAgentSheet
         visible={createOpen}
@@ -459,187 +328,8 @@ export default function ChannelsScreen() {
   );
 }
 
-function AgentRow({
-  agent,
-  opening,
-  onPress
-}: {
-  agent: AgentRecord;
-  opening: boolean;
-  onPress: () => void;
-}) {
-  // The agent list isn't backed by per-agent last-message previews on
-  // this screen (those live on the canonical chat session, which we don't
-  // pre-resolve for every row), so the preview line shows the agent's
-  // runtime status text as a stable, cheap subtitle. The detail screen
-  // surfaces the real conversation once opened.
-  const online = agent.status === "ready" || agent.status === "active";
-  return (
-    <TouchableOpacity
-      onPress={onPress}
-      activeOpacity={0.7}
-      style={styles.agentRow}
-      accessibilityRole="button"
-      accessibilityLabel={`Open ${agent.name}`}
-    >
-      <AgentAvatar name={agent.name} size={48} online={online} />
-      <View style={styles.agentBody}>
-        <View style={styles.agentTop}>
-          <Text style={styles.agentName} numberOfLines={1}>
-            {agent.name}
-          </Text>
-          {opening ? <ActivityIndicator size="small" color={theme.muted} /> : null}
-        </View>
-        <Text style={styles.agentPreview} numberOfLines={1}>
-          {agent.model ? `${agent.providerName ?? "model"} · ${agent.model}` : agent.status}
-        </Text>
-      </View>
-    </TouchableOpacity>
-  );
-}
-
-// AgentRow wrapped in a left-swipe-to-archive gesture. A left swipe reveals
-// a red Archive action (renderRightActions); tapping it closes the swipeable
-// and hands off to the confirm dialog. The default agent skips this wrapper
-// (see the list render) since it can't be archived.
-function SwipeableAgentRow({
-  agent,
-  opening,
-  onPress,
-  onArchive
-}: {
-  agent: AgentRecord;
-  opening: boolean;
-  onPress: () => void;
-  onArchive: (agent: AgentRecord) => void;
-}) {
-  const swipeRef = useRef<SwipeableMethods>(null);
-  return (
-    <ReanimatedSwipeable
-      ref={swipeRef}
-      friction={2}
-      rightThreshold={40}
-      renderRightActions={() => (
-        <TouchableOpacity
-          onPress={() => {
-            swipeRef.current?.close();
-            onArchive(agent);
-          }}
-          activeOpacity={0.8}
-          style={styles.archiveAction}
-          accessibilityRole="button"
-          accessibilityLabel={`Archive ${agent.name}`}
-        >
-          <Feather name="archive" size={20} color="#FFFFFF" />
-          <Text style={styles.archiveActionLabel}>Archive</Text>
-        </TouchableOpacity>
-      )}
-    >
-      <AgentRow agent={agent} opening={opening} onPress={onPress} />
-    </ReanimatedSwipeable>
-  );
-}
-
-// Dimmed archived-agent row: avatar + name + a one-tap Restore control.
-// Restore is a direct, no-confirm action (mirrors the web's one-click
-// restore); the row stays tappable so the chat history is still reachable.
-function ArchivedAgentRow({
-  agent,
-  restoring,
-  onRestore
-}: {
-  agent: AgentRecord;
-  restoring: boolean;
-  onRestore: () => void;
-}) {
-  return (
-    <View style={[styles.agentRow, styles.archivedRow]}>
-      <AgentAvatar name={agent.name} size={48} online={false} />
-      <View style={styles.agentBody}>
-        <Text style={styles.agentName} numberOfLines={1}>
-          {agent.name}
-        </Text>
-        <Text style={styles.agentPreview} numberOfLines={1}>
-          Archived
-        </Text>
-      </View>
-      <TouchableOpacity
-        onPress={onRestore}
-        disabled={restoring}
-        hitSlop={8}
-        style={styles.restoreButton}
-        accessibilityRole="button"
-        accessibilityLabel={`Restore ${agent.name}`}
-      >
-        {restoring ? (
-          <ActivityIndicator size="small" color={theme.accent} />
-        ) : (
-          <Feather name="rotate-ccw" size={18} color={theme.accent} />
-        )}
-      </TouchableOpacity>
-    </View>
-  );
-}
-
-function ChannelRow({
-  channel,
-  job,
-  unreadCount
-}: {
-  channel: ChatSession;
-  job?: JobRecord;
-  unreadCount: number;
-}) {
-  const title = job?.name?.trim() || channel.title?.trim() || "Channel";
-  // Prefer the job's schedule (the design's "Every day · 9:00 AM"); fall
-  // back to the channel's last-delivery preview when there's no paired
-  // job record.
-  const schedule =
-    job
-      ? jobCadence(job)
-      : channel.lastMessagePreview?.trim() || channel.summary?.trim() || "Recurring delivery";
-  // Next-run time when paired with a job; otherwise the channel's last
-  // activity time.
-  const time = chatListTime(job?.nextRunAt ?? channel.updatedAt ?? channel.createdAt);
-  const isUnread = unreadCount > 0;
-  return (
-    <TouchableOpacity
-      onPress={() => router.push(`/chat/${channel.id}`)}
-      activeOpacity={0.7}
-      style={styles.channelRow}
-      accessibilityRole="button"
-      accessibilityLabel={`Open channel ${title}`}
-    >
-      <View style={styles.channelIcon}>
-        <Feather name="clock" size={18} color={theme.placeholder} />
-      </View>
-      <View style={styles.channelBody}>
-        <Text style={styles.channelName} numberOfLines={1}>
-          {title}
-        </Text>
-        <View style={styles.channelSchedule}>
-          <Feather name="repeat" size={11} color="#B0B0B6" />
-          <Text style={styles.channelCadence} numberOfLines={1}>
-            {schedule}
-          </Text>
-        </View>
-      </View>
-      {isUnread ? (
-        <View style={styles.channelBadge}>
-          <Text style={styles.channelBadgeText}>
-            {unreadCount > 99 ? "99+" : unreadCount}
-          </Text>
-        </View>
-      ) : (
-        <Text style={styles.channelNext}>{time}</Text>
-      )}
-    </TouchableOpacity>
-  );
-}
-
-// Topic row — a `#<title>` side-conversation. Mirrors the channel row's
-// shape (tile icon + title/preview + unread badge / last-activity time) but
-// uses a hash glyph and the topic's last-message preview as the subtitle.
+// Topic row — a `#<title>` side-conversation. Tile icon + title/preview +
+// unread badge / last-activity time.
 function TopicRow({
   topic,
   unreadCount
@@ -656,29 +346,29 @@ function TopicRow({
     <TouchableOpacity
       onPress={() => router.push(`/chat/${topic.id}`)}
       activeOpacity={0.7}
-      style={styles.channelRow}
+      style={styles.topicRow}
       accessibilityRole="button"
       accessibilityLabel={`Open topic ${title}`}
     >
-      <View style={styles.channelIcon}>
+      <View style={styles.topicIcon}>
         <Feather name="hash" size={18} color={theme.placeholder} />
       </View>
-      <View style={styles.channelBody}>
-        <Text style={styles.channelName} numberOfLines={1}>
+      <View style={styles.topicBody}>
+        <Text style={styles.topicName} numberOfLines={1}>
           #{title}
         </Text>
-        <Text style={styles.channelCadence} numberOfLines={1}>
+        <Text style={styles.topicPreview} numberOfLines={1}>
           {preview}
         </Text>
       </View>
       {isUnread ? (
-        <View style={styles.channelBadge}>
-          <Text style={styles.channelBadgeText}>
+        <View style={styles.badge}>
+          <Text style={styles.badgeText}>
             {unreadCount > 99 ? "99+" : unreadCount}
           </Text>
         </View>
       ) : (
-        <Text style={styles.channelNext}>{time}</Text>
+        <Text style={styles.topicTime}>{time}</Text>
       )}
     </TouchableOpacity>
   );
@@ -692,71 +382,23 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 12,
     backgroundColor: theme.bg,
     borderBottomWidth: 1,
     borderBottomColor: theme.border
   },
-  brand: {
+  switcher: { flexDirection: "row", alignItems: "center", gap: 10, flexShrink: 1 },
+  switcherName: {
+    flexShrink: 1,
     color: theme.text,
     fontFamily: family("HankenGrotesk", 700),
     fontSize: 19
   },
-  headerActions: { flexDirection: "row", alignItems: "center", gap: 18 },
-  headerIconButton: { alignItems: "center", justifyContent: "center" },
-
-  searchWrap: { paddingHorizontal: 12, paddingVertical: 10 },
-  searchPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 9,
-    backgroundColor: theme.searchBg,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 9
-  },
-  searchInput: {
-    flex: 1,
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 15,
-    padding: 0
-  },
 
   content: { paddingHorizontal: 16, paddingBottom: 24 },
 
-  sectionHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingTop: 12,
-    paddingBottom: 8
-  },
-  jobsHeader: { paddingTop: 18 },
-  sectionHeaderLeft: { flexDirection: "row", alignItems: "center", gap: 6 },
-  // Nested under the active agent list — indented and lighter so it reads as
-  // a sub-dropdown of Agents rather than a top-level section.
-  archivedHeader: { paddingLeft: 8, paddingTop: 6 },
-  sectionLabel: {
-    color: "#6A6A70",
-    fontFamily: family("HankenGrotesk", 700),
-    fontSize: 13,
-    letterSpacing: 0.3
-  },
-  archivedLabel: {
-    color: "#8A8A90",
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 12,
-    letterSpacing: 0.3
-  },
-  sectionCount: {
-    color: "#B6B6BC",
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 13
-  },
-
-  // Agent row — avatar + name/preview + time/badge.
-  agentRow: {
+  // Messages row — active agent avatar + "Messages" + preview + unread.
+  messagesRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -764,46 +406,37 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: theme.border
   },
-  agentBody: { flex: 1, gap: 5 },
-  agentTop: {
+  messagesBody: { flex: 1, gap: 5 },
+  messagesTop: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     gap: 8
   },
-  agentName: {
+  messagesTitle: {
     flex: 1,
     color: "#0A0A0A",
     fontFamily: family("HankenGrotesk", 700),
     fontSize: 17
   },
-  agentPreview: {
+  messagesPreview: {
     color: "#3A3A3A",
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 14,
     lineHeight: 18
   },
 
-  // Left-swipe Archive action revealed behind an active agent row.
-  archiveAction: {
-    backgroundColor: theme.danger,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-    paddingHorizontal: 20
-  },
-  archiveActionLabel: {
-    color: "#FFFFFF",
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 12
+  sectionLabel: {
+    color: "#6A6A70",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 13,
+    letterSpacing: 0.3,
+    paddingTop: 18,
+    paddingBottom: 8
   },
 
-  // Archived agent row — dimmed, with a Restore control on the right.
-  archivedRow: { opacity: 0.6 },
-  restoreButton: { padding: 8 },
-
-  // Channel row — timer tile + name/schedule + next-run.
-  channelRow: {
+  // Topic row — hash tile + title/preview + unread badge / last-activity time.
+  topicRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -811,7 +444,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#F2F2F2"
   },
-  channelIcon: {
+  topicIcon: {
     width: 38,
     height: 38,
     borderRadius: 11,
@@ -819,25 +452,24 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  channelBody: { flex: 1, gap: 2 },
-  channelName: {
+  topicBody: { flex: 1, gap: 2 },
+  topicName: {
     color: "#3A3A3A",
     fontFamily: family("HankenGrotesk", 600),
     fontSize: 15
   },
-  channelSchedule: { flexDirection: "row", alignItems: "center", gap: 5 },
-  channelCadence: {
-    flex: 1,
+  topicPreview: {
     color: theme.placeholder,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 12
   },
-  channelNext: {
+  topicTime: {
     color: "#B6B6BC",
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 12
   },
-  channelBadge: {
+
+  badge: {
     minWidth: 20,
     paddingHorizontal: 7,
     paddingVertical: 2,
@@ -846,19 +478,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  channelBadgeText: {
+  badgeText: {
     color: "#FFFFFF",
     fontFamily: family("HankenGrotesk", 700),
     fontSize: 12
   },
 
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
-  emptySub: {
-    color: theme.subtle,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 14,
-    paddingVertical: 12
-  },
   error: {
     color: theme.danger,
     fontFamily: family("HankenGrotesk", 400),

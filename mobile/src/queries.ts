@@ -196,26 +196,6 @@ export function useAgentChat(agentId: string | null) {
   });
 }
 
-// All recurring-job channels for the instance. These are the chat
-// sessions tagged `kind: "channel"` (always also `origin: "job"`) — the
-// Channels screen renders them under "Recurring Jobs". Sorted newest
-// activity first so the most recently fired channel floats to the top.
-export function useChannels() {
-  return useQuery<ChatSession[], Error, ChatSession[]>({
-    queryKey: ["channels"],
-    queryFn: () => api<ChatSession[]>("/chat"),
-    refetchInterval: 30_000,
-    select: (sessions) =>
-      sessions
-        // Archived channels (job delivery rebound away) keep their history
-        // and stay addressable by deep link, but leave the list.
-        .filter((s) => (s.kind === "channel" || s.origin === "job") && !s.archivedAt)
-        .sort((a, b) =>
-          (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
-        )
-  });
-}
-
 // Job records. Pass an agentId to scope to one agent (the chat detail's
 // Jobs tab); pass `"all"` to fetch every job in the instance (the
 // Channels screen pairs each job with its delivery channel via
