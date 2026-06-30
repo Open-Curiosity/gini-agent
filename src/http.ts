@@ -1843,7 +1843,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
     // Email watchers (ADR email-watch.md). Thin handlers over the state
     // module: list, add (builds the query + dedicated chat session), remove.
-    ["GET", /^\/api\/email\/watchers$/, () => json(listEmailWatchers(config))],
+    ["GET", /^\/api\/email\/watchers$/, () => json(listEmailWatchers(config, readState(config.instance).activeAgentId))],
     ["POST", /^\/api\/email\/watchers$/, async (request) => {
       const payload = await body(request);
       // Whole-inbox triage opt-in (ADR email-watch.md): `triage: true` provisions
