@@ -17,6 +17,7 @@ import {
   ScrollText,
   Settings,
   Sun,
+  Trash2,
   WandSparkles
 } from "lucide-react";
 import { useTheme } from "next-themes";
@@ -39,6 +40,7 @@ import {
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { ArchiveAgentDialog } from "@/components/ArchiveAgentDialog";
+import { DeleteAgentDialog } from "@/components/DeleteAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
@@ -53,6 +55,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<AgentRow | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AgentRow | null>(null);
   const [topicsCollapsed, toggleTopics] = useSectionCollapsed("topics");
 
   const status = useStatus();
@@ -209,6 +212,17 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                     >
                       <ArchiveRestore className="size-3.5" />
                     </button>
+                    <button
+                      type="button"
+                      aria-label={`Delete ${agent.name}`}
+                      onClick={() => {
+                        setAgentMenuOpen(false);
+                        setDeleteTarget(agent);
+                      }}
+                      className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:opacity-50"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
                   </div>
                 ))}
               </>
@@ -351,6 +365,13 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         open={archiveTarget !== null}
         onOpenChange={(open) => {
           if (!open) setArchiveTarget(null);
+        }}
+      />
+      <DeleteAgentDialog
+        agent={deleteTarget}
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
         }}
       />
     </div>
